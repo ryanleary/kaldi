@@ -9,7 +9,7 @@ cd kaldi-nvidia-tuning/tools
 extras/check_dependencies.sh
 make -j
 cd ../src
-CXXFLAGS="-fopenmp" LDFLAGS="-fopenmp -nvToolsExt" ./configure --static --use-cuda --cudatk-dir=$CUDA_HOME
+CXXFLAGS="-fopenmp" LDFLAGS="-fopenmp -lnvToolsExt" ./configure --static --use-cuda --cudatk-dir=$CUDA_HOME
 
 
 Building Kaldi
