@@ -1,0 +1,38 @@
+Getting the repository:
+
+git clone git@github.com:thatguymike/kaldi-nvidia-tuning.git
+
+
+Setting up the build:
+
+cd kaldi-nvidia-tuning/tools
+extras/check_dependencies.sh
+make -j
+cd ../src
+CXXFLAGS="-fopenmp" LDFLAGS="-fopenmp -nvToolsExt" ./configure --static --use-cuda --cudatk-dir=$CUDA_HOME
+
+
+Building Kaldi
+
+make -j
+
+
+Setting up the model:
+
+cd ../egs/aspire/s5
+wget http://dl.kaldi-asr.org/models/0001_aspire_chain_model.tar.gz
+tar -xzf 0001_aspire_chain_model.tar.gz
+steps/online/nnet3/prepare_online_decoding.sh --mfcc-config conf/mfcc_hires.conf data/lang_chain exp/nnet3/extractor exp/chain/tdnn_7b exp/tdnn_7b_chain_online
+
+
+Running inference on 1 stream:
+
+OMP_NUM_THREADS=1 ../../../src/online2bin/online2-wav-nnet3-cuda --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --gpu-fraction=1 --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-tiny.wav|' 'ark:/dev/null'
+
+Running inference on 8 streams (just increase OMP threads, computation is being replicated):
+
+OMP_NUM_THREADS=1 ../../../src/online2bin/online2-wav-nnet3-cuda --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --gpu-fraction=.125 --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-tiny.wav|' 'ark:/dev/null'
+
+
+Notes:  --gpu-fraction=.125 says to use 1/8th of the GPU per thread.  We can increase this or decrease this as necessary.  A higher value means more threads per decoder but also leads to more waisted computation.  A lower value means less threads per decoder lettig us run more streams but at a higher latency.
+
