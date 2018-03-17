@@ -29,14 +29,21 @@ utils/mkgraph.sh --self-loop-scale 1.0 data/lang_pp_test exp/tdnn_7b_chain_onlin
 
 Running inference on 1 stream:
 
-nvidia-cuda-mps-control -d
 
-OMP_NUM_THREADS=1 ../../../src/online2bin/online2-wav-nnet3-cuda --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --gpu-fraction=1 --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-tiny.wav|' 'ark:/dev/null'
+OMP_NUM_THREADS=1 ../../../src/online2bin/online2-wav-nnet3-cuda --frames-per-chunk=160 --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --gpu-fraction=.125 --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-tiny.wav|' 'ark:/dev/null'
+
 
 Running inference on 8 streams (just increase OMP threads, computation is being replicated):
 
-OMP_NUM_THREADS=8 ../../../src/online2bin/online2-wav-nnet3-cuda --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --gpu-fraction=.125 --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-tiny.wav|' 'ark:/dev/null'
+nvidia-cuda-mps-control -d
+OMP_NUM_THREADS=8 ../../../src/online2bin/online2-wav-nnet3-cuda --frames-per-chunk=160  --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --gpu-fraction=.125 --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-tiny.wav|' 'ark:/dev/null'
 
 
 Notes:  --gpu-fraction=.125 says to use 1/8th of the GPU per thread.  We can increase this or decrease this as necessary.  A higher value means more threads per decoder but also leads to more waisted computation.  A lower value means less threads per decoder lettig us run more streams but at a higher latency.
 
+Running inference on the CPU (change number of threads to match hardware threads):
+
+OMP_NUM_THREADS=8 ../../../src/online2bin/online2-wav-nnet3-faster --online=false --do-endpointing=false --frame-subsampling-factor=3 --config=exp/tdnn_7b_chain_online/conf/online.conf --beam=15.0 --acoustic-scale=1.0 --word-symbol-table=exp/tdnn_7b_chain_online/graph_pp/words.txt exp/tdnn_7b_chain_online/final.mdl exp/tdnn_7b_chain_online/graph_pp/HCLG.fst 'ark:echo utterance-id1 utterance-id1|'  'scp:echo utterance-id1 ../../../audio-samples/audio-sample-small.wav|' 'ark:/dev/null'
+
+
+numactl:  It is suggested to use numactl to control thread placement
