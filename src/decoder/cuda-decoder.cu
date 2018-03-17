@@ -1168,7 +1168,7 @@ template<typename T>
 
       *modified1 = false;
 
-      processNonEmittingTokens_function<32,2>(params,cutoff,size,modified0);
+      processNonEmittingTokens_function<4,16>(params,cutoff,size,modified0);
 
       //grid.sync();
       __grid_sync_nv_internal(params.barrier);  //wait for everyone to finish process tokens and writes modified0
