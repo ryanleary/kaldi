@@ -11,7 +11,7 @@ extras/check_dependencies.sh
 make -j
 cd ../src
 CXXFLAGS="-O3 -fopenmp" LDFLAGS="-fopenmp -L$CUDA_HOME/lib64 -lnvToolsExt" ./configure --static --use-cuda --cudatk-dir=$CUDA_HOME
-make depends -j
+make depend -j
 
 Building Kaldi
 
