@@ -5,6 +5,7 @@ git clone git@github.com:thatguymike/kaldi-nvidia-tuning.git
 
 Setting up the build:
 
+export CUDA_HOME=/path/to/cuda
 cd kaldi-nvidia-tuning/tools
 extras/check_dependencies.sh
 make -j
