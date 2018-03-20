@@ -102,7 +102,9 @@ int main(int argc, char *argv[]) {
     bool online = true;
 
     ParseOptions po(usage);
+    int threads_per_gpu = omp_get_max_threads();
 
+    po.Register("threads-per-gpu", &threads_per_gpu, "number of CPU threads to assign to each GPU");
     po.Register("chunk-length", &chunk_length_secs,
         "Length of chunk size in seconds, that we process.  Set to <= 0 "
         "to use all input in one chunk.");
@@ -143,18 +145,23 @@ int main(int argc, char *argv[]) {
 
 
     cuInit(0);
-    CudaFst cuda_fst;
+    #define MAX_DEVS 8
+    CudaFst cuda_fst[MAX_DEVS];
 
 #pragma omp parallel shared(po, cuda_fst) 
     {
-      printf("Thread %d of %d\n", omp_get_thread_num(), omp_get_num_threads());
 
       // feature_opts includes configuration for the iVector adaptation,
       // as well as the basic features.
 
-
 #if HAVE_CUDA==1
-      CuDevice::Instantiate().SelectGpuId("yes");
+      int device=omp_get_thread_num()/threads_per_gpu;
+      char vis_dev[100];
+      sprintf(vis_dev,"CUDA_VISIBLE_DEVICES=%d\n",device);
+      putenv(vis_dev);
+      //int device=1;
+      printf("Thread %d of %d on device %d\n", omp_get_thread_num(), omp_get_num_threads(), device);
+      CuDevice::Instantiate().SelectGpuIdUniqueContext(device);
       CuDevice::Instantiate().AllowMultithreading();
 #endif
 #pragma omp barrier
@@ -195,7 +202,7 @@ int main(int argc, char *argv[]) {
 
 
         fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
-        if(omp_get_thread_num()==0) cuda_fst.initialize(*decode_fst);
+        if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].initialize(*decode_fst);
 #pragma omp barrier
 
         fst::SymbolTable *word_syms = NULL;
@@ -242,11 +249,11 @@ int main(int argc, char *argv[]) {
 
             SingleUtteranceNnet3CudaDecoder decoder(decoder_opts, trans_model,
                 decodable_info,
-                cuda_fst, &feature_pipeline);
+                cuda_fst[device], &feature_pipeline);
  
             if(omp_get_thread_num()==0) {
               printf("cudaMallocMemory: %lg GB, cudaMallocManagedMemory: %lg GB\n", 
-                  (decoder.Decoder().getCudaMallocBytes()*omp_get_num_threads()+cuda_fst.getCudaMallocBytes())/1024.0/1024/1024, 
+                  (decoder.Decoder().getCudaMallocBytes()*omp_get_num_threads()+cuda_fst[device].getCudaMallocBytes())/1024.0/1024/1024, 
                   decoder.Decoder().getCudaMallocManagedBytes()/1024.0/1024/1024*omp_get_num_threads());
             }
 
@@ -347,9 +354,9 @@ int main(int argc, char *argv[]) {
         delete decode_fst;
         delete word_syms; // will delete if non-NULL.
       #pragma omp barrier
+      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].finalize();
     } //end parallel
     printf("Stopping CUDA\n");
-    cuda_fst.finalize();
     cudaDeviceSynchronize();
     cudaProfilerStop();
     return 0;

@@ -338,7 +338,6 @@ template<typename T>
 
   void CudaFst::finalize() {
     nvtxRangePushA("CudaFst destructor");
-    printf("CudaFst::finalize()\n");
     cudaFreeHost(final_h);
     cudaFree(final_d);
     free(e_offsets_h);
@@ -443,7 +442,6 @@ template<typename T>
   }
 
   void CudaDecoder::TokenAllocator::finalize() {
-    printf("TokenAllocator::finalize()\n");
     cudaFree(tokens_allocation);
     cudaFree(front_d);
     cudaFreeHost(front_h);
@@ -464,7 +462,6 @@ template<typename T>
 
 
   CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), beam_(config.beam), bytes_cudaMalloc(0), bytes_cudaMallocManaged(0) {
-    printf("CudaDecoder Constructor\n");
     int device;
     cudaGetDevice(&device);
 
@@ -522,8 +519,6 @@ template<typename T>
   }
 
   CudaDecoder::~CudaDecoder() {
-
-    printf("CUDA DECODER DESTRUCTOR\n");
 
     cur_toks_.free();
     prev_toks_.free();
@@ -601,7 +596,6 @@ template<typename T>
   }
 
   void CudaDecoder::InitDecoding() {
-    printf("CUDA DECODER InitDecoding\n");
     // clean up from last time:
     ClearToks(cur_toks_);
     ClearToks(prev_toks_);
@@ -634,9 +628,6 @@ template<typename T>
 
   void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
       int32 max_num_frames) {
-    printf("AdvanceDecoding\n");
-  
-
     nvtxRangePushA("AdvanceDecoding");
     KALDI_ASSERT(num_frames_decoded_ >= 0 &&
         "You must call InitDecoding() before AdvanceDecoding()");
@@ -676,7 +667,6 @@ template<typename T>
     cur_toks_.copy_all_to_host(stream_comp);
     cudaStreamSynchronize(stream_comp);
 
-    printf("AdvanceDecoding Done\n");
     nvtxRangePop();
   }
 
