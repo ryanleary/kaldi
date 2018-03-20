@@ -301,13 +301,12 @@ int main(int argc, char *argv[]) {
 
           decoder.AdvanceDecoding();
         }
-
+        Lattice lat;
+        decoder.GetBestPath(true, &lat);
+        
         MPI_Barrier(MPI_COMM_WORLD);
         decoding_timer.OutputStats(&timing_stats);
         nvtxRangePop();
-
-        Lattice lat;
-        decoder.GetBestPath(true, &lat);
 
         CompactLattice clat;
         ConvertLattice(lat, &clat);

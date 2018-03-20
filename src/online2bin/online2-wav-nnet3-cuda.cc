@@ -309,12 +309,13 @@ int main(int argc, char *argv[]) {
             decoder.FinalizeDecoding();
 #endif
 
-#pragma omp barrier
-            decoding_timer.OutputStats(&timing_stats);
-            nvtxRangePop();
 
             Lattice lat;
             decoder.GetBestPath(true, &lat);
+
+#pragma omp barrier
+            decoding_timer.OutputStats(&timing_stats);
+            nvtxRangePop();
             
             CompactLattice clat;
             ConvertLattice(lat, &clat);
