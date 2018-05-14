@@ -115,7 +115,6 @@ struct CudaDecoderConfig {
 
 // is mostly read in coalesced accesses
 struct InfoToken { // we needed to take StateId out
-    BaseFloat cost; // accumulated total cost up to this point.
     int prev_token;
     int arc_idx;
 };
@@ -169,18 +168,49 @@ class CudaDecoder {
   /// utterance and want to start with a new utterance. 
   void InitDecoding();  
 
+  struct PreprocessParams {
+      StateId *d_main_q_state; 
+      CostT *d_main_q_cost;
+      InfoToken *d_main_q_info; 
 
-  struct ExpandArcParams {
-      StateId *d_q; 
-      InfoToken *d_q_info; 
+      const int *d_main_q_local_offset; 
+      const int *d_main_q_end; 
 
-      int *d_q_token_from; 
-      int *d_q_token_to;
-      int *d_q_token_end;
+      StateId *d_q_to_state; 
+      CostT *d_q_to_cost;
+      InfoToken *d_q_to_info; 
 
-      int *d_q_token_from_narcs; 
+      const int *d_q_to_end_i2; 
 
       int *d_degrees_scan; 
+      unsigned int *d_arc_offsets; 
+      int *d_q_arc_offsets; // offsets, relative to the queue
+
+      int *d_state_cost; 
+      BaseFloat *d_cutoff; 
+
+      int2 *d_degrees_block_scan; 
+
+      int *h_q_to_narcs; 
+      int *d_n_CTA_done;
+  };
+
+
+  struct ExpandArcParams {
+      StateId *d_main_q_state; 
+      CostT *d_main_q_cost;
+      InfoToken *d_main_q_info; 
+      int *d_degrees_scan; 
+
+      int *d_main_q_narcs; 
+      int *d_main_q_local_offset;
+      int *d_main_q_global_offset;
+
+      StateId *d_aux_q_state; 
+      CostT *d_aux_q_cost;
+      InfoToken *d_aux_q_info; 
+      int *d_aux_q_end;
+
 
       int *d_q_arc_offsets; 
       int *arc_ilabels; 
@@ -192,24 +222,16 @@ class CudaDecoder {
       BaseFloat beam; 
 
       int *d_lookup;
-        
       bool is_emitting;
-
       int *d_n_CTA_done;
+  };
 
-      int *h_q_token_from_size; // to be set at the end
-
-      int *d_curr_token;
-};
-
-    int debug_max_narcs;
 
   void ExpandArcs(int nthreads, const ExpandArcParams &params);
 
-  void DeviceScan(int *d_degrees, int h_prevTok_size, int *d_degrees_scan);
-
-  void ComputeDegrees(unsigned int *d_offsets);
-  void FinalizeDegreesScan();
+  void ContractAndPreprocess(unsigned int *d_arc_offsets);
+  void PreprocessInPlace(unsigned int *d_arc_offsets);
+  void FinalizePreprocessInPlace();
 
   /// This will decode until there are no more frames ready in the decodable
   /// object, but if max_num_frames is >= 0 it will decode no more than
@@ -221,52 +243,46 @@ class CudaDecoder {
   /// Returns the number of frames already decoded.  
   int32 NumFramesDecoded() const { return num_frames_decoded_; }
 
+  StateId *d_main_q_state, d_aux_q_state; 
+  CostT *d_main_q_cost, *d_aux_q_cost;
+  InfoToken *d_main_q_info, *d_aux_q_info;
 
-  StateId *d_allToken; 
-  InfoToken *d_allTokenInfo;
+  // Local offset (in d_q_from_*)
+  int *d_main_q_local_offset;
+
+  // Global offset (in h_all_*)
+  // Used to set the "prev_token" in new tokens
+  int *d_main_q_global_offset;
+
+  // Pointer to end index in from (equal to size + offset)
+  int *d_main_q_end;
+  // total number of arcs contained in main q [off, end[
+  // ie total # of arcs from tok.next_state, where tok is in [off,end[
+  // (actually one "valid arcs" are counted, cf Preprocess)
+  int *d_main_q_narcs;
+  int *h_main_q_narcs; // pinned
+
+  // Contains both q_end and narcs
+  int2 *d_main_q_i2; 
+
+  // Pointer to end index in to (equal to size + 0) (no offset)
+  int *d_aux_q_end;
+
+  InfoToken *h_q_info; // on host
+  std::vector<InfoToken> h_all_token_info;
 
   // Used to detect last CTA alive in some kernels
   int *d_n_CTA_done;
 
-  // At each ProcessToken, we will propagate the queue [from, to[ to [to, end[
-  int *d_q_token_from;
-  int *d_q_token_to;
-  int *d_q_token_end; 
-
-  // Save the offset of currToken of the current frame
-  // Used for ProcessEmitting of following frame
-  int *d_curr_token;
-
-  // Total number of arcs contained in the [from,to[ queue
-  // ie total # of arcs from tok.next_state, where tok is in [from,to[
-  // (actually one "valid arcs" are counted, cf ComputeDegrees)
-  int *d_q_token_from_narcs;
- 
-  // Host Pinned memory
-  // size = to - from, total # of tokens in [from,to[
-  int *h_q_token_from_size;
-
-  // Host Pinned memory
-  // Total number of arcs contained in the [from,to[ queue
-  // ie total # of arcs from tok.next_state, where tok is in [from,to[
-  // (actually one "valid arcs" are counted, cf ComputeDegrees)
-
-  int *h_q_token_from_narcs;
- 
   // Scan of the outgoing arc degrees of tokens in [from,to[
   int *d_degrees_scan;
-
-  // # arcs in the corresponding CTA block
-  // Cf Compute degrees
-  int *d_block_sums_scan;
+  // Scan of the total per block
+  int *d_degrees_block_scan;
 
   // Cf Compute degrees
-  int *d_q_arc_offset;
+  int *d_q_arc_offsets;
 
   int *h_reached_final;
-
-  // TODO remove the d_reversed_path, use only host
-  StateId *d_reversed_path, *h_reversed_path;
 
   int *d_path_size;
 
