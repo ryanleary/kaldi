@@ -168,48 +168,64 @@ class CudaDecoder {
   /// utterance and want to start with a new utterance. 
   void InitDecoding();  
 
+  struct EndAndNarcs{
+    int end;
+    int narcs;
+  };
+
+  union QEndAndNarcs {
+      EndAndNarcs split;
+      unsigned long long both;
+  };
+
   struct PreprocessParams {
       StateId *d_main_q_state; 
-      CostT *d_main_q_cost;
+      CostType *d_main_q_cost;
       InfoToken *d_main_q_info; 
 
-      const int *d_main_q_local_offset; 
-      const int *d_main_q_end; 
+      int *d_main_q_local_offset; 
+      int *d_main_q_end; 
+      QEndAndNarcs *d_main_q_end_and_narcs_i2; 
+      int *d_main_q_narcs; 
+      int *h_main_q_narcs; 
 
-      StateId *d_q_to_state; 
-      CostT *d_q_to_cost;
-      InfoToken *d_q_to_info; 
-
-      const int *d_q_to_end_i2; 
+      StateId *d_aux_q_state; 
+      CostType *d_aux_q_cost;
+      InfoToken *d_aux_q_info; 
+      int *d_aux_q_end; 
 
       int *d_degrees_scan; 
       unsigned int *d_arc_offsets; 
-      int *d_q_arc_offsets; // offsets, relative to the queue
+      int *d_main_q_arc_offsets; // offsets, relative to the queue
 
       int *d_state_cost; 
       BaseFloat *d_cutoff; 
 
-      int2 *d_degrees_block_scan; 
+      int *d_degrees_block_scan; 
 
-      int *h_q_to_narcs; 
       int *d_n_CTA_done;
   };
 
 
   struct ExpandArcParams {
       StateId *d_main_q_state; 
-      CostT *d_main_q_cost;
+      CostType *d_main_q_cost;
       InfoToken *d_main_q_info; 
       int *d_degrees_scan; 
 
       int *d_main_q_narcs; 
+      int *h_main_q_narcs; 
+
       int *d_main_q_local_offset;
       int *d_main_q_global_offset;
+      int *d_main_q_end;
+      int *h_main_q_end;
 
       StateId *d_aux_q_state; 
-      CostT *d_aux_q_cost;
+      CostType *d_aux_q_cost;
       InfoToken *d_aux_q_info; 
       int *d_aux_q_end;
+      int *h_aux_q_end; 
 
 
       int *d_q_arc_offsets; 
@@ -243,19 +259,22 @@ class CudaDecoder {
   /// Returns the number of frames already decoded.  
   int32 NumFramesDecoded() const { return num_frames_decoded_; }
 
-  StateId *d_main_q_state, d_aux_q_state; 
-  CostT *d_main_q_cost, *d_aux_q_cost;
+  StateId *d_main_q_state, *d_aux_q_state; 
+  CostType *d_main_q_cost, *d_aux_q_cost;
   InfoToken *d_main_q_info, *d_aux_q_info;
 
   // Local offset (in d_q_from_*)
   int *d_main_q_local_offset;
+  int *h_main_q_local_offset;
 
   // Global offset (in h_all_*)
   // Used to set the "prev_token" in new tokens
   int *d_main_q_global_offset;
+  int *h_main_q_global_offset;
 
   // Pointer to end index in from (equal to size + offset)
   int *d_main_q_end;
+  int *h_main_q_end;
   // total number of arcs contained in main q [off, end[
   // ie total # of arcs from tok.next_state, where tok is in [off,end[
   // (actually one "valid arcs" are counted, cf Preprocess)
@@ -263,12 +282,18 @@ class CudaDecoder {
   int *h_main_q_narcs; // pinned
 
   // Contains both q_end and narcs
-  int2 *d_main_q_i2; 
+  QEndAndNarcs *d_main_q_end_and_narcs_i2; 
 
   // Pointer to end index in to (equal to size + 0) (no offset)
   int *d_aux_q_end;
+  int *h_aux_q_end;
 
-  InfoToken *h_q_info; // on host
+  InfoToken *h_main_q_info; // on host
+
+  // Those are filled only if necessary
+  StateId *h_main_q_state; // on host
+  CostType *h_main_q_cost; // on host
+
   std::vector<InfoToken> h_all_token_info;
 
   // Used to detect last CTA alive in some kernels
@@ -280,7 +305,7 @@ class CudaDecoder {
   int *d_degrees_block_scan;
 
   // Cf Compute degrees
-  int *d_q_arc_offsets;
+  int *d_main_q_arc_offsets;
 
   int *h_reached_final;
 
