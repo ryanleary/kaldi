@@ -30,6 +30,7 @@
 #include "nnet3/nnet-utils.h"
 #include <nvToolsExt.h>
 #include <cuda_profiler_api.h>
+#include <cuda.h>
 #include <omp.h>
 namespace kaldi {
 

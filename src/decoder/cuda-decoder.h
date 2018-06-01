@@ -36,7 +36,7 @@
 #include "lat/kaldi-lattice.h"
 #include "itf/decodable-itf.h"
 #include "omp.h"
-
+#include <cuda_runtime_api.h>
 
 namespace kaldi {
   
