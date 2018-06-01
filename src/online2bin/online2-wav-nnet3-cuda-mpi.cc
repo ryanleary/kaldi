@@ -313,10 +313,11 @@ int main(int argc, char *argv[]) {
         //        bool end_of_utterance = true;
         //        decoder.GetLattice(end_of_utterance, &clat);
 
-        if(rank==0) 
+        for(int i=0;i<size;i++)
         {
-          GetDiagnosticsAndPrintOutput(utt, word_syms, clat,
-             &num_frames, &tot_like);
+          if(i==rank) 
+            GetDiagnosticsAndPrintOutput(utt, word_syms, clat, &num_frames, &tot_like);
+          MPI_Barrier(MPI_COMM_WORLD);
         }
 
         // In an application you might avoid updating the adaptation state if
