@@ -117,33 +117,35 @@ class CudaVector {
       uint32_t max_size;
       T* mem_d, *mem_h;
 };
-  
 
 struct CudaDecoderConfig {
   BaseFloat beam;
   double gpu_fraction;
-  uint32_t max_tokens_per_frame;
   uint32_t max_tokens;
-  
+
   CudaDecoderConfig(): beam(16.0),
                        gpu_fraction(1.0/8.0),
-                       max_tokens_per_frame(900000),
-                       max_tokens(60000000) {}
+                       max_tokens(300000000){}
   
   void Register(OptionsItf *opts) {
     opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");
     opts->Register("gpu-fraction", &gpu_fraction, "Percent of GPU to use for this decoder.  "
                                                   "A single decoding cannot saturate the device.  "
                                                   "Use multiple decoders in parallel for the best performance.");
-    opts->Register("max-tokens-per-frame", &max_tokens_per_frame, "Maximum tokens used per frame.  If decoding exceeds this resutls are undefined.");
-    opts->Register("max-tokens-allocated", &max_tokens, "Total number of tokens allocated.  This controls how many tokens are allocated to the entire decoding process."
-                                                        "  If actual usaged exceeds this the results are undefined.");
+    opts->Register("max-tokens-allocated", &max_tokens, "Total numbe rof tokens allocated.  Tis controls how many tokens are allocated to the entire decoding process."  
+                                                        " If actual usage exceeds this the results are undefined.");
   }
   void Check() const {
-    KALDI_ASSERT(beam > 0.0 && gpu_fraction>0 && gpu_fraction <= 1 && max_tokens_per_frame > 0 && max_tokens>0);
+    KALDI_ASSERT(beam > 0.0 && gpu_fraction>0 && gpu_fraction <= 1 && max_tokens > 0);
   }
 };
 
+// is mostly read in coalesced accesses
+struct InfoToken { // we needed to take StateId out
+    BaseFloat cost;  //accumulated total cost up to this point.
+    int prev_token;
+    int arc_idx;
+};
 
 class CudaDecoder {
 
@@ -193,6 +195,47 @@ class CudaDecoder {
   /// utterance and want to start with a new utterance. 
   void InitDecoding();  
 
+  struct ExpandArcParams {
+      StateId *d_q; 
+      InfoToken *d_q_info; 
+
+      int *d_q_token_from; 
+      int *d_q_token_to;
+      int *d_q_token_end;
+
+      int *d_q_token_from_narcs; 
+
+      int *d_degrees_scan; 
+
+      int *d_q_arc_offsets; 
+      int *arc_ilabels; 
+
+      BaseFloat *arc_weights; 
+      StateId *arc_nextstates; 
+      BaseFloat *d_cutoff;
+      BaseFloat *d_loglikelihoods;
+      BaseFloat beam; 
+
+      int *d_lookup;
+        
+      bool is_emitting;
+
+      int *d_n_CTA_done;
+
+      int *h_q_token_from_size; // to be set at the end
+
+      int *d_curr_token;
+};
+
+    int debug_max_narcs;
+
+  void ExpandArcs(int nthreads, const ExpandArcParams &params);
+
+  void DeviceScan(int *d_degrees, int h_prevTok_size, int *d_degrees_scan);
+
+  void ComputeDegrees(unsigned int *d_offsets);
+  void FinalizeDegreesScan();
+
   /// This will decode until there are no more frames ready in the decodable
   /// object, but if max_num_frames is >= 0 it will decode no more than
   /// that many frames.  If it returns false, then no tokens are alive,
@@ -203,60 +246,70 @@ class CudaDecoder {
   /// Returns the number of frames already decoded.  
   int32 NumFramesDecoded() const { return num_frames_decoded_; }
 
+  StateId *d_allToken; 
+  InfoToken *d_allTokenInfo;
 
+  // Used to detect last CTA alive in some kernels
+  int *d_n_CTA_done;
+
+  // At each ProcessToken, we will propagate the queue [from, to[ to [to, end[
+  int *d_q_token_from;
+  int *d_q_token_to;
+  int *d_q_token_end; 
+
+  // Save the offset of currToken of the current frame
+  // Used for ProcessEmitting of following frame
+  int *d_curr_token;
+
+  // Total number of arcs contained in the [from,to[ queue
+  // ie total # of arcs from tok.next_state, where tok is in [from,to[
+  // (actually one "valid arcs" are counted, cf ComputeDegrees)
+  int *d_q_token_from_narcs;
  
-  class __align__(16) Token {
-   public:
-    Token *prev_;
-    CostType cost_; // accumulated total cost up to this point.
-    uint32_t arc_index_;
-//    BaseFloat acoustic_cost;   //currently not recording acoustic_cost.  It is trivial to add back in but didn't seem necessary for this use case
+  // Host Pinned memory
+  // size = to - from, total # of tokens in [from,to[
+  int *h_q_token_from_size;
 
-    HOST DEVICE inline Token(BaseFloat cost, Token *prev, uint32_t arc_index) : prev_(prev), cost_(cost), arc_index_(arc_index) {
-      if(prev) {
-        cost_ += prev->cost_;
-      }
-    }
+  // Host Pinned memory
+  // Total number of arcs contained in the [from,to[ queue
+  // ie total # of arcs from tok.next_state, where tok is in [from,to[
+  // (actually one "valid arcs" are counted, cf ComputeDegrees)
 
-    HOST DEVICE inline bool operator < (const Token &other) {
-      return cost_ > other.cost_;
-    }
-    HOST DEVICE inline bool operator < (const Token &other) volatile{
-      return cost_ > other.cost_;
-    }
-  };
+  int *h_q_token_from_narcs;
+ 
+  // Scan of the outgoing arc degrees of tokens in [from,to[
+  int *d_degrees_scan;
 
-  //Preallocates tokens and allocates them in a circular buffer.
-  //This allows threads to concurrently allocate/deallocate objects quickly in CUDA
-  class TokenAllocator {
-    public:
-      void initialize(uint32_t size);
-      void finalize();
+  // # arcs in the corresponding CTA block
+  // Cf Compute degrees
+  int *d_block_sums_scan;
 
-      inline void prefetch_next_to_device(cudaStream_t stream, int count);
-      inline void prefetch_next_to_device(cudaStream_t stream);
-      inline void prefetch_allocated_to_host(cudaStream_t stream);
+  // Cf Compute degrees
+  int *d_q_arc_offset;
 
-      inline size_t getCudaMallocManagedBytes();
+  int *h_reached_final;
 
-      //circular buffer,  need to ensure front never gets close to back....  If this happens there can be race conditions 
+  // TODO remove the d_reversed_path, use only host
+  StateId *d_reversed_path, *h_reversed_path;
 
-      DEVICE inline Token* getToken(uint32_t index);   //gets a free token offset by index
-      DEVICE inline void advanceFront(uint32_t num);         //advances the allocated token list by num
+  int *d_path_size;
 
-      void reset();   //returns all memory to the allocator (essentially a garbage collection of oustanding memory.  
-    private:
+  // Lookup table of all the costs
+  // d_state_cost[state] -> best cost for that state
+  // Resetted between frames
+  // Costs is stored as an ordered int representing a float
+  int *d_state_cost;
 
-      uint32_t size;
-      int32_t device;
-      uint32_t *front_d, *front_h;    //next free token index
+  // Current cutoff for current frame
+  BaseFloat *d_cutoff;
 
-      Token *tokens_allocation;  //TODO we could have a list of these and dynamically add more.  Just going static for now.
-      size_t bytes_cudaMallocManaged;
-      uint32_t prefetch_size;         //amount of elements to prefetch beyond front
-  };
+  int max_tokens;
 
-  TokenAllocator allocator;
+  BaseFloat *loglikelihoods_h, *loglikelihoods_d, *next_loglikelihoods_d;  
+
+  // Streams, overlap likelihoods copies with compute
+  cudaStream_t compute_st, copy_st;
+  cudaEvent_t loglikelihood_evt, q_token_from_narcs_evt;
 
   //pre-computes log likelihoods for the current frame
   void ComputeLogLikelihoods(DecodableInterface *decodable);
@@ -265,58 +318,34 @@ class CudaDecoder {
   // decodable object, then increments num_frames_decoded_.
   //void ProcessEmitting(DecodableInterface *decodable);
 
+  // Descriptions in .cu file
+
+  void InitLookup();
+  void ResetLookup();
+  void NonEmittingLongTail(unsigned int *d_arc_offsets, const ExpandArcParams &params);
+
+  void GetBestCost(BaseFloat *min, int *arg, bool isfinal) const;
+  void ProcessEmitting();
   void ProcessNonemitting();
-  void ProcessTokens();
+
  
-  //struct to hold pre-allocated tokens (one per state)
-  struct __align__(16) TokenLookupElem{
-    Token *token;     //pointer for that token
-    uint32_t active;  //tells if token has activiated or not
-    uint32_t pad;     //aligning to 16 bytes
-  };
+  bool ProcessToken(unsigned int *d_arc_offsets, bool is_emitting);
+
   
-  //token lookup table.  Provides constant time lookup for active tokens.
-  //One entry per state.  If entry is NULL token is not active.
-  TokenLookupElem *current_tokens_lookup_d;
-
-  struct TokenState {
-    Token* token;
-    StateId state;
-    HOST DEVICE inline TokenState (Token *token, StateId state) : token(token), state(state) {}
-    HOST DEVICE inline TokenState () : token(NULL) {};
-  };
- 
-  typedef CudaVector<TokenState> TokenVector;
-
-  //Lists of active tokens to be iterated through
-  TokenVector cur_toks_;
-  TokenVector prev_toks_;
-
   const CudaFst fst_;
 
   BaseFloat beam_;
+
   // Keep track of the number of frames decoded in the current file.
   int32 num_frames_decoded_;
 
-  //data store for log likelihoods needed in the current frame.  Double buffering to avoid synchronization.
-  BaseFloat *loglikelihoods_h, *loglikelihoods_old_h, *loglikelihoods_d, *loglikelihoods_old_d;  
+  BaseFloat *cutoff;
 
-  CostType *cutoff_d;
-  int *modified_d;
+  cudaEvent_t event;
+  cudaStream_t st1;
 
-  volatile int *token_locks_d;
-  void ClearToks(TokenVector &toks);
-
-  cudaEvent_t event_pt, event_pt_old, event_ll;
-  cudaStream_t stream_comp, stream_copy, stream_ll;
-
-  uint32_t total_threads;
   size_t bytes_cudaMalloc, bytes_cudaMallocManaged;
 
-  //warp assignment indexes
-  int *pe_idx_d, *ne_idx_d, *fb_idx_d;
-  int *barrier_d;  //barrier to allow grid syncs
-  
   KALDI_DISALLOW_COPY_AND_ASSIGN(CudaDecoder);
 };
 

@@ -26,6 +26,7 @@
 #include <float.h>
 #include <math.h>
 #include <cooperative_groups.h>
+#include <cub/cub.cuh>
 
 #define MEMADVISE
 
@@ -40,183 +41,6 @@
 
 #define DIV_ROUND_UP(a,b) ((a+b-1)/b)
 namespace kaldi {
-
-  template <typename T>
-  DEVICE __forceinline__ void load16(T *a, const T *b) {
-    const ulong2 *src = reinterpret_cast<const ulong2*>(b);
-    ulong2 &dst = *reinterpret_cast<ulong2*>(a);
-    asm("ld.global.v2.u64 {%0,%1}, [%2];" : "=l"(dst.x), "=l"(dst.y) : "l"(src));
-  }
-  
-template <typename T>
-  DEVICE __forceinline__ void store16(T *a, const T *b) {
-    const ulong2 src = *reinterpret_cast<const ulong2*>(b);
-    asm("st.global.v2.u64 [%0], {%1,%2};" :: "l"(a), "l"(src.x), "l"(src.y));
-  }
-
-
-
-
-// Assumptions: 1-d grid and blocks. No threads "early-exit" the grid.
-// No stream priorities
-DEVICE inline void __gpu_sync_fast(volatile int *fast_epoch)
-{
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        // gridDim.x-1 blocks are adding 1
-        // and one block is adding 0x80000000 - (gridDim.x-1)
-        // so the whole sum is 0x80000000
-        int nb = 1;
-        if (blockIdx.x == 0) {
-            nb = 0x80000000 - (gridDim.x-1);
-        }
- 
-        int old_epoch = *fast_epoch;
-        __threadfence();
-        atomicAdd((int*)fast_epoch, nb);
- 
-        // wait for the sign bit to commute   
-        while (((*fast_epoch) ^ old_epoch) >= 0)
-            ;
-    }
-    __syncthreads();
-}
-
-DEVICE __noinline__ void __grid_sync_nv_internal(int *barrier)
-{
-    __gpu_sync_fast((volatile int*)barrier);
-}
-
-  template<typename T> 
-    inline DEVICE void swap(T &a, T &b) {
-      T c = a;
-      a = b;
-      b = c;
-    }
-
-  /******************************************CudaVector Implementation*******************************/
-  template<typename T>
-    HOST DEVICE inline T& CudaVector<T>::operator[](uint32_t idx) { 
-#ifdef __CUDA_ARCH__
-      return mem_d[idx];
-#else
-      return mem_h[idx];
-#endif
-    }
-
-  template<typename T>
-    HOST DEVICE inline const T& CudaVector<T>::operator[](uint32_t idx) const { 
-#ifdef __CUDA_ARCH__
-      return mem_d[idx];
-#else
-      return mem_h[idx];
-#endif
-    } 
-
-  template<typename T>
-    inline void CudaVector<T>::allocate(uint32_t max_size) {
-      this->max_size=max_size;
-
-      cudaMallocHost(&count_h,sizeof(uint32_t));
-      cudaMalloc(&count_d, sizeof(uint32_t));
-      cudaMemset(count_d, 0,sizeof(uint32_t));
-      *count_h=0;
-
-      cudaMalloc(&mem_d,max_size*sizeof(T));
-      cudaMallocHost(&mem_h,max_size*sizeof(T));
-    }
-
-  template<typename T>
-    inline size_t CudaVector<T>::getCudaMallocBytes() {
-      return sizeof(uint32_t)+max_size*sizeof(T);
-    }
-
-  template<typename T>
-    inline void CudaVector<T>::free() { 
-      cudaFree(mem_d); 
-      cudaFreeHost(mem_h);
-      cudaFreeHost(count_h);
-    }
-
-
-  template<typename T>
-    inline void CudaVector<T>::copy_all_to_host(cudaStream_t stream) {
-      cudaStreamSynchronize(stream);
-      cudaMemcpy(count_h,count_d,sizeof(int32),cudaMemcpyDeviceToHost);
-      cudaMemcpyAsync(mem_h,mem_d,*count_h*sizeof(T),cudaMemcpyDeviceToHost, stream);
-    }
-
-  template<typename T>
-    inline void CudaVector<T>::copy_all_to_device(cudaStream_t stream) {
-      cudaStreamSynchronize(stream);
-      cudaMemcpyAsync(count_d,count_h,sizeof(int32),cudaMemcpyHostToDevice);
-      cudaMemcpyAsync(mem_d,mem_h,*count_h*sizeof(T),cudaMemcpyHostToDevice, stream);
-    }
-
-  template<typename T>
-    inline void CudaVector<T>::copy_size_to_host(cudaStream_t stream) {
-      cudaMemcpyAsync(count_h,count_d,sizeof(int32),cudaMemcpyDeviceToHost, stream);
-    }
-
-  template<typename T>
-    inline void CudaVector<T>::copy_size_to_device(cudaStream_t stream) {
-      cudaMemcpyAsync(count_d,count_h,sizeof(int32),cudaMemcpyHostToDevice, stream);
-    }
-  
-template<typename T>
-    inline void CudaVector<T>::copy_data_to_host(cudaStream_t stream) {
-      cudaMemcpyAsync(mem_h,mem_d,*count_h*sizeof(T),cudaMemcpyDeviceToHost, stream);
-    }
-
-  template<typename T>
-    inline void CudaVector<T>::copy_data_to_device(cudaStream_t stream) {
-      cudaMemcpyAsync(mem_d,mem_h,*count_h*sizeof(T),cudaMemcpyHostToDevice, stream);
-    }
-
-
-  //Note:  This will cause page faults back and forth when we switch from host to device.
-  template<typename T>
-    HOST DEVICE inline uint32_t CudaVector<T>::size() const 
-    {
-#ifdef __CUDA_ARCH__
-      return *count_d; 
-#else
-      return *count_h;
-#endif
-    }
-
-  template<typename T> 
-    HOST DEVICE inline void CudaVector<T>::push_back(const T &val) { 
-#ifdef __CUDA_ARCH__
-      //assert(*count_d<max_size);
-      uint32_t idx = atomicAdd(count_d,1);
-      mem_d[idx]=val; 
-#else
-      assert(*count_h<max_size);
-      uint32_t idx = (*count_h)++;
-      mem_h[idx]=val; 
-#endif
-    }
-  template<typename T> 
-    HOST DEVICE inline void CudaVector<T>::clear(cudaStream_t stream) { 
-#ifdef __CUDA_ARCH__
-      *count_d = 0;
-#else
-      *count_h = 0; 
-      cudaMemsetAsync(count_d,0,sizeof(int32),stream); 
-#endif
-    }
-  template<typename T> 
-    inline bool CudaVector<T>::empty() const { return size()==0; }
-  template<typename T> 
-    inline void CudaVector<T>::swap(CudaVector<T> &v) {
-      std::swap(mem_h,v.mem_h);
-      std::swap(mem_d,v.mem_d);
-      std::swap(count_h,v.count_h);
-      std::swap(count_d,v.count_d);
-      std::swap(max_size,v.max_size);
-    }
-  /**************************************End CudaVector Implementation**********************************/
 
   /***************************************CudaFst Implementation*****************************************/
   HOST DEVICE inline float CudaFst::Final(StateId state) const {
@@ -284,10 +108,10 @@ template<typename T>
 
     arc_count=e_count+ne_count+1;
 
-    cudaMemcpyAsync(final_d,final_h,sizeof(float)*numStates,cudaMemcpyHostToDevice,cudaStreamPerThread);
+    cudaMemcpy(final_d,final_h,sizeof(float)*numStates,cudaMemcpyHostToDevice);
     
-    cudaMemcpyAsync(e_offsets_d,e_offsets_h,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice, cudaStreamPerThread);
-    cudaMemcpyAsync(ne_offsets_d,ne_offsets_h,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice, cudaStreamPerThread);
+    cudaMemcpy(e_offsets_d,e_offsets_h,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice);
+    cudaMemcpy(ne_offsets_d,ne_offsets_h,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice);
 
 
     //Allocate non-zero arrays
@@ -296,11 +120,11 @@ template<typename T>
     cudaMallocHost(&arc_ilabels_h,arc_count*sizeof(int32));
     cudaMallocHost(&arc_olabels_h,arc_count*sizeof(int32));
 
-    cudaMalloc((void**)&arc_weights_d,arc_count*sizeof(BaseFloat));  bytes_cudaMalloc+=arc_count*sizeof(BaseFloat);
-    cudaMalloc((void**)&arc_nextstates_d,arc_count*sizeof(StateId));  bytes_cudaMalloc+=arc_count*sizeof(StateId);
-    cudaMalloc((void**)&arc_ilabels_d,arc_count*sizeof(int32));  bytes_cudaMalloc+=arc_count*sizeof(int32);
-    
-    //now populate arc data
+    cudaMalloc((void**)&arc_weights_d,arc_count*sizeof(BaseFloat));
+    cudaMalloc((void**)&arc_nextstates_d,arc_count*sizeof(StateId));
+    cudaMalloc((void**)&arc_ilabels_d,arc_count*sizeof(int32)); 
+
+        //now populate arc data
     int e_idx=1;          //save room for dummy arc (so start at 1)
     int ne_idx=e_count+1; //starts where e_offsets ends
 
@@ -311,7 +135,7 @@ template<typename T>
     arc_olabels_h[0]=0;
 
     for(int i=0;i<numStates;i++) {
-      //count emmiting and non_emitting arcs
+      //count emiting and non_emitting arcs
 
       for (fst::ArcIterator<fst::Fst<StdArc> > aiter(fst, i); !aiter.Done(); aiter.Next()) {
         StdArc arc = aiter.Value();
@@ -328,11 +152,13 @@ template<typename T>
       }
     }
 
-    cudaMemcpyAsync(arc_weights_d,arc_weights_h,arc_count*sizeof(BaseFloat),cudaMemcpyHostToDevice,cudaStreamPerThread);
-    cudaMemcpyAsync(arc_nextstates_d,arc_nextstates_h,arc_count*sizeof(StateId),cudaMemcpyHostToDevice,cudaStreamPerThread);
-    cudaMemcpyAsync(arc_ilabels_d,arc_ilabels_h, arc_count*sizeof(int32),cudaMemcpyHostToDevice,cudaStreamPerThread);
+    cudaMemcpy(arc_weights_d,arc_weights_h,arc_count*sizeof(BaseFloat),cudaMemcpyHostToDevice);
+    cudaMemcpy(arc_nextstates_d,arc_nextstates_h,arc_count*sizeof(StateId),cudaMemcpyHostToDevice);
+    cudaMemcpy(arc_ilabels_d,arc_ilabels_h, arc_count*sizeof(int32),cudaMemcpyHostToDevice);
 
-    cudaStreamSynchronize(cudaStreamPerThread);
+    cudaDeviceSynchronize();
+    cudaCheckError();
+
     nvtxRangePop();
   }
 
@@ -359,279 +185,194 @@ template<typename T>
 
   /***************************************End CudaFst****************************************************/
 
-  DEVICE inline void allocateAllTokens_function(CudaDecoder::TokenLookupElem *current_tokens_lookup, int32 numStates,  CudaDecoder::TokenAllocator allocator) {
-    for(int i=blockIdx.x*blockDim.x+threadIdx.x; i<numStates; i+=blockDim.x*gridDim.x) {
-      CudaDecoder::Token *token = allocator.getToken(i);
-      token->cost_ = INFINITY;
-      token->prev_ = NULL;
-      CudaDecoder::TokenLookupElem elem;
-      elem.token=token;
-      elem.active=false;
-      store16(&current_tokens_lookup[i], &elem);
-    }
-  }
-  __global__ void allocateAllTokens(CudaDecoder::TokenLookupElem *current_tokens_lookup, int32 numStates,  CudaDecoder::TokenAllocator allocator, int *barrier) {
-    allocateAllTokens_function(current_tokens_lookup,numStates,allocator);
-     __grid_sync_nv_internal(barrier);
-     if(blockIdx.x==0 && threadIdx.x==0) {
-      allocator.advanceFront(numStates);
-     }
-  }
+  CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), beam_(config.beam),
+  bytes_cudaMalloc(0), max_tokens(config.max_tokens) {
+    printf("CudaDecoder2 Constructor\n");
 
-  DEVICE inline void allocateNewTokens_function(CudaDecoder::TokenLookupElem *current_tokens_lookup, CudaDecoder::TokenVector cur_toks, CudaDecoder::TokenAllocator allocator) {
-    int32 size = cur_toks.size();
-    for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<size;i+=blockDim.x*gridDim.x) {
-      CudaDecoder::Token *token = allocator.getToken(i);
-      token->cost_ = INFINITY;
-      token->prev_ = NULL;
-      CudaDecoder::StateId state=cur_toks[i].state;
-      CudaDecoder::TokenLookupElem elem;
-      elem.token=token;
-      elem.active=false;
-      store16(&current_tokens_lookup[state], &elem);
-    }
-  }
+    int max_token = config.max_tokens; // for CUB
 
+    // Comments about variables are in the .h file
+
+    cudaStreamCreate(&compute_st);
+    cudaStreamCreate(&copy_st);
+
+    cudaEventCreate(&loglikelihood_evt);
+    cudaEventCreate(&q_token_from_narcs_evt);
+
+    cudaMalloc(&d_curr_token, sizeof(int));
+    cudaMalloc(&d_q_token_from, sizeof(int));
+    cudaMalloc(&d_q_token_to, sizeof(int));
+    cudaMalloc(&d_q_token_end, sizeof(int));
+
+    cudaMalloc(&d_q_token_from_narcs, sizeof(int));
   
-  void CudaDecoder::TokenAllocator::prefetch_next_to_device(cudaStream_t stream) {
-    prefetch_next_to_device(stream,prefetch_size);
-  }
+    cudaMalloc(&d_allToken, config.max_tokens * sizeof(StateId));
+    cudaMalloc(&d_allTokenInfo, config.max_tokens * sizeof(InfoToken));
 
-  void CudaDecoder::TokenAllocator::prefetch_next_to_device(cudaStream_t stream, int count) {
-    int front = *front_h;
-    //clamp to maximum size
-    if(count>size-front)
-      count = size-front;
+    cudaMallocHost(&h_q_token_from_size, sizeof(int));  
 
-    cudaMemPrefetchAsync(tokens_allocation+front,sizeof(Token)*count,device,stream);  
-  }
+    // TODO move back to params
+    int max_token_frame = 5000000;
+    // we could use same pointer
+    cudaMalloc(&d_degrees_scan, max_token_frame * sizeof(int));
+    cudaMalloc(&d_block_sums_scan, (max_token_frame / 256 + 2)* sizeof(int)); // TODO remove hardcoded
+    cudaMalloc(&d_q_arc_offset, max_token_frame * sizeof(int));
 
-  void CudaDecoder::TokenAllocator::prefetch_allocated_to_host(cudaStream_t stream) {
-    cudaMemPrefetchAsync(tokens_allocation,sizeof(Token)* *front_h,cudaCpuDeviceId,stream);  
-  }
+    cudaMalloc(&loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
+    cudaMalloc(&next_loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
+    cudaMallocHost(&loglikelihoods_h, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
 
-  size_t CudaDecoder::TokenAllocator::getCudaMallocManagedBytes() {
-    return bytes_cudaMallocManaged;
-  }
 
-  void CudaDecoder::TokenAllocator::reset() {
-    *front_h=0;
-    cudaMemset(front_d,0,sizeof(int));
-  }
+    cudaMalloc(&d_state_cost,sizeof(BaseFloat)*fst_.numStates);
 
-  void CudaDecoder::TokenAllocator::initialize(uint32_t size)  {
-    cudaGetDevice(&device);
-    prefetch_size=250000;
+    cudaMallocHost(&h_reached_final, sizeof(int));
+    cudaMallocHost(&h_q_token_from_narcs, sizeof(int));
 
-    this->size = size;
+    // TODO use directly pinned, no device mem
+    // TODO hardcoded params
+    cudaMalloc(&d_reversed_path, 50000 * sizeof(int)); // TODO pinned
+    h_reversed_path = (int*)malloc(50000 * sizeof(int));
 
-    //managed so getBestPath can easily access this data in the end
-    cudaMallocManaged((void**)&tokens_allocation,sizeof(Token)*size);  
-    bytes_cudaMallocManaged=sizeof(Token)*size;
-
-    cudaMalloc((void**)&front_d,sizeof(uint32_t)); 
-    cudaMallocHost((void**)&front_h,sizeof(uint32_t)); 
-
-#ifdef MEMADVISE
-    //If we do this we get faster perf as long as we don't over subscribe
-    cudaMemAdvise(tokens_allocation,sizeof(Token)*size,cudaMemAdviseSetPreferredLocation,device);
-    cudaMemPrefetchAsync(tokens_allocation,sizeof(Token)*size,device);  //force pages to allocate now
-#endif
-
-    reset();
-  }
-
-  void CudaDecoder::TokenAllocator::finalize() {
-    cudaFree(tokens_allocation);
-    cudaFree(front_d);
-    cudaFreeHost(front_h);
-  }
-
-  DEVICE inline CudaDecoder::Token* CudaDecoder::TokenAllocator::getToken(uint32_t offset) {
-    int idx = *front_d + offset;
-    return &tokens_allocation[idx];
-  }
-
-  DEVICE inline void CudaDecoder::TokenAllocator::advanceFront(uint32_t num) {
-    int front = *front_d + num;
-    //assert(front<size);
+    cudaMalloc(&d_cutoff, sizeof(float));
     
-    *front_d=front;
-    *front_h=front;
-  }
+    cudaMalloc(&d_path_size, sizeof(int));
+    cudaMalloc(&d_n_CTA_done, sizeof(int));
 
-
-  CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), beam_(config.beam), bytes_cudaMalloc(0), bytes_cudaMallocManaged(0) {
-    int device;
-    cudaGetDevice(&device);
-
-
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop,device);
-
-    total_threads = prop.maxThreadsPerMultiProcessor * prop.multiProcessorCount * config.gpu_fraction;
-
-    allocator.initialize(config.max_tokens);
-
-    bytes_cudaMallocManaged+=allocator.getCudaMallocManagedBytes();
-    cur_toks_.allocate(config.max_tokens_per_frame);
-    prev_toks_.allocate(config.max_tokens_per_frame);
-    bytes_cudaMalloc+=cur_toks_.getCudaMallocBytes()+prev_toks_.getCudaMallocBytes();
-
-    cudaEventCreateWithFlags(&event_pt,cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&event_pt_old,cudaEventDisableTiming);
-    cudaEventCreateWithFlags(&event_ll,cudaEventDisableTiming);
-
-    cudaStreamCreateWithFlags(&stream_comp, cudaStreamNonBlocking);
-    cudaStreamCreateWithFlags(&stream_copy, cudaStreamNonBlocking);
-    cudaStreamCreateWithPriority(&stream_ll, cudaStreamNonBlocking, -1);
-
-    cudaMalloc(&pe_idx_d, sizeof(int)); bytes_cudaMalloc+=sizeof(int);
-    cudaMalloc(&ne_idx_d, sizeof(int)); bytes_cudaMalloc+=sizeof(int);
-    cudaMalloc(&fb_idx_d, sizeof(int)); bytes_cudaMalloc+=sizeof(int);
-    cudaMalloc(&barrier_d, sizeof(int)); bytes_cudaMalloc+=sizeof(int);
-
-    cudaMemset(pe_idx_d,0,sizeof(int));
-    cudaMemset(ne_idx_d,0,sizeof(int));
-    cudaMemset(fb_idx_d,0,sizeof(int));
-    cudaMemset(barrier_d,0,sizeof(int));
-
-    cudaMalloc(&cutoff_d, sizeof(CostType)); bytes_cudaMalloc+=sizeof(CostType);
-    cudaMalloc(&modified_d, sizeof(int)*2); bytes_cudaMalloc+=sizeof(CostType)*2;
-
-    cudaMalloc(&token_locks_d,sizeof(int)*fst_.numStates);  bytes_cudaMalloc+=sizeof(int)*fst_.numStates;
-    cudaMemset((void*)token_locks_d,0,sizeof(int)*fst_.numStates);
-
-    cudaMalloc((void**)&current_tokens_lookup_d,sizeof(TokenLookupElem)*fst_.numStates); bytes_cudaMalloc+=sizeof(TokenLookupElem)*fst_.numStates;
-
-    cudaMallocHost(&loglikelihoods_h,sizeof(BaseFloat)*(fst_.max_ilabel+1));  
-    cudaMallocHost(&loglikelihoods_old_h,sizeof(BaseFloat)*(fst_.max_ilabel+1));
-
-    cudaMalloc((void**)&loglikelihoods_d,sizeof(BaseFloat)*(fst_.max_ilabel+1)); bytes_cudaMalloc+=sizeof(BaseFloat)*(fst_.max_ilabel+1);
-    cudaMalloc((void**)&loglikelihoods_old_d,sizeof(BaseFloat)*(fst_.max_ilabel+1)); bytes_cudaMalloc+=sizeof(BaseFloat)*(fst_.max_ilabel+1);
-
-    cudaStreamSynchronize(stream_comp);
-    cudaStreamSynchronize(stream_copy);
-    cudaStreamSynchronize(cudaStreamPerThread);
-
-    //sgemm requires shared memory and we don't want cache config changing.  So set a device wide cache config.
-    cudaDeviceSetCacheConfig(cudaFuncCachePreferEqual);
+    cudaCheckError();
   }
 
   CudaDecoder::~CudaDecoder() {
-
-    cur_toks_.free();
-    prev_toks_.free();
-    allocator.finalize();
-
-    cudaFreeHost(loglikelihoods_h);
-    cudaFreeHost(loglikelihoods_old_h);
-    cudaFree(loglikelihoods_d);
-    cudaFree(loglikelihoods_old_d);
-    cudaFree(current_tokens_lookup_d);
-
-    cudaFree(pe_idx_d);
-    cudaFree(ne_idx_d);
-    cudaFree(fb_idx_d);
-    cudaFree(barrier_d);
-
-    cudaFree((void*)token_locks_d);
-    cudaFree(cutoff_d);
-    cudaFree(modified_d);
-
-    cudaEventDestroy(event_pt);
-    cudaEventDestroy(event_pt_old);
-    cudaEventDestroy(event_ll);
-
-    cudaStreamDestroy(stream_comp);
-    cudaStreamDestroy(stream_copy);
-    cudaStreamDestroy(stream_ll);
-
-  }
-
-
-  bool CudaDecoder::Decode(DecodableInterface *decodable) {
-    nvtxRangePushA("CudaDecoder::Decode");
-
-    InitDecoding();
-
-    ComputeLogLikelihoods(decodable);
-
-    while( !decodable->IsLastFrame(num_frames_decoded_ - 1)) {
-
-#ifndef MEMADVISE
-      //no need to prefetch if we have done a memadvise
-      allocator.prefetch_next_to_device(cudaStreamPerThread);
-#endif
-
-      //TODO prefetch here
-
-      cur_toks_.swap(prev_toks_);
-
-      ProcessTokens();
-
-      //computes log likelihoods for the next frame
-      ComputeLogLikelihoods(decodable);
-    }
-
-    cur_toks_.copy_all_to_host(stream_comp);
-    cudaStreamSynchronize(stream_comp);
-
-    nvtxRangePop();
-
-    return (!cur_toks_.empty());
-  }
-
-  __global__ void addOneToken(CudaDecoder::TokenLookupElem *current_tokens_lookup,  CudaDecoder::TokenVector cur_toks, CudaDecoder::Token tok, CudaDecoder::StateId state) {
-
-    CudaDecoder::TokenLookupElem elem = current_tokens_lookup[state];
-    *elem.token = tok;
-    current_tokens_lookup[state].active = true;
-    cur_toks.push_back(CudaDecoder::TokenState(elem.token,state));   //add token to current token list 
-  }
-
-  //putting this into a kernel to avoid extra latency of a memory copy
-  __global__ void initializeCutoff(CudaDecoder::CostType *cutoff) {
-    *cutoff = INFINITY;
+        printf("CUDA DECODER DESTRUCTOR\n");
+      // TODO
   }
 
   void CudaDecoder::InitDecoding() {
-    // clean up from last time:
-    ClearToks(cur_toks_);
-    ClearToks(prev_toks_);
-    
-    allocator.reset();
-    int threads=64;
-    int blocks=DIV_ROUND_UP(total_threads,threads);
-    
-    //start moving these / allocating them on the device
-    allocator.prefetch_next_to_device(stream_comp, fst_.numStates+5000);
+    printf("CUDA DECODER InitDecoding\n");
 
-    allocateAllTokens<<<blocks,threads,0,stream_comp>>>(current_tokens_lookup_d, fst_.numStates, allocator, barrier_d);
 
-    // initialize decoding:
+    InitLookup();
+
     StateId start_state = fst_.Start();
     KALDI_ASSERT(start_state != fst::kNoStateId);
 
     cudaCheckError();
-    Token tok(StdWeight::One().Value(), NULL, 0);
-    //Token tok(StdWeight::One().Value(),0, NULL, 0);
-    addOneToken<<<1,1,0,stream_comp>>>(current_tokens_lookup_d, cur_toks_, tok, start_state);
+    InfoToken it_init;
+    it_init.cost = StdWeight::One().Value();
+    it_init.prev_token = INT_MIN;
+    it_init.arc_idx = -1;
+
+    cudaMemcpy(d_allToken, &start_state, sizeof(StateId), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_allTokenInfo, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
+
+    // We simulate a regular execution for the first iteration
+    cudaMemcpy(&d_state_cost[start_state], &(it_init.cost), sizeof(BaseFloat), cudaMemcpyHostToDevice);
+
+    cudaMemset(d_curr_token, 0, sizeof(int));
+    cudaMemset(d_q_token_from, 0, sizeof(int));
+
+    // Init state is in queue
+    int one = 1;
+    cudaMemcpy(d_q_token_to, &one, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_q_token_end, &one, sizeof(int), cudaMemcpyHostToDevice);
+    *h_q_token_from_size = 1;
+
+    float cutoff = FLT_MAX;
+    cudaMemcpy(d_cutoff, &cutoff, sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaMemset(d_n_CTA_done, 0, sizeof(int));
+    
     cudaCheckError();
 
-    initializeCutoff<<<1,1,0,stream_comp>>>(cutoff_d);
-
+    debug_max_narcs = 0;
     num_frames_decoded_ = 0;
+
+    printf("CUDA DECODER InitDecoding 1/2\n");
     ProcessNonemitting();
+    printf("CUDA DECODER InitDecoding 2/2\n");
+ }
 
-  }
 
-  void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
-      int32 max_num_frames) {
-    nvtxRangePushA("AdvanceDecoding");
+// Used to trigger the fire&forget version of atomicMin (only av for int/long)
+__device__ int floatToOrderedInt(float floatVal) {
+
+    int intVal = __float_as_int( floatVal );
+
+    return (intVal >= 0 ) ? intVal : intVal ^ 0x7FFFFFFF;
+
+}
+
+
+
+__device__ float orderedIntToFloat(int intVal) {
+
+    return __int_as_float( (intVal >= 0) ? intVal : intVal ^ 0x7FFFFFFF );
+
+} 
+
+
+// Used before first frame
+__global__ void init_lookup_kernel(int *state_cost, int size) {
+    for(int idx = blockIdx.x*blockDim.x + threadIdx.x;
+            idx < size;
+            idx += blockDim.x*gridDim.x) {
+        state_cost[idx]  = floatToOrderedInt(FLT_MAX);
+    }
+}
+
+void CudaDecoder::InitLookup() {
+    int nstates = fst_.numStates;
+
+
+    dim3 grid,block;
+    block.x = 256;
+    grid.x = DIV_ROUND_UP(nstates, block.x);
+
+    init_lookup_kernel<<<grid,block,0,cudaStreamPerThread>>>(d_state_cost, nstates);
+}
+
+typedef CudaDecoder::StateId StateId;
+
+// Used to reset lookup table between frames
+// Using the queue to reset only the values needed
+// Also takes care of resetting cutof
+// TODO rename to something like "ResetForNewFrame"
+__global__ void reset_lookup_kernel(StateId *d_q, int *d_q_offset, int *d_q_end, int *state_cost, float *d_cutoff) {
+    int q_offset = *d_q_offset;
+    int q_end = *d_q_end; 
+
+    for(int idx = q_offset + blockIdx.x*blockDim.x + threadIdx.x;
+            idx < q_end;
+            idx += blockDim.x*gridDim.x) {
+
+        StateId state = d_q[idx];
+
+        state_cost[state]  = floatToOrderedInt(FLT_MAX);
+    }
+
+    // Avoiding a kernel call just to reset the cutoff
+    if(blockIdx.x == 0 && threadIdx.x == 0)
+        *d_cutoff = FLT_MAX; 
+}
+
+void CudaDecoder::ResetLookup() {
+    int size = *h_q_token_from_size;
+
+    dim3 grid,block;
+    block.x = 256;
+    grid.x = DIV_ROUND_UP(size, block.x);
+
+    reset_lookup_kernel<<<grid,block,0,compute_st>>>(d_allToken, d_q_token_from, d_q_token_to, d_state_cost, d_cutoff);
+}
+
+
+void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
+        int32 max_num_frames) {
+    printf("AdvanceDecoding\n");
+
     KALDI_ASSERT(num_frames_decoded_ >= 0 &&
         "You must call InitDecoding() before AdvanceDecoding()");
     int32 num_frames_ready = decodable->NumFramesReady();
+
     // num_frames_ready must be >= num_frames_decoded, or else
     // the number of frames ready must have decreased (which doesn't
     // make sense) or the decodable object changed between calls
@@ -644,632 +385,1013 @@ template<typename T>
 
     ComputeLogLikelihoods(decodable);
 
-    int threads=64;
-    int blocks=DIV_ROUND_UP(total_threads,threads);
-    
     while (num_frames_decoded_ < target_frames_decoded) {
+        //KALDI_LOG << "New frame";
 
-#ifndef MEMADVISE
-      //no need to prefetch if we have done a memadvise
-      allocator.prefetch_next_to_device(cudaStreamPerThread);
-#endif
+        cudaEventSynchronize(loglikelihood_evt);
+        std::swap(next_loglikelihoods_d, loglikelihoods_d);
+        num_frames_decoded_++; 
+        ComputeLogLikelihoods(decodable);
 
-      cur_toks_.swap(prev_toks_);
-      
-      ProcessTokens();
-      
-      //computes log likelihoods for the next frame
-      ComputeLogLikelihoods(decodable);
-      
+        //KALDI_LOG << "Emitting, frame=" << num_frames_decoded_;
+        ProcessEmitting();
+
+        //KALDI_LOG << "Non Emitting";
+        ProcessNonemitting(); 
+
+
+        if(num_frames_decoded_ > 3) {
+            //KALDI_ASSERT(0); 
+        }
+
+        //computes log likelihoods for the next frame - check order
     }   
-    
 
-    cur_toks_.copy_all_to_host(stream_comp);
-    cudaStreamSynchronize(stream_comp);
 
+    printf("AdvanceDecoding Done\n");
     nvtxRangePop();
-  }
+}
 
-  bool CudaDecoder::ReachedFinal() const {
-    for (int i=0;i<cur_toks_.size();i++) {
-      TokenState ts = cur_toks_[i];
-
-      if (ts.token->cost_ != std::numeric_limits<BaseFloat>::infinity() &&
-          fst_.Final(ts.state) != StdWeight::Zero())
-        return true;
-    }
-
-    return false;
-  }
-
-  BaseFloat CudaDecoder::FinalRelativeCost() const {
-    // as a special case, if there are no active tokens at all (e.g. some kind of
-    // pruning failure), return infinity.
-    CostType infinity = std::numeric_limits<CostType>::infinity();
-    if (cur_toks_.empty())
-      return infinity;
-    CostType best_cost = infinity,
-             best_cost_with_final = infinity;
-
-
-    //for each active token
-    //compute minimum cost
-    for (int i=0;i<cur_toks_.size();i++) {
-      TokenState ts = cur_toks_[i];
-      StateId state = ts.state;
-      CostType cost = ts.token->cost_;
-
-      // Note: Plus is taking the minimum cost, since we're in the tropical
-      // semiring.
-      best_cost = std::min(best_cost, cost);
-      best_cost_with_final = std::min(best_cost_with_final,
-          cost +
-          fst_.Final(state));
-          //fst_.Final(state).Value());
-    }
-
-    BaseFloat extra_cost = best_cost_with_final - best_cost;
-    if (extra_cost != extra_cost) { // NaN.  This shouldn't happen; it indicates some
-      // kind of error, most likely.
-      KALDI_WARN << "Found NaN (likely search failure in decoding)";
-      return infinity;
-    }
-    // Note: extra_cost will be infinity if no states were final.
-    return extra_cost;
-  }
-
-  // Outputs an FST corresponding to the single best path
-  // through the lattice.
-  bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
-    nvtxRangePushA("GetBestPath");
-
-
-    fst_out->DeleteStates();
-    Token *best_tok = NULL;
-    bool is_final = ReachedFinal();
-    
-    if (!is_final) {
-      for(int i=0;i<cur_toks_.size();i++) {
-        TokenState ts = cur_toks_[i];
-        Token *tok = ts.token;
-        if(best_tok==NULL || *best_tok < *tok) {
-          best_tok = tok;
-        }
-      }
-    } else {
-      CostType infinity =std::numeric_limits<CostType>::infinity(),
-               best_cost = infinity;
-      for(int i=0;i<cur_toks_.size();i++) {
-        TokenState ts = cur_toks_[i];
-        Token  *tok = ts.token;
-        StateId state = ts.state;
-        CostType this_cost = tok->cost_ + fst_.Final(state);
-        if (this_cost != infinity && this_cost < best_cost) {
-          best_cost = this_cost;
-          best_tok = tok;
-        }
-      }
-    }
-
-    if (best_tok == NULL) {
-      nvtxRangePop();
-      return false;  // No output.
-    }
-
-    int count=0;
-
-    //for each token in reverse order
-    //add arc to list
-    std::vector<LatticeArc> arcs_reverse;  // arcs in reverse order.
-    for (Token *tok = best_tok; tok != NULL; tok = tok->prev_) {
-      count++;
-      Token &t=*tok;
-
-      uint32_t arc_idx=t.arc_index_;
-
-      LatticeArc arc(fst_.arc_ilabels_h[arc_idx], fst_.arc_olabels_h[arc_idx], LatticeWeight(fst_.arc_weights_h[arc_idx], 0), fst_.arc_nextstates_h[arc_idx]);
-
-      arcs_reverse.push_back(arc);
-    }
-    KALDI_ASSERT(arcs_reverse.back().nextstate == fst_.Start());
-    arcs_reverse.pop_back();  // that was a "fake" token... gives no info.
-
-    //for each arc in reverse
-    //generate new fst
-    StateId cur_state = fst_out->AddState();
-    fst_out->SetStart(cur_state);
-    for (ssize_t i = static_cast<ssize_t>(arcs_reverse.size())-1; i >= 0; i--) {
-      LatticeArc arc = arcs_reverse[i];
-      arc.nextstate = fst_out->AddState();
-      fst_out->AddArc(cur_state, arc);
-      cur_state = arc.nextstate;
-    }
-    if (is_final && use_final_probs)
-      fst_out->SetFinal(cur_state,
-          LatticeWeight(fst_.Final(fst_.arc_nextstates_h[best_tok->arc_index_]),
-            0.0));
-    else
-      fst_out->SetFinal(cur_state, LatticeWeight::One());
-    fst::RemoveEpsLocal(fst_out);
-    nvtxRangePop();
-    return true;
-  }
-
-  inline DEVICE void atomicMin(double *address, double val) {
-    unsigned long long *address_ull = (unsigned long long *)address;
-
-    double minval = *address;
-
-    while (val < minval) {  //if my value is less than minimum
-      minval = val;         //update the minimum to my value locally
-      val = __longlong_as_double(atomicExch(address_ull, __double_as_longlong(val))); //write minimum and read back value
-    } //if the new value is < the minimum I wrote I need to try again.
-  }
-  inline DEVICE void atomicMin(float *address, float val) {
-    unsigned int *address_ui = (unsigned int  *)address;
-
-    float minval = *address;
-
-    while (val < minval) {  //if my value is less than minimum
-      minval = val;         //update the minimum to my value locally
-      val = __uint_as_float(atomicExch(address_ui, __float_as_uint(val))); //write minimum and read back value
-    } //if the new value is < the minimum I wrote I need to try again.
-  }
 
   void CudaDecoder::ComputeLogLikelihoods(DecodableInterface *decodable) {
     nvtxRangePushA("ComputeLogLikelihoods");
 
     int32 frame = num_frames_decoded_;
 
-    std::swap(loglikelihoods_h,loglikelihoods_old_h); //double buffering so we don't overwrite loglikelihoods_h before it is copied down
-    std::swap(loglikelihoods_d,loglikelihoods_old_d); //double buffer
-
-    //We really only need about 10% of these but finding out which 10% is more expensive then just computing all of them
-    //Computing them inline in the next loop leads to lots of redundant computation
     decodable->ComputeLogLikelihoods(loglikelihoods_h,frame,fst_.max_ilabel+1);
 
     //copying in another stream to overlap transfer with compute
-    cudaMemcpyAsync(loglikelihoods_d,loglikelihoods_h,sizeof(BaseFloat)*(fst_.max_ilabel+1),cudaMemcpyHostToDevice, stream_ll);
+    cudaMemcpyAsync(next_loglikelihoods_d, loglikelihoods_h, sizeof(BaseFloat)*(fst_.max_ilabel+1), cudaMemcpyHostToDevice,
+    copy_st);
 
-    cudaEventRecord(event_ll,stream_ll);  //mark log likelihoods are copied down to the device
-    cudaStreamWaitEvent(stream_comp,event_ll,0); //ensure logliklihoods_d is updated before consuming
+    cudaEventRecord(loglikelihood_evt, copy_st);
 
     nvtxRangePop();
   }
 
-  //structs to hold kernel parameters.  Large numbers of parameters can slow down launch latency which matters when we are launching very short kernels
-  struct processTokens_params {
 
-    CudaDecoder::TokenVector prev_toks;
-    CudaDecoder::TokenVector cur_toks;
-    CudaDecoder::TokenAllocator allocator;
-    CudaDecoder::CostType *cutoff;
+// Below that value, we launch the persistent kernel for NonEmitting
+#define NONEM_LT_MAX_NARCS 4096
+bool CudaDecoder::ProcessToken(unsigned int *d_arc_offsets,
+                        bool is_emitting) {
 
-    //never change
-    const __restrict__ uint32_t *e_offsets;
-    const __restrict__ uint32_t *ne_offsets;
-    const __restrict__ int32 *arc_ilabels;
-    const __restrict__ int32 *arc_olabels; 
-    const __restrict__ BaseFloat *arc_weights;
-    const __restrict__ CudaDecoder::StateId *arc_nextstates;
-    const __restrict__ BaseFloat *loglikelihoods;
-    CudaDecoder::TokenLookupElem *current_tokens_lookup;
-    volatile int *token_locks;
-    BaseFloat beam;
-    volatile int *modified;
-    int *pe_idx;
-    int *ne_idx;
-    int *fb_idx;
-    int *barrier;
 
-  };
+    // Compute degrees, reduce by key, apply cutoff
+    // Compute first part of the prefix sums of the degrees
+    // At the end of that step, the kernel
+    // set the value of h_q_token_from_narcs
+    // (the number of arcs in the current queue processed)
+    // TODO rename to something more explicit
+    ComputeDegrees(d_arc_offsets);
+    
+    // Recording an event to signal h_q_token_from_narcs 
+    // as ready to use 
+    cudaEventRecord(q_token_from_narcs_evt, compute_st);
+            cudaCheckError();
 
-  //blockDim.x threads per token
-  template<int blockDimx, int blockDimy>
-  inline DEVICE void findBestCutoff_function(processTokens_params params) {
-    typedef CudaDecoder::TokenState TokenState;
-    typedef CudaDecoder::Token Token; 
-    typedef CudaDecoder::StateId StateId;
-    typedef CudaDecoder::CostType CostType;
+    // last time we use the lookup for old_q is in compute degrees
+    if(is_emitting)
+        ResetLookup();
 
-    int threadIdxy = threadIdx.x / blockDimx;
+    // Finalize the scan 
+    // partial scans + block offsets -> global scan
+    // If we want to speed up the binary search in expand
+    // This is where we can compute lower and upper bound 
+    // on the fly
+    FinalizeDegreesScan();
+    
+    // We need h_q_token_from_narcs to be ready
+    cudaEventSynchronize(q_token_from_narcs_evt);
+    int h_old_q_narcs = *h_q_token_from_narcs;
 
-    auto group = cooperative_groups::tiled_partition<blockDimx>(cooperative_groups::this_thread_block());
+    ExpandArcParams params;
 
-    CudaDecoder::CostType local_cutoff = INFINITY;
-    int32 size = params.prev_toks.size(); 
+    params.d_q = d_allToken; 
+    params.d_q_info = d_allTokenInfo;
 
-    //uses dynamically load balanced loop trips.  Tokens are assigned dynamically instead of statically
-    while(true) { 
-      int i;
-      if(group.thread_rank()==0) { //thread 0 nominated to get new token
-        i=atomicAdd(params.fb_idx,1);      //get token index
-      }
-      i=group.shfl(i,0);           //broadcast token index
-      //i=__shfl_sync(0xffffffff,i,0);
-      if(i>=size) break;  //Work complete
-      
-      TokenState ts = params.prev_toks[i];
-      Token * tok = ts.token;
-      StateId state = ts.state;
+    params.d_q_token_from = d_q_token_from;
+    params.d_q_token_to = d_q_token_to;
+    params.d_q_token_end = d_q_token_end;
 
-      uint32_t start=params.e_offsets[state], finish=params.e_offsets[state+1];
-      
-      int32 ilabel, ilabel_next;
+    params.d_degrees_scan = d_degrees_scan; 
 
-      int j=start+group.thread_rank();
+    params.d_q_arc_offsets = d_q_arc_offset;
+    params.arc_ilabels = fst_.arc_ilabels_d;
+    params.d_q_token_from_narcs = d_q_token_from_narcs;
+ 
+    params.arc_weights = fst_.arc_weights_d; 
+    params.arc_nextstates = fst_.arc_nextstates_d; 
+    params.d_cutoff = d_cutoff;
+    params.beam = beam_;
+    params.d_loglikelihoods= loglikelihoods_d;
+    params.d_lookup = d_state_cost;
+    params.is_emitting = is_emitting;
 
-      if(j<finish) {
-        ilabel_next = params.arc_ilabels[j];
-      }
-      int nextj;
+    params.d_curr_token = d_curr_token;
+    params.h_q_token_from_size = h_q_token_from_size;
+    params.d_n_CTA_done = d_n_CTA_done;
 
-      for(j;j<finish;j=nextj) {
-        nextj = j+blockDimx;
-        ilabel = ilabel_next;
-        if(nextj<finish) {
-          ilabel_next = params.arc_ilabels[nextj];
+    bool done = false;
+
+    if(h_old_q_narcs) {
+        if(!params.is_emitting 
+            && h_old_q_narcs < NONEM_LT_MAX_NARCS) { 
+            NonEmittingLongTail(d_arc_offsets, params); 
+
+            cudaCheckError();
+
+            // Persistent kernel finishes the job
+            done = true;
         }
-        
-        BaseFloat acoustic_cost = -params.loglikelihoods[ilabel]; //TODO can I prefetch this?
-        CostType weight = params.arc_weights[j];
-        
-        CudaDecoder::CostType total_cost = tok->cost_ + weight + acoustic_cost + params.beam;
-
-        if(total_cost<local_cutoff)
-          local_cutoff = total_cost;
-      }
-    }
-
-    //TODO reduce inside block first?
-    if(local_cutoff!=INFINITY) {
-      atomicMin(params.cutoff, local_cutoff);
-    }
-  }
-
-  //blockDim.x threads per token
-  template<int blockDimx, int blockDimy>
-  inline DEVICE void processEmittingTokens_function(processTokens_params params) {
-    typedef CudaDecoder::TokenState TokenState;
-    typedef CudaDecoder::Token Token; 
-    typedef CudaDecoder::StateId StateId;
-    typedef CudaDecoder::CostType CostType;
-    typedef CudaDecoder::TokenLookupElem TokenLookupElem; 
-    int threadIdxy = threadIdx.x / blockDimx;
-    
-    auto group = cooperative_groups::tiled_partition<blockDimx>(cooperative_groups::this_thread_block());
-
-    CostType cutoff=*params.cutoff;
-    int32 size = params.prev_toks.size();
-    //uses dynamically load balanced loop trips.  Tokens are assigned dynamically instead of statically
-    while(true) {
-      int i;
-      if(group.thread_rank()==0) { //thread 0 nominated to get new token
-        i=atomicAdd(params.pe_idx,1);      //get token index
-      }
-      i=group.shfl(i,0);           //broadcast token index
-      //i=__shfl_sync(0xffffffff,i,0);
-      if(i>=size) break;
-
-      TokenState ts = params.prev_toks[i];
-      Token * tok = ts.token;
-      StateId state = ts.state;
-
-      uint32_t start=params.e_offsets[state], finish=params.e_offsets[state+1];
-      int32 ilabel, ilabel_next;  //prefetch ilabel since it leads to a dependent load
-
-      int j=start+group.thread_rank();
-
-      if(j<finish) {
-        ilabel_next = params.arc_ilabels[j];
-      }
-      int nextj;
-
-      for(j;j<finish;j=nextj) {
-        nextj = j+blockDimx;
-
-        ilabel = ilabel_next;
-
-        if(nextj<finish) {
-          ilabel_next = params.arc_ilabels[nextj];
+        else {
+            ExpandArcs(h_old_q_narcs, params);
         }
-        BaseFloat acoustic_cost = -params.loglikelihoods[ilabel];  //TODO can I prefetch this?  
-        BaseFloat weight = params.arc_weights[j];
-        StateId nextstate = params.arc_nextstates[j];
 
-        CostType total_cost = tok->cost_ + weight + acoustic_cost;
-
-        if(total_cost<=cutoff) 
-        {
-          TokenLookupElem lookup_elem;
-          load16(&lookup_elem, &params.current_tokens_lookup[nextstate]);
-          
-          Token *cur_tok = lookup_elem.token;  
-          Token next_tok =  Token(acoustic_cost+weight, tok, j);
-
-          //check if token is active or not.  Double check the lock.
-          if(lookup_elem.active==0 && atomicCAS(&params.current_tokens_lookup[nextstate].active,0,1)==0) {        //grab sentinal to see who gets to add to cur_toks list
-            params.cur_toks.push_back(TokenState(cur_tok,nextstate));                                             //add to cur_toks list
-          }
-
-          volatile Token* cur_tokv = reinterpret_cast<volatile Token*>(cur_tok);  //need volatile reads to ensure we don't get cached versions
-
-          while(*cur_tokv < next_tok) {   //check if we need to update
-            if(params.token_locks[nextstate]==0 && atomicExch((int*)&params.token_locks[nextstate],1)==0) {       //try and grab lock
-              if(*cur_tokv < next_tok) {                                                                          //recheck if we are min
-                
-                if(sizeof(Token)==16)
-                  store16(cur_tok,&next_tok);                                                                       //update token
-                else
-                  *cur_tok=next_tok;
-
-                __threadfence();                                                                                  //ensure my write is visible to all threads   
-              }
-              
-              atomicExch((int*)&params.token_locks[nextstate],0);                                                 //release lock
-              break;                                                                                              //exit loop as our update is done
-            }
-            __threadfence();                                                                                      //ensure writes cur_tok and token_locks are visible
-          } //end while
-        } //end total_cost<=cutoff
-      } //end arc loop
-    } //end token loop
-  }
-  
-    template<int blockDimx, int blockDimy>
-  DEVICE __inline__ void processNonEmittingTokens_function(processTokens_params &params, CudaDecoder::CostType cutoff, uint32_t size,  volatile int *modified) {
-    typedef CudaDecoder::TokenState TokenState;
-    typedef CudaDecoder::Token Token; 
-    typedef CudaDecoder::StateId StateId;
-    typedef CudaDecoder::CostType CostType;
-    typedef CudaDecoder::TokenLookupElem TokenLookupElem; 
-    
-    auto group = cooperative_groups::tiled_partition<blockDimx>(cooperative_groups::this_thread_block());
-
-    int threadIdxy = threadIdx.x / blockDimx;
-
-    //uses dynamically load balanced loop trips.  Tokens are assigned dynamically instead of statically
-    while(true) {
-      int i;
-      if(group.thread_rank()==0) { //thread 0 nominated to get new token
-        i=atomicAdd(params.ne_idx,1);      //get token index
-      }
-      i=group.shfl(i,0);           //broadcast token index
-      //i=__shfl_sync(0xffffffff,i,0);
-      if(i>=size) break;
-      
-      TokenState ts = params.cur_toks[i];
-      Token * tok = ts.token;
-      StateId state = ts.state;
-
-      uint32_t start=params.ne_offsets[state], finish=params.ne_offsets[state+1];
-      for(int j=start+group.thread_rank();j<finish;j+=blockDimx) {
-        BaseFloat weight = params.arc_weights[j];
-        StateId nextstate = params.arc_nextstates[j];
-
-        Token next_tok = Token(weight, tok, j);
-
-        if (next_tok.cost_ <= cutoff) {
-          TokenLookupElem lookup_elem;
-          load16(&lookup_elem,&params.current_tokens_lookup[nextstate]);
-          Token *cur_tok = lookup_elem.token;
-          
-          //check if token is active or not.  If not then add it to the cur_toks list.  Double check the lock.
-          if(lookup_elem.active==0 && atomicCAS(&params.current_tokens_lookup[nextstate].active,0,1)==0) {
-            params.cur_toks.push_back(TokenState(cur_tok,nextstate));
-          }
-
-          volatile Token* cur_tokv = reinterpret_cast<volatile Token*>(cur_tok);  //need volatile reads to ensure we don't get cached versions
-
-          while(*cur_tokv < next_tok) {   //check if we need to update
-            if(params.token_locks[nextstate]==0 && atomicExch((int*)&params.token_locks[nextstate],1)==0) {  //try and grab locks
-              if(*cur_tokv < next_tok) {                                                                     //recheck that we are minimum
-                if(sizeof(Token)==16)
-                  store16(cur_tok,&next_tok);                                                                       //update token
-                else
-                  *cur_tok=next_tok;
-
-                __threadfence();                                                                             //ensure my write is visible to all threads
-              }
-              
-              atomicExch((int*)&params.token_locks[nextstate],0);                                            //release lock
-              
-              (*modified) = true;                                                                            //mark as updated
-              break;  //exit loop as our update is done
-            }
-            __threadfence(); //ensure writes to cur_tok and token_locks are visible
-          } //end try update loop
-        }
-      }
-    }
-  }
-
-  //Loop through all tokens repeatdly updating costs until nothing changes
-  //__launch_bounds__(64,32)
-  __global__ void processNonEmittingTokens_cg(processTokens_params params) {
-
-    //auto grid = cooperative_groups::this_grid();
-    //double buffer to reduce synchronization
-    volatile int *modified0 = params.modified;    //modified flag for current iteration
-    volatile int *modified1 = params.modified+1;  //modified flag for next/last iteration
-    *modified1 = false;
-
-    CudaDecoder::CostType cutoff=*params.cutoff;
-    do {
-
-      uint32_t size = params.cur_toks.size();
-
-      *params.ne_idx=0;
-      //grid.sync();  
-      __grid_sync_nv_internal(params.barrier);
-
-      //swap buffers
-      swap(modified0,modified1);
-
-      *modified1 = false;
-
-      processNonEmittingTokens_function<32,2>(params,cutoff,size,modified0);
-
-      //grid.sync();
-      __grid_sync_nv_internal(params.barrier);
-
-    } while ((*modified0)==true);
-    
-    //prepare for next iteration
-    *params.cutoff = INFINITY;
-
-    allocateNewTokens_function(params.current_tokens_lookup, params.cur_toks, params.allocator);
-    __grid_sync_nv_internal(params.barrier);
-    if(threadIdx.x==0 && blockIdx.x==0)
-      params.allocator.advanceFront(params.cur_toks.size());
-  }
-
-  __launch_bounds__(64,32)
-  __global__ void processTokens_cg(processTokens_params params) {
-//    auto grid = cooperative_groups::this_grid();
-
-
-    findBestCutoff_function<32,2>(params);
-    //grid.sync();
-    __grid_sync_nv_internal(params.barrier);
-    
-    
-    volatile int *modified0 = params.modified;    //modified flag for current iteration
-    volatile int *modified1 = params.modified+1;  //modified flag for next/last iteration
-    *modified1 = false;
-    CudaDecoder::CostType cutoff=*params.cutoff;
-
-    processEmittingTokens_function<32,2>(params);
-    //grid.sync();
-    __grid_sync_nv_internal(params.barrier);  //ensure cur_toks size is final
-    
-
-    do {
-
-      uint32_t size = params.cur_toks.size();
-
-      *params.ne_idx=0;
-
-      //grid.sync();  
-      __grid_sync_nv_internal(params.barrier); //wait for everyone to read size and modified0
-
-      //swap buffers
-      swap(modified0,modified1); //double buffered to avoid extra sync when resetting modified to false
-
-      *modified1 = false;
-
-      processNonEmittingTokens_function<4,16>(params,cutoff,size,modified0);
-
-      //grid.sync();
-      __grid_sync_nv_internal(params.barrier);  //wait for everyone to finish process tokens and writes modified0
-
-    } while ((*modified0)==true);
-
-
-    allocateNewTokens_function(params.current_tokens_lookup, params.cur_toks, params.allocator);
-  
-    bool rank0 = blockIdx.x==0 && threadIdx.x==0;
-    if(rank0) {
-      //prepare for next iteration
-      params.prev_toks.clear();
-      *params.cutoff = INFINITY;
-      *params.fb_idx=0;  
-      *params.pe_idx=0;
-    }
-    
-    __grid_sync_nv_internal(params.barrier);  //wait for allocation to finish
-    
-    if(rank0) {
-      params.allocator.advanceFront(params.cur_toks.size());
+        cudaStreamSynchronize(compute_st); 
     }
 
+    cudaCheckError();
+    return done;
+}
+
+
+void CudaDecoder::ProcessEmitting() {
+    nvtxRangePushA("ProcessEmitting");
     
-  }
+    // Using emitting arc offsets
+    ProcessToken(fst_.e_offsets_d, true); 
+
+    cudaCheckError();
+    nvtxRangePop();
+}
 
   void CudaDecoder::ProcessNonemitting() {
     nvtxRangePushA("ProcessNonemitting");
-    // Processes nonemitting arcs for one frame.  Propagates within
-    // cur_toks_.
 
-    dim3 threads(64,1);
-
-    dim3 blocks(DIV_ROUND_UP(total_threads,(threads.x*threads.y)));
-
-    processTokens_params params;
-
-    params.modified=modified_d;
-    params.cutoff=cutoff_d;
-    params.cur_toks=cur_toks_;
-    params.ne_offsets=fst_.ne_offsets_d;
-    params.arc_weights=fst_.arc_weights_d;
-    params.arc_nextstates=fst_.arc_nextstates_d;
-    params.current_tokens_lookup=current_tokens_lookup_d;
-    params.token_locks=token_locks_d;
-    params.allocator=allocator;
-    params.ne_idx=ne_idx_d;
-    params.barrier=barrier_d;
-
-#if 0
-    void *args[] = { (void*) &params };
-
-    cudaLaunchCooperativeKernel((void*)processNonEmittingTokens_cg, blocks, threads, args, 0, stream_comp);
-#else
-    processNonEmittingTokens_cg<<<blocks,threads,0,stream_comp>>>(params);
-#endif
+    // While not done, call it
+    while(!ProcessToken(fst_.ne_offsets_d, false));
 
     cudaCheckError();
     nvtxRangePop();
   }
 
-  void CudaDecoder::ProcessTokens() {
-    nvtxRangePushA("ProcessTokens");
 
-    processTokens_params params;
+// TODO use struct for params, 
+// large # of args slow things down
+
+/*
+
+This kernel is responsible for :
+
+1) Read a token from the input queue [from, to[
+2) Compute the outgoing degree of that token.next_state. For that :
+   -> If that token is suboptimal (cutoff, best_cost), degree = 0
+   -> Otherwise, we set degree using CSR graph
+
+The distinction between emitting / non emitting depends on the argument passed
+as "d_q_arc_offset"
+
+3) Compute prefix sums of those degrees within the block :
+    -> We store those "local prefix sums" in d_degrees_scan. Another kernel will finish the job
+    -> We save the sum of all degrees in that block (block_sums)
+
+4) The last block alive compute the prefix sums of block_sums. 
+    -> We save it, it will be needed to compute global_scan
+    -> We now have the total number of arcs overall, we save it to h_q_token_from_narcs
+
+*/
+
+#define COMPUTE_DEGREES_DIMX 256
+  __global__ void compute_degrees_kernel(StateId *d_q, InfoToken *d_q_info, const int *d_q_token_from, const int
+  *d_q_token_to, int *d_degrees_scan, unsigned int
+  *d_offsets, int *d_state_cost, BaseFloat *d_cutoff, int *d_q_arc_offset,
+  int *d_block_sums, int *d_block_sums_scan, int *h_q_token_from_narcs, int *d_q_token_from_narcs, int *d_n_CTA_done) {
+
+       typedef cub::BlockScan<int, COMPUTE_DEGREES_DIMX> BlockScan;
+       __shared__ typename BlockScan::TempStorage temp_storage;
+
+       __shared__ int blk_scan_offset;
+       __shared__ int is_last_CTA;
+
+
+        int queue_offset = *d_q_token_from;
+        int queue_end = *d_q_token_to;
+        int queue_size = queue_end - queue_offset;
+
+        BaseFloat cutoff = *d_cutoff;
+
+        for(int block_offset = blockDim.x*blockIdx.x;
+                block_offset < queue_size;
+                block_offset += gridDim.x*blockDim.x) {
+            int idx = queue_offset + block_offset + threadIdx.x;
+            int degree = 0;
+
+            if(idx < queue_end) {
+
+                StateId state_idx = d_q[idx];
+                BaseFloat cost = d_q_info[idx].cost;
+
+                if(cost < cutoff) {
+                    BaseFloat best_cost = orderedIntToFloat(d_state_cost[state_idx]);
+                    if(cost == best_cost) {
+                        int start = d_offsets[state_idx];
+                        int end = d_offsets[state_idx+1];
+                        degree = end - start;
+                        d_q_arc_offset[idx-queue_offset] = start;
+                    }
+                }
+            }
+
+            int scan;
+            BlockScan(temp_storage).ExclusiveSum(degree, scan);
+
+            if(idx < queue_end)
+                d_degrees_scan[idx-queue_offset] = scan;
+
+            if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
+                d_block_sums[block_offset/COMPUTE_DEGREES_DIMX] = (scan + degree); // scan is exclusive 
+            }
+
+            if((block_offset + gridDim.x*blockDim.x) < queue_end) {
+                // if there's another iteration, we'll reuse temp_storage
+                __syncthreads();
+            }
+        }
+
+        if(threadIdx.x == 0) {
+            int old = atomicAdd(d_n_CTA_done, 1);
+            blk_scan_offset = 0; // will be used if last CTA, avoiding a second sync
+            is_last_CTA = (old == (gridDim.x -1));
+        }
+
+        __syncthreads(); // is_last_CTA + temp_storage reuse if last CTA
+
+        if(is_last_CTA) {
+                // The last block alive takes care of scan of block sums 
+                __threadfence();
+                if(threadIdx.x == 0) {
+                    *d_n_CTA_done = 0;
+                }
+
+                // following value can be different than gridDim.x
+                int total_blk_val = (queue_size + COMPUTE_DEGREES_DIMX -1) / COMPUTE_DEGREES_DIMX;
+
+                for(int blk_idx_off = 0;
+                    blk_idx_off < total_blk_val;
+                    blk_idx_off += blockDim.x) {
+                    int blk_idx = blk_idx_off + threadIdx.x;
+
+                    int blk_sum = (blk_idx < total_blk_val) ? d_block_sums[blk_idx] : 0;
+
+                    int blk_scan;
+                    BlockScan(temp_storage).ExclusiveSum(blk_sum, blk_scan);
+                    blk_scan += blk_scan_offset; 
+                
+                    if(blk_idx < total_blk_val) {
+                        d_block_sums_scan[blk_idx] = blk_scan;
+                    }
+                    
+                    if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
+                        int total = blk_scan + blk_sum;
+                        blk_scan_offset = total;
+                    }
+
+                    __syncthreads(); // blk_scan_offset + reuse temp_storage
+                }
+
+            if(threadIdx.x == 0) {
+                *d_q_token_from_narcs = blk_scan_offset; // pinned memory
+                *h_q_token_from_narcs = blk_scan_offset; // pinned memory
+            }
+        }
+  }
+
+  void CudaDecoder::ComputeDegrees(unsigned int *d_offsets) {
+    dim3 grid,block;
+    block.x = COMPUTE_DEGREES_DIMX;
+    grid.x = DIV_ROUND_UP(*h_q_token_from_size, block.x);
+
+    compute_degrees_kernel<<<grid,block,0,compute_st>>>(d_allToken, d_allTokenInfo, d_q_token_from, d_q_token_to, d_degrees_scan,
+    d_offsets, d_state_cost, d_cutoff, d_q_arc_offset, d_block_sums_scan, d_block_sums_scan, h_q_token_from_narcs,
+    d_q_token_from_narcs, d_n_CTA_done);
+  }
+
+
+/*
+
+Part 2 of the scan. Computes global prefix sum with block prefix sum and block offsets
+
+If we want to speed up expand, we can compute lower and upper bound to restrain 
+the binary search in expand
+This can be done on the fly here, and removes main bottleneck of expand
+Not done for now, because expand is fast enough
+
+*/
+ __global__ void finalize_degrees_scan_kernel(int *d_scan, int *d_blk_scan, const int *d_q_token_from, const int
+  *d_q_token_to) {
+
+        int q_off = *d_q_token_from;
+        int q_end = *d_q_token_to;
+        int q_size = q_end - q_off;
+
+        for(int idx = blockDim.x*blockIdx.x + threadIdx.x;
+                idx < q_size;
+                idx += blockDim.x*gridDim.x) {
+
+            int blk_idx = idx / blockDim.x;
+            int blk_scan_offset = d_blk_scan[blk_idx]; // we rely on L1 for this one, avoiding syncs
+
+            d_scan[idx] += blk_scan_offset;
+        }
+
+ }
+
+  void CudaDecoder::FinalizeDegreesScan() {
+      dim3 grid,block;
+      block.x = COMPUTE_DEGREES_DIMX;
+      grid.x = DIV_ROUND_UP(*h_q_token_from_size, block.x);
+
+      finalize_degrees_scan_kernel<<<grid,block,0,compute_st>>>(d_degrees_scan, d_block_sums_scan, d_q_token_from, d_q_token_to); 
+  }
+    
+
+__forceinline__ __device__ int binsearch_maxle(const int *vec, const int val, int low, int high) {
+    while(true) {
+        if(low == high)
+            return low; //we know it exists
+        if((low + 1) == high)
+            return (vec[high] <= val) ? high : low;
+
+        int mid = low + (high- low) / 2;
+
+        if(vec[mid] > val)
+            high = mid-1;
+        else
+            low = mid;
+    }
+}
+
+
+// Temporary used for cutoff - will be removed
+__device__ float fatomicMin(float *addr, float value)
+
+{
+
+    float old = *addr, assumed;
+    if(old <= value) return old;
+
+    do
+    {
+        assumed = old;
+        old = atomicCAS((unsigned int*)addr,
+                __float_as_int(assumed),
+                __float_as_int(value));
+
+    } while(old!=assumed);
+
+    return old;
+
+}
+
+typedef CudaDecoder::ExpandArcParams ExpandArcParams; // TODO
+
+#define EXPAND_ARCS_DIMX 256
+
+/*
+
+This kernel propagates arcs from the current queue [from,to[
+to the new queue [to,end[
+
+The main bottleneck is the first binary search. 
+If we want to remove that bottleneck, cf comments on FinalizeScan
+
+
+TODO merge reduce and scan for code simplicity + remove syncs
+
+The last block alive moves the queues indexes :
+new from is old to
+new to is new end
+new end stays new end
+
+
+*/
+
+
+void __global__ expand_arcs_kernel(ExpandArcParams params) {
+    typedef cub::BlockScan<int, EXPAND_ARCS_DIMX> BlockScan;
+    typedef cub::BlockReduce<BaseFloat, EXPAND_ARCS_DIMX> BlockReduce;
+    
+    __shared__ typename BlockScan::TempStorage temp_storage_scan;
+    __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
+
+    __shared__ int new_q_block_off;
+    __shared__ BaseFloat global_cutoff;
+ 
+    const int total_narcs = *params.d_q_token_from_narcs;
+    const int old_q_offset = *params.d_q_token_from;
+    const int old_q_size = *params.d_q_token_to - old_q_offset;
+
+    if(threadIdx.x == 0) {
+        global_cutoff = *params.d_cutoff;
+    }
+
+    __syncthreads();
+ 
+    // Keeping the whole CTA alive, we'll have syncs
+    for(int block_offset = blockDim.x*blockIdx.x;
+            block_offset < total_narcs;
+            block_offset += gridDim.x*blockDim.x) {
+
+        int th_idx = block_offset + threadIdx.x;
+        bool valid_input = (th_idx < total_narcs);
+
+        StateId prev_state;
+        BaseFloat total_cost = FLT_MAX;
+        int arc_idx;
+        StateId arc_next_state;
+        int q_idx;
+
+        if(valid_input) {
+            //we can do better than that
+            q_idx = old_q_offset + binsearch_maxle(params.d_degrees_scan, th_idx, 0, old_q_size-1); 
+            
+            int lower_bound = params.d_degrees_scan[q_idx - old_q_offset];
+            prev_state = params.d_q[q_idx];
+
+            int arc_offset_start = params.d_q_arc_offsets[q_idx - old_q_offset];
+            arc_idx = arc_offset_start + (block_offset + threadIdx.x - lower_bound);
+
+            arc_next_state = params.arc_nextstates[arc_idx];
+            BaseFloat arc_weight = params.arc_weights[arc_idx];
+            
+            int arc_ilabel = params.is_emitting ? params.arc_ilabels[arc_idx] : 0;
+
+            BaseFloat accoustic_cost = (arc_ilabel != 0) ? -params.d_loglikelihoods[arc_ilabel] : 0.0; 
+            BaseFloat next_state_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
+
+            BaseFloat old_tok_cost = params.d_q_info[q_idx].cost;
+
+            total_cost = accoustic_cost + arc_weight + old_tok_cost;
+
+            if(total_cost >= next_state_cost) {
+                total_cost = FLT_MAX;
+                valid_input = false; 
+            } 
+        }
+        
+        BaseFloat thread_cutoff = (total_cost < FLT_MAX) ? (total_cost + params.beam) : FLT_MAX;
+        BaseFloat new_block_cutoff = BlockReduce(temp_storage_reduce).Reduce(thread_cutoff, cub::Min());
+
+        if(threadIdx.x == 0) {
+            if(new_block_cutoff < global_cutoff) {
+                BaseFloat new_global_cutoff = fatomicMin(params.d_cutoff, new_block_cutoff);
+                new_global_cutoff = min(new_global_cutoff, new_block_cutoff);
+                global_cutoff = new_global_cutoff;
+            }
+        }
+        
+        __syncthreads();
+
+        BaseFloat cutoff = global_cutoff;
+
+        int has_successor = (total_cost < cutoff && valid_input) ? 1 : 0;
+
+        if(has_successor) {
+            // reduce, not atomic (no return)
+            atomicMin(&params.d_lookup[arc_next_state], floatToOrderedInt(total_cost));
+        }
+
+        int new_q_idx_block;
+
+        BlockScan(temp_storage_scan).ExclusiveSum(has_successor, new_q_idx_block); // we could merge the reduce and
+        //the scan
+
+        
+        //printf("thx=%i, next_state=%i, new_arc_idx=%i, arc_idx=%i \n", threadIdx.x, arc_next_state, new_q_idx_block,
+        //arc_idx);
+
+        if(threadIdx.x == (EXPAND_ARCS_DIMX - 1)) {
+            int total_block = new_q_idx_block + has_successor; // exclusive sum
+            new_q_block_off = atomicAdd(params.d_q_token_end, total_block);
+        }
+
+        __syncthreads(); // newQueue_block_off + we'll reuse temp_storage_scan + global cutoff
+
+        int new_q_index = new_q_block_off + new_q_idx_block;
+
+        if(has_successor) {
+            params.d_q[new_q_index] = arc_next_state;
+
+            InfoToken new_tok_info;
+            new_tok_info.cost = total_cost;
+            // Negative means we'll have to reindex at the end of advancedecoding
+            new_tok_info.prev_token = q_idx;
+            new_tok_info.arc_idx = arc_idx;
+    
+            params.d_q_info[new_q_index] = new_tok_info;
+
+            //printf("Posted one NOT NULL tok=%i to %i, arc_idx=%i, with pred=%i (q=%i), cost=%f\n", new_q_index,
+            //arc_next_state, arc_idx, prev_state, q_idx, total_cost);
+        }
+    }
+
+
+    // Last block alive moves queue 
+
+    if(threadIdx.x == 0) {
+        int old = atomicAdd(params.d_n_CTA_done, 1);
+        if(old == (gridDim.x -1)) {
+            // The last block alive takes care of preparing for next iter
+            __threadfence(); // we want last value of d_q_token_end
+            int final_end = *params.d_q_token_end;
+
+            *params.h_q_token_from_size = final_end - *params.d_q_token_to;
+
+            *params.d_n_CTA_done = 0;
+            *params.d_q_token_from = *params.d_q_token_to;
+            *params.d_q_token_to = final_end;
+
+            if(params.is_emitting) {
+                // Saving position of curr_token for this frame
+                // We'll need to reset d_q_token_from for next frame
+                *params.d_curr_token = *params.d_q_token_from;
+            }
+        }
+    }
+
+}
+
+void CudaDecoder::ExpandArcs(int nthreads, const ExpandArcParams &params) {
+    dim3 grid,block;
+    block.x = 256;
+    grid.x = DIV_ROUND_UP(nthreads, block.x);
+
+    expand_arcs_kernel<<<grid,block,0,compute_st>>>(params);
+}
+
+
+
+// Reached final kernel
+__global__ void reached_final_kernel(StateId *d_q, const int *d_q_token_from, const int *d_q_token_to, BaseFloat *final, float fst_zero, int *h_reached_final) {
+    int q_offset = *d_q_token_from;
+    int q_end = *d_q_token_to;
+
+    for(int idx = q_offset + blockDim.x*blockIdx.x + threadIdx.x;
+            idx < q_end;
+            idx += blockDim.x*gridDim.x) {
+
+       StateId state = d_q[idx];
+       float final_val = final[state]; 
+
+       if(final_val != fst_zero) {
+            *h_reached_final = 1; // we could exit
+       }
+    }
+
+}
+
+  bool CudaDecoder::ReachedFinal() const {
+      dim3 grid, block;
+      block.x = 256;
+      grid.x = DIV_ROUND_UP(*h_q_token_from_size, block.x);
+
+      reached_final_kernel<<<grid,block,0,cudaStreamPerThread>>>(d_allToken, d_q_token_from, d_q_token_to, fst_.final_d, StdWeight::Zero().Value(), h_reached_final);
+      cudaDeviceSynchronize(); //TODO...
+
+      return *h_reached_final;
+  }
+
+
+
+// Used to find best costs.
+// TODO Needs to be rewritten
+
+#define FILL_COSTS_DIMX 256
+__global__ void fill_costs_kernel(StateId *d_q, InfoToken *d_q_it, const int *d_q_token_from, const int *d_q_token_to,
+int *d_costs, BaseFloat *d_final, bool final) {
+    int q_offset = *d_q_token_from;
+    int q_end = *d_q_token_to;
+
+    for(int idx = q_offset + blockIdx.x*blockDim.x + threadIdx.x;
+            idx < q_end;
+            idx += blockDim.x*gridDim.x) {
+        BaseFloat cost = d_q_it[idx].cost;
+        
+        if(final) {
+            StateId state = d_q[idx];
+            cost += d_final[state];
+        }
+        
+        //printf("idx=%i, final=%i, cost=%f \n", idx, final, cost);
+
+        d_costs[idx-q_offset] = floatToOrderedInt(cost);
+    }
+
+}
+
+
+void CudaDecoder::GetBestCost(BaseFloat *min, int *arg, bool isfinal) const {
+    dim3 grid, block;
+    block.x = FILL_COSTS_DIMX;
+
+    grid.x = DIV_ROUND_UP(*h_q_token_from_size, block.x);
+
+    // TODO using lookup as float buffer for now - NEED TO CHANGE
+    fill_costs_kernel<<<grid,block,0,cudaStreamPerThread>>>(d_allToken, d_allTokenInfo,
+    d_q_token_from, d_q_token_to, d_state_cost, fst_.final_d, isfinal);
+
+    cub::KeyValuePair<int, int> *d_argmin;
+    cudaMalloc(&d_argmin, sizeof(cub::KeyValuePair<int, int>));
+    
+    void *d_temp_storage_amin = NULL;
+    size_t temp_storage_amin_bytes = 0;
+
+    int max_t = max_tokens;
+    cub::DeviceReduce::ArgMin(d_temp_storage_amin, temp_storage_amin_bytes, d_state_cost, d_argmin, *h_q_token_from_size);
+    cudaMalloc(&d_temp_storage_amin, temp_storage_amin_bytes);
+
+    cub::DeviceReduce::ArgMin(d_temp_storage_amin, temp_storage_amin_bytes, d_state_cost, d_argmin, *h_q_token_from_size);
+
+    cub::KeyValuePair<int, int> h_argmin;
+
+    cudaMemcpy(&h_argmin, d_argmin, sizeof(cub::KeyValuePair<int, int>), cudaMemcpyDeviceToHost);
    
-    dim3 threads(64,1);
-    dim3 blocks(DIV_ROUND_UP(total_threads,(threads.x*threads.y)));
+
+    cudaFree(d_temp_storage_amin);
+    cudaFree(d_argmin);
+
+    //InitLookup(); // reset lookup
+
+    //*min = orderedIntToFloat(h_argmin.value);
+    *min = -10; // TODO switch back to real value once new kernel ready
+    *arg = h_argmin.key;
+}
+
+  BaseFloat CudaDecoder::FinalRelativeCost() const {
+    if(*h_q_token_from_size == 0)
+        return FLT_MAX;
+
+      BaseFloat best_cost;
+      int arg_best;
+      GetBestCost(&best_cost, &arg_best, false);
 
 
-    params.prev_toks=prev_toks_;
-    params.cur_toks=cur_toks_;
-    params.allocator=allocator;
-    params.e_offsets=fst_.e_offsets_d;
-    params.ne_offsets=fst_.ne_offsets_d;
-    params.arc_ilabels=fst_.arc_ilabels_d;
-    params.arc_weights=fst_.arc_weights_d;
-    params.arc_nextstates=fst_.arc_nextstates_d;
-    params.cutoff=cutoff_d;
-    params.loglikelihoods=loglikelihoods_d;
-    params.current_tokens_lookup=current_tokens_lookup_d;
-    params.token_locks=token_locks_d;
-    params.modified=modified_d;
-    params.beam=beam_;
-    params.pe_idx=pe_idx_d;
-    params.ne_idx=ne_idx_d;
-    params.fb_idx=fb_idx_d;
-    params.barrier=barrier_d;
+      BaseFloat best_cost_final;
+      int arg_best_final;
+      GetBestCost(&best_cost_final, &arg_best_final, true);
 
-    cudaStreamWaitEvent(stream_comp,event_ll,0); //make sure log likelihoods are on the device before starting these kernels
+      return (best_cost_final - best_cost);
+  }
 
-#if 0
-    void *args[] = { (void*) &params };
-    cudaLaunchCooperativeKernel((void*)processTokens_cg, blocks, threads, args, 0, stream_comp);
-#else
-    processTokens_cg<<<blocks,threads,0,stream_comp>>>(params);  //doesn't work
-#endif
-    cudaCheckError();
-      
-    cudaEventSynchronize(event_pt); //throttle
-    cudaEventRecord(event_pt,stream_comp);
+// brutal - one thread, multiple global memory load. But avoids a massive memcpy D2H
+// Will disappear with better memory management 
+void __global__ get_best_path_kernel(int best_token_idx_in_all_tokens, StateId *d_all_tokens, InfoToken
+*d_all_tokens_info, int *d_reversed_path, int *path_size) {
 
-    num_frames_decoded_++;
+    int tok_idx = best_token_idx_in_all_tokens;
+    int idx = 0;
+
+    //printf("start from %i \n", tok_idx);
+
+    printf("backtrack = ");
+    while(tok_idx != INT_MIN) {
+        //printf("%i -> ", tok_idx);
+        int state = d_all_tokens[tok_idx];
+        int arc_idx = d_all_tokens_info[tok_idx].arc_idx;
+        //printf("state=%i, tok=%i, arc=%i \n", state, tok_idx, arc_idx);
+        //printf("at %i, arc=%i, state=%s  \n", idx, arc_idx, state);
+        d_reversed_path[idx++] = arc_idx;
+
+        int old_tok_idx = tok_idx; 
+        tok_idx = d_all_tokens_info[tok_idx].prev_token;
+        if(old_tok_idx <= tok_idx) 
+            printf("FAIL\n");
+    }
+    
+    printf("\n");
+
+    *path_size = idx;
+}
+
+// Outputs an FST corresponding to the single best path
+  // through the lattice.
+  bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
+      nvtxRangePushA("GetBestPath");
+
+      BaseFloat best_cost;
+      int arg_best;
+      GetBestCost(&best_cost, &arg_best, false);
+
+      BaseFloat best_cost_final;
+      int arg_best_final;
+      GetBestCost(&best_cost_final, &arg_best_final, true);
+
+      bool isfinal = ReachedFinal();
+
+      int h_curr_token_offset;
+      cudaMemcpy(&h_curr_token_offset, d_q_token_from, sizeof(int), cudaMemcpyDeviceToHost);
+
+      int h_best_token_idx = isfinal ? arg_best_final : arg_best; 
+      h_best_token_idx += h_curr_token_offset;
+  
+    printf("is final = %i \n", isfinal);
+    printf("curr token off=%i \n", h_curr_token_offset);
+    printf("best token idx=%i \n", h_best_token_idx);
+    printf("final costs : %f  final = %f \n", best_cost, best_cost_final);
+    printf("final costs idx : %i  final idx = %i \n", arg_best, arg_best_final);
+
+    cudaMemset(d_path_size, 0, sizeof(int));
+
+    get_best_path_kernel<<<1,1,0,cudaStreamPerThread>>>(h_best_token_idx, d_allToken, d_allTokenInfo, d_reversed_path, d_path_size);
+
+    cudaDeviceSynchronize();
+
+    printf("flush \n");
+    
+    int h_path_size;
+    cudaMemcpy(&h_path_size, d_path_size, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_reversed_path, d_reversed_path, h_path_size * sizeof(int), cudaMemcpyDeviceToHost);
+    
+
+    fst_out->DeleteStates();
+     
+     // We can assert first state equals to root
+    
+    StateId cur_state = fst_out->AddState();
+    fst_out->SetStart(cur_state);
+
+    // -1 for 0-indexing, -1 for ignoring starting arc
+    for (int i = h_path_size-1-1; i >= 1; i--) {
+      int arc_idx = h_reversed_path[i];
+      LatticeArc arc(fst_.arc_ilabels_h[arc_idx], fst_.arc_olabels_h[arc_idx], LatticeWeight(fst_.arc_weights_h[arc_idx], 0), fst_.arc_nextstates_h[arc_idx]);
+
+      arc.nextstate = fst_out->AddState();
+      fst_out->AddArc(cur_state, arc);
+      cur_state = arc.nextstate;
+    }
+
+    if (isfinal && use_final_probs)
+      fst_out->SetFinal(cur_state,
+          LatticeWeight(fst_.Final(fst_.arc_nextstates_h[h_reversed_path[0]]), 0.0));
+    else
+      fst_out->SetFinal(cur_state, LatticeWeight::One());
+
+    fst::RemoveEpsLocal(fst_out);
 
     nvtxRangePop();
+      return true;
   }
 
-  void CudaDecoder::ClearToks(TokenVector &toks) {
-    //cannot acctually delete tokens as they may still be connected to active tokens
-    toks.clear(stream_comp);
-  }
+
+// Wrote for single CTA
+
+/*
+
+Persistent kernel
+
+Used to avoid calling multiple "heavy lifting" kernels for the tail of non emitting
+(lots of iterations with small number of arcs)
+
+Code is greatly simplified because we can have only one CTA alive
+
+Repeat until new queue empty:
+    1) Computes degrees (cf ComputeDegrees) 
+    2) Compute scan
+    3) Expand arcs
+
+1 and 2 are not done on the first iteration, because it's already done
+(by corresponding kernels)
+
+At the end, this kernel finalize the computation for current frame,
+setting the queue [from,to[ to the complete curr_token queue
+so that it's ready for next ProcessEmitting
+
+We could optimize and speed up this kernel
+It will only gives us a better latency for 1 stream, which is low enough
+Instead, we let it compute while we use the GPU for other streams
+This kernel only uses one block, and is a free rider on the GPU
+
+*/
+
+
+#define NONEM_LT_DIMX 1024
+__launch_bounds__(NONEM_LT_DIMX, 1)
+__global__ void process_nonem_longtail(unsigned int *d_arc_offsets, 
+                                ExpandArcParams params) {
+
+    typedef cub::BlockScan<int, NONEM_LT_DIMX> BlockScan;
+    typedef cub::BlockReduce<float, NONEM_LT_DIMX> BlockReduce;
+
+    __shared__ typename BlockScan::TempStorage temp_storage_scan;
+    __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
+
+    __shared__ BaseFloat cutoff;
+    
+    __shared__ int total_narcs;
+
+    __shared__ int new_q_end;
+
+    int old_q_offset = *params.d_q_token_from;
+    int new_q_offset = *params.d_q_token_to;
+
+    if(threadIdx.x == 0) {
+        new_q_end = *params.d_q_token_end;
+        total_narcs = *params.d_q_token_from_narcs;
+    }
+
+    __syncthreads();
+
+    int old_q_size = new_q_offset - old_q_offset;  // move to end
+    
+    cutoff = *params.d_cutoff;
+    
+    // We'll switch queue at the beg of the loop
+    // Cleaner that way - we need the offsets ready for
+    // the global updates at the very end of this kernel
+    new_q_offset = old_q_offset;
+   
+    bool first = true;
+
+    while(old_q_size > 0) {
+        // Step 0 : move queues        
+        old_q_offset = new_q_offset;
+        new_q_offset = new_q_end;
+
+        if(!first) {
+
+            if(threadIdx.x == 0)  {
+                total_narcs = 0;
+            }
+
+            __syncthreads();
+
+
+            // Step 1 : compute_degrees
+            for(int local_q_idx = threadIdx.x;
+                    local_q_idx < old_q_size;
+                    local_q_idx += blockDim.x) {
+
+                int global_q_idx = old_q_offset + local_q_idx;
+
+                StateId state = params.d_q[global_q_idx];
+                BaseFloat cost = params.d_q_info[global_q_idx].cost;
+
+                int degree = 0;
+                if(cost < cutoff) {
+                    BaseFloat best_cost = orderedIntToFloat(params.d_lookup[state]);
+
+                    if(cost == best_cost) {
+                        int start = d_arc_offsets[state];
+                        int end = d_arc_offsets[state+1];
+                        degree = end - start;
+                        params.d_q_arc_offsets[local_q_idx] = start;
+                    }
+                }
+
+                params.d_degrees_scan[local_q_idx] = degree;
+            }
+
+            __syncthreads();
+
+            // Step 2 : Scan
+
+            for(int block_off = 0;
+                    block_off < old_q_size;
+                    block_off += blockDim.x) {
+
+                int local_q_idx = block_off + threadIdx.x;
+
+                int degree = (local_q_idx < old_q_size) 
+                    ? params.d_degrees_scan[local_q_idx]
+                    : 0;
+                int lscan;
+                BlockScan(temp_storage_scan).ExclusiveSum(degree, lscan);
+                int scan = lscan + total_narcs;
+
+                if(local_q_idx < old_q_size)
+                    params.d_degrees_scan[local_q_idx] = scan;
+
+                if(threadIdx.x == (NONEM_LT_DIMX-1)) {
+                    int total_in_block = lscan + degree;
+                    total_narcs += total_in_block;
+                }
+
+                __syncthreads();
+            }
+
+        } else {
+            first = false;    
+        }
+
+        //if(threadIdx.x == 0)
+        //    printf("narcs=%i \n", total_narcs);
+
+        // We already sync'ed
+
+        // Step 3 : expand arcs
+
+        for(int block_offset = 0;
+                block_offset < total_narcs;
+                block_offset += blockDim.x) {
+
+            int th_idx = block_offset + threadIdx.x;
+            bool valid_input = (th_idx < total_narcs);
+
+            BaseFloat total_cost = FLT_MAX;
+            int arc_idx;
+            StateId arc_next_state;
+            int q_idx;
+
+            if(valid_input) {
+                //we can do better than that
+                int local_q_idx = binsearch_maxle(params.d_degrees_scan, th_idx, 0, old_q_size-1); 
+
+                //printf("thx=%i, q_idx=%i, oldqsize=%i, oldqoff=%i \n", threadIdx.x, q_idx, old_q_size, old_q_offset);
+
+                int lower_bound = params.d_degrees_scan[local_q_idx];
+                int arc_offset_start = params.d_q_arc_offsets[local_q_idx];
+                q_idx = old_q_offset + local_q_idx;
+
+                arc_idx = arc_offset_start + (th_idx - lower_bound);
+
+                arc_next_state = params.arc_nextstates[arc_idx];
+                BaseFloat arc_weight = params.arc_weights[arc_idx];
+                BaseFloat next_state_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
+                BaseFloat old_tok_cost = params.d_q_info[q_idx].cost;
+
+                total_cost = arc_weight + old_tok_cost;
+
+                if(total_cost >= next_state_cost) {
+                    total_cost = FLT_MAX;
+                    valid_input = false; 
+                } 
+            }
+
+            BaseFloat thread_cutoff = (total_cost < FLT_MAX) ? (total_cost + params.beam) : FLT_MAX;
+            BaseFloat new_block_cutoff = BlockReduce(temp_storage_reduce).Reduce(thread_cutoff, cub::Min());
+
+            if(threadIdx.x == 0) {
+                if(new_block_cutoff < cutoff) {
+                    cutoff = new_block_cutoff;
+                }
+            }
+
+            __syncthreads();
+
+            int has_successor = (total_cost < cutoff && valid_input) ? 1 : 0;
+
+            if(has_successor) 
+                atomicMin(&params.d_lookup[arc_next_state], floatToOrderedInt(total_cost));
+            
+
+            int new_q_idx_block;
+
+            BlockScan(temp_storage_scan).ExclusiveSum(has_successor, new_q_idx_block);
+
+            if(has_successor) {
+                int new_q_index = new_q_end + new_q_idx_block;
+                params.d_q[new_q_index] = arc_next_state;
+
+                InfoToken new_tok_info;
+                new_tok_info.cost = total_cost;
+                new_tok_info.prev_token = q_idx;
+                new_tok_info.arc_idx = arc_idx;
+
+                params.d_q_info[new_q_index] = new_tok_info;
+ 
+            }
+
+            if(threadIdx.x == (NONEM_LT_DIMX - 1)) {
+                int total_in_block = new_q_idx_block + has_successor; // exclusive sum
+                new_q_end += total_in_block;
+            }
+        }
+
+        __syncthreads(); // new_q_end
+
+        old_q_size = new_q_end - new_q_offset; 
+
+    }
+
+    if(threadIdx.x == 0) {
+        // Next step is ProcessEmitting of next frame, from is currToken_offset
+        *params.d_q_token_from = *params.d_curr_token; 
+        *params.d_q_token_to = new_q_end;
+        *params.d_q_token_end = new_q_end;
+        *params.d_cutoff = cutoff;
+
+        *params.h_q_token_from_size = new_q_end - *params.d_q_token_from;
+    }
+
+}
+  
+void CudaDecoder::NonEmittingLongTail(unsigned int *d_arc_offsets, 
+                                const ExpandArcParams &params) {
+
+    dim3 grid,block;
+    block.x = NONEM_LT_DIMX;
+    grid.x = 1; // it is designed for the long tail
+    process_nonem_longtail<<<grid,block,0,compute_st>>>(d_arc_offsets, params);
+}
 
 } // end namespace kaldi.

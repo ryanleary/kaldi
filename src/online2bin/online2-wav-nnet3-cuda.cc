@@ -106,6 +106,7 @@ int main(int argc, char *argv[]) {
     int threads_per_gpu = omp_get_max_threads();
 
     po.Register("threads-per-gpu", &threads_per_gpu, "number of CPU threads to assign to each GPU");
+
     po.Register("chunk-length", &chunk_length_secs,
         "Length of chunk size in seconds, that we process.  Set to <= 0 "
         "to use all input in one chunk.");
@@ -167,9 +168,6 @@ int main(int argc, char *argv[]) {
 #endif
 #pragma omp barrier
       
-
-
-
         std::string nnet3_rxfilename = po.GetArg(1),
           fst_rxfilename = po.GetArg(2),
           spk2utt_rspecifier = po.GetArg(3),
@@ -309,7 +307,6 @@ int main(int argc, char *argv[]) {
 #if 0
             decoder.FinalizeDecoding();
 #endif
-
 
             Lattice lat;
             decoder.GetBestPath(true, &lat);
