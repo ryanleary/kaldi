@@ -19,8 +19,8 @@
 // limitations under the License.
 
 
-#ifndef KALDI_ONLINE2_ONLINE_NNET3_DECODING_H_
-#define KALDI_ONLINE2_ONLINE_NNET3_DECODING_H_
+#ifndef KALDI_ONLINE2_ONLINE_NNET3_CUDA_DECODING_H_
+#define KALDI_ONLINE2_ONLINE_NNET3_CUDA_DECODING_H_
 
 #include <string>
 #include <vector>
@@ -85,7 +85,7 @@ class SingleUtteranceNnet3CudaDecoder {
   // it's needed by the endpointing code.
   const TransitionModel &trans_model_;
 
-  nnet3::DecodableAmNnetLoopedOnline decodable_;
+  nnet3::DecodableAmNnetLoopedOnlineCuda decodable_;
 
   CudaDecoder decoder_;
 };
@@ -97,4 +97,4 @@ class SingleUtteranceNnet3CudaDecoder {
 
 
 
-#endif  // KALDI_ONLINE2_ONLINE_NNET3_DECODING_H_
+#endif  // KALDI_ONLINE2_ONLINE_NNET3_CUDA_DECODING_H_

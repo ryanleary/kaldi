@@ -194,9 +194,7 @@ namespace kaldi {
     // Comments about variables are in the .h file
 
     cudaStreamCreate(&compute_st);
-    cudaStreamCreate(&copy_st);
 
-    cudaEventCreate(&loglikelihood_evt);
     cudaEventCreate(&q_token_from_narcs_evt);
 
     cudaMalloc(&d_curr_token, sizeof(int));
@@ -219,9 +217,6 @@ namespace kaldi {
     cudaMalloc(&d_q_arc_offset, max_token_frame * sizeof(int));
 
     cudaMalloc(&loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
-    cudaMalloc(&next_loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
-    cudaMallocHost(&loglikelihoods_h, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
-
 
     cudaMalloc(&d_state_cost,sizeof(BaseFloat)*fst_.numStates);
 
@@ -388,8 +383,6 @@ void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
     while (num_frames_decoded_ < target_frames_decoded) {
         //KALDI_LOG << "New frame";
 
-        cudaEventSynchronize(loglikelihood_evt);
-        std::swap(next_loglikelihoods_d, loglikelihoods_d);
         num_frames_decoded_++; 
         ComputeLogLikelihoods(decodable);
 
@@ -414,19 +407,10 @@ void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
 
 
   void CudaDecoder::ComputeLogLikelihoods(DecodableInterface *decodable) {
-    nvtxRangePushA("ComputeLogLikelihoods");
 
     int32 frame = num_frames_decoded_;
 
-    decodable->ComputeLogLikelihoods(loglikelihoods_h,frame,fst_.max_ilabel+1);
-
-    //copying in another stream to overlap transfer with compute
-    cudaMemcpyAsync(next_loglikelihoods_d, loglikelihoods_h, sizeof(BaseFloat)*(fst_.max_ilabel+1), cudaMemcpyHostToDevice,
-    copy_st);
-
-    cudaEventRecord(loglikelihood_evt, copy_st);
-
-    nvtxRangePop();
+    decodable->ComputeLogLikelihoods(loglikelihoods_d,frame,fst_.max_ilabel+1, compute_st);
   }
 
 

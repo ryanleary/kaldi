@@ -305,11 +305,11 @@ class CudaDecoder {
 
   int max_tokens;
 
-  BaseFloat *loglikelihoods_h, *loglikelihoods_d, *next_loglikelihoods_d;  
+  BaseFloat *loglikelihoods_d;
 
   // Streams, overlap likelihoods copies with compute
-  cudaStream_t compute_st, copy_st;
-  cudaEvent_t loglikelihood_evt, q_token_from_narcs_evt;
+  cudaStream_t compute_st;
+  cudaEvent_t q_token_from_narcs_evt;
 
   //pre-computes log likelihoods for the current frame
   void ComputeLogLikelihoods(DecodableInterface *decodable);
