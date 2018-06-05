@@ -156,7 +156,6 @@ namespace kaldi {
         cudaMemcpy(arc_nextstates_d,arc_nextstates_h,arc_count*sizeof(StateId),cudaMemcpyHostToDevice);
         cudaMemcpy(arc_ilabels_d,arc_ilabels_h, arc_count*sizeof(int32),cudaMemcpyHostToDevice);
 
-        printf("narcs=%i \n", arc_count);
 
         cudaDeviceSynchronize();
         cudaCheckError();
@@ -205,9 +204,11 @@ namespace kaldi {
         int max_token_frame = 5000000; // move back to params
         // we could use same pointer
         cudaMalloc(&d_main_q_state, max_token_frame * sizeof(int));
+        cudaMallocHost(&h_main_q_state, max_token_frame * sizeof(int));
         cudaMalloc(&d_aux_q_state, max_token_frame * sizeof(int));
 
         cudaMalloc(&d_main_q_cost, max_token_frame * sizeof(CostType));
+        cudaMallocHost(&h_main_q_cost, max_token_frame * sizeof(CostType));
         cudaMalloc(&d_aux_q_cost, max_token_frame * sizeof(CostType));
 
         cudaMalloc(&d_main_q_info, max_token_frame * sizeof(InfoToken));
@@ -217,7 +218,6 @@ namespace kaldi {
         cudaMalloc(&bufi4, 6*sizeof(int));
 
         d_main_q_local_offset = &bufi4[0];
-        d_main_q_global_offset = &bufi4[1];
         d_aux_q_end = &bufi4[2];
 
         cudaMalloc(&d_main_q_end_and_narcs_i2, sizeof(QEndAndNarcs));
@@ -229,9 +229,10 @@ namespace kaldi {
 
         cudaMallocHost(&h_main_q_info, max_token_frame * sizeof(InfoToken));
 
-        cudaMallocHost(&d_main_q_end, sizeof(int));  
-        cudaMallocHost(&h_main_q_global_offset, sizeof(int));  
-        cudaMallocHost(&d_aux_q_end, sizeof(int));  
+        cudaMallocHost(&h_main_q_end, sizeof(int));  
+        cudaMallocHost(&h_main_q_narcs, sizeof(int));  
+        cudaMallocHost(&h_main_q_local_offset, sizeof(int));  
+        cudaMallocHost(&h_aux_q_end, sizeof(int));  
 
         // we could use same pointer
         cudaMalloc(&d_degrees_scan, max_token_frame * sizeof(int));
@@ -269,21 +270,25 @@ namespace kaldi {
 
         CostType cost = StdWeight::One().Value();
 
-        cudaMemcpy(d_main_q_state, &start_state, sizeof(StateId), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_main_q_cost, &cost, sizeof(CostType), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_main_q_info, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
+        // We'll call ProcessNonemitting just after,
+        // which will move tokens from aux to main
+        cudaMemcpy(d_aux_q_state, &start_state, sizeof(StateId), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aux_q_cost, &cost, sizeof(CostType), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aux_q_info, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
 
         // We simulate a regular execution for the first iteration
         cudaMemcpy(&d_state_cost[start_state], &cost, sizeof(CostType), cudaMemcpyHostToDevice);
 
-        cudaMemset(d_aux_q_end, 0, sizeof(int));
-        cudaMemset(d_main_q_local_offset, 0, sizeof(int));
-        cudaMemset(d_main_q_global_offset, 0, sizeof(int));
-
         // Init state is in queue
         int one = 1;
-        cudaMemcpy(d_main_q_end, &one, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aux_q_end, &one, sizeof(int), cudaMemcpyHostToDevice);
+        *h_aux_q_end = 1;
+
+        cudaMemset(d_main_q_end, 0, sizeof(int));
         *h_main_q_end = 1;
+
+        cudaMemset(d_main_q_local_offset, 0, sizeof(int));
+        main_q_global_offset = 0;
 
         CostType cutoff = FLT_MAX;
         cudaMemcpy(d_cutoff, &cutoff, sizeof(CostType), cudaMemcpyHostToDevice);
@@ -296,6 +301,13 @@ namespace kaldi {
 
         printf("CUDA DECODER InitDecoding 1/2\n");
         ProcessNonemitting();
+
+        int main_q_size = *h_main_q_end;
+        cudaMemcpy(h_main_q_info, d_main_q_info, main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
+        for(int i=0; i < main_q_size; ++i) {
+            h_all_token_info.push_back(h_main_q_info[i]);
+        }
+
         printf("CUDA DECODER InitDecoding 2/2\n");
     }
 
@@ -393,8 +405,11 @@ namespace kaldi {
 
         ComputeLogLikelihoods(decodable);
 
+        int prev_main_q_size = *h_main_q_end;
         while (num_frames_decoded_ < target_frames_decoded) {
-            //KALDI_LOG << "New frame";
+            cudaDeviceSynchronize();
+            //KALDI_LOG << "\n New frame off=" << main_q_global_offset;
+            cudaDeviceSynchronize();
 
             cudaEventSynchronize(loglikelihood_evt);
             std::swap(next_loglikelihoods_d, loglikelihoods_d);
@@ -403,12 +418,22 @@ namespace kaldi {
 
             //KALDI_LOG << "Emitting, frame=" << num_frames_decoded_;
             ProcessEmitting();
-
+            main_q_global_offset += prev_main_q_size;
             //KALDI_LOG << "Non Emitting";
             ProcessNonemitting(); 
+            
+            cudaDeviceSynchronize();
+            
+            prev_main_q_size = *h_main_q_end;
+            
+            //printf("copying %i elements \n", prev_main_q_size);
+            
+            cudaMemcpy(h_main_q_info, d_main_q_info, prev_main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
+            for(int i=0; i < prev_main_q_size; ++i) {
+                h_all_token_info.push_back(h_main_q_info[i]);
+            }
 
-
-            if(num_frames_decoded_ > 3) {
+            if(num_frames_decoded_ > 1) {
                 //KALDI_ASSERT(0); 
             }
 
@@ -451,6 +476,7 @@ namespace kaldi {
             FinalizePreprocessInPlace();
         } else {
             ContractAndPreprocess(d_arc_offsets);
+            cudaEventRecord(q_token_from_narcs_evt, compute_st);
         }
 
 
@@ -465,19 +491,25 @@ namespace kaldi {
         params.d_main_q_info = d_main_q_info;
 
         params.d_main_q_local_offset = d_main_q_local_offset;
-        params.d_main_q_global_offset = d_main_q_global_offset;
+        params.main_q_global_offset = main_q_global_offset;
+
         params.d_main_q_end = d_main_q_end;
+        params.d_main_q_narcs = d_main_q_narcs;
+
+        params.h_main_q_end = h_main_q_end;
+        params.h_main_q_narcs = h_main_q_narcs;
 
         params.d_aux_q_state = d_aux_q_state; 
         params.d_aux_q_cost = d_aux_q_cost; 
         params.d_aux_q_info = d_aux_q_info;
         params.d_aux_q_end = d_aux_q_end;
 
+        params.h_aux_q_end = h_aux_q_end;
+
         params.d_degrees_scan = d_degrees_scan; 
         params.d_q_arc_offsets = d_main_q_arc_offsets;
         params.arc_ilabels = fst_.arc_ilabels_d;
         params.is_emitting = is_emitting;
-        params.d_main_q_narcs = d_main_q_narcs;
 
         params.arc_weights = fst_.arc_weights_d; 
         params.arc_nextstates = fst_.arc_nextstates_d; 
@@ -487,7 +519,7 @@ namespace kaldi {
         params.d_lookup = d_state_cost;
 
         params.d_n_CTA_done = d_n_CTA_done;
-
+    
         bool done = false;
 
         if(main_q_narcs) {
@@ -578,7 +610,6 @@ namespace kaldi {
         __shared__ QEndAndNarcs blk_local_offset_i2;
 
         const int aux_q_end = *params.d_aux_q_end;
-
         BaseFloat cutoff = *params.d_cutoff;
 
         for(int block_offset = blockDim.x*blockIdx.x;
@@ -607,12 +638,17 @@ namespace kaldi {
                 } 
             }
 
+            // TODO use struct here, with overloaded operator+
+
             int is_pruned = (arc_start == -1);
             int2 scan_i2;
             scan_i2.x =  is_pruned ? 0 : 1;
             scan_i2.y =  degree;
 
-            BlockScan(temp_storage).ExclusiveScan(scan_i2, scan_i2, F2Sum());
+            int2 zeroi2;
+            zeroi2.x = zeroi2.y = 0;
+
+            BlockScan(temp_storage).ExclusiveScan(scan_i2, scan_i2, zeroi2, F2Sum());
 
             if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
                 // CUB Scan is exclusive
@@ -621,6 +657,8 @@ namespace kaldi {
                 inclusive_scan.split.narcs = scan_i2.y + degree;
 
                 blk_local_offset_i2.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, inclusive_scan.both);
+                //printf("m_q_end, before = %i, added = %i  \n", blk_local_offset_i2.split.end,
+                //inclusive_scan.split.end);
             }
 
             __syncthreads(); // blk_local_offset + temp_storage
@@ -635,6 +673,8 @@ namespace kaldi {
                 params.d_main_q_info[main_q_idx] = info;
 
                 params.d_degrees_scan[main_q_idx] = blk_local_offset_i2.split.narcs + scan_i2.y;
+                //printf("th=%i, idx=%i, scan=%i \n", threadIdx.x, main_q_idx, params.d_degrees_scan[main_q_idx]);
+
                 params.d_main_q_arc_offsets[main_q_idx] = arc_start;
             }
 
@@ -649,8 +689,10 @@ namespace kaldi {
                 __threadfence();
 
                 // Avoid a mem copy
-                *params.d_n_CTA_done = 0;
                 *params.h_main_q_narcs = *params.d_main_q_narcs; // pinned memory
+                *params.d_n_CTA_done = 0;
+                *params.d_aux_q_end = 0;
+
             }
         }
 
@@ -659,7 +701,7 @@ namespace kaldi {
 
 #define COMPUTE_DEGREES_DIMX 256
     __global__ void preprocess_in_place_kernel(PreprocessParams params) {
-
+    
         typedef cub::BlockScan<int, COMPUTE_DEGREES_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
@@ -719,6 +761,7 @@ namespace kaldi {
 
         // is_last_CTA + temp_storage reuse
         __syncthreads();
+        
         if(is_last_CTA)
         {
             // The last block alive takes care of scan of block sums 
@@ -779,7 +822,13 @@ namespace kaldi {
         params.d_main_q_cost = d_main_q_cost;
         params.d_main_q_info = d_main_q_info; 
         params.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2; 
+        params.d_main_q_narcs = d_main_q_narcs;
+        params.d_main_q_end = d_main_q_end;
 
+        params.d_main_q_local_offset = d_main_q_local_offset;
+
+        params.d_main_q_end = d_main_q_end;
+        params.h_main_q_narcs = h_main_q_narcs;
 
         params.d_degrees_scan = d_degrees_scan; 
         params.d_arc_offsets = d_arc_offsets;
@@ -790,7 +839,6 @@ namespace kaldi {
 
         params.d_degrees_block_scan = d_degrees_block_scan; 
 
-        params.h_main_q_narcs = h_main_q_narcs; 
         params.d_n_CTA_done = d_n_CTA_done;
 
         contract_and_preprocess_kernel<<<grid,block,0,compute_st>>>(params);
@@ -815,7 +863,11 @@ namespace kaldi {
         params.d_main_q_cost = d_main_q_cost;
         params.d_main_q_info = d_main_q_info; 
         params.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2; 
+        params.d_main_q_end = d_main_q_end; 
+        params.d_main_q_narcs = d_main_q_narcs; 
 
+
+        params.d_main_q_local_offset = d_main_q_local_offset;
 
         params.d_degrees_scan = d_degrees_scan; 
         params.d_arc_offsets = d_arc_offsets;
@@ -845,18 +897,18 @@ namespace kaldi {
        Not done for now, because expand is fast enough
 
      */
-    __global__ void finalize_degrees_scan_kernel(int *d_scan, int *d_blk_scan, const int *d_main_q_offset, const int
+    __global__ void finalize_degrees_scan_kernel(int *d_scan, int *d_blk_scan, const int *d_main_q_local_offset, const int
             *d_main_q_end) {
 
-        int q_off = *d_main_q_offset;
+        int q_off = *d_main_q_local_offset;
         int q_end = *d_main_q_end;
         int q_size = q_end - q_off;
 
-        for(int idx = blockDim.x*blockIdx.x + threadIdx.x;
+        for(int idx = q_off + blockDim.x*blockIdx.x + threadIdx.x;
                 idx < q_size;
                 idx += blockDim.x*gridDim.x) {
 
-            int blk_idx = idx / blockDim.x;
+            int blk_idx = (idx - q_off) / COMPUTE_DEGREES_DIMX;
             int blk_scan_offset = d_blk_scan[blk_idx]; // we rely on L1 for this one, avoiding syncs
 
             d_scan[idx] += blk_scan_offset;
@@ -944,7 +996,7 @@ namespace kaldi {
     struct CISum {
         __device__ CostTInt operator()(const CostTInt &a, const CostTInt &b) const {
             CostTInt c;
-            c.cost = a.cost + b.cost;
+            c.cost = fmin(a.cost, b.cost);
             c.i = a.i + b.i;
 
             return c;
@@ -962,8 +1014,9 @@ namespace kaldi {
 
         const int total_narcs = *params.d_main_q_narcs;
         const int main_q_offset = *params.d_main_q_local_offset;
-        const int main_q_size = *params.d_main_q_end - main_q_offset;
+        const int main_q_end = *params.d_main_q_end;
 
+        
         if(threadIdx.x == 0) {
             blk_cutoff = *params.d_cutoff;
         }
@@ -985,7 +1038,7 @@ namespace kaldi {
 
             if(valid_input) {
                 //we can do better than that
-                main_q_idx = main_q_offset + binsearch_maxle(params.d_degrees_scan, th_idx, 0, main_q_size-1); 
+                main_q_idx = binsearch_maxle(params.d_degrees_scan, th_idx, main_q_offset, main_q_end-1); 
 
                 int lower_bound = params.d_degrees_scan[main_q_idx];
                 int arc_offset_start = params.d_q_arc_offsets[main_q_idx];
@@ -993,7 +1046,7 @@ namespace kaldi {
                 arc_idx = arc_offset_start + (block_offset + threadIdx.x - lower_bound);
                 arc_next_state = params.arc_nextstates[arc_idx];
 
-                BaseFloat total_cost = params.arc_weights[arc_idx];
+                total_cost = params.arc_weights[arc_idx];
 
                 int arc_ilabel = params.is_emitting ? params.arc_ilabels[arc_idx] : 0;
                 total_cost += (arc_ilabel != 0) ? -params.d_loglikelihoods[arc_ilabel] : 0.0; 
@@ -1003,18 +1056,14 @@ namespace kaldi {
                     valid_input = false;
                 else {
                     // switch back to red, worst case is bad
-                    BaseFloat next_state_cost = orderedIntToFloat(
-                            atomicMin(&params.d_lookup[arc_next_state],
-                                floatToOrderedInt(total_cost)
-                                ));
+                    BaseFloat next_state_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
 
-                            if(total_cost >= next_state_cost)
-                            valid_input = false;
-                            }
-                            }
+                    if(total_cost >= next_state_cost)
+                        valid_input = false;
+                }
+            }
 
                             int has_successor = valid_input ? 1 : 0;  // Need a spot in the new q
-
                             CostTInt ci;
                             ci.cost = valid_input ? (total_cost + params.beam) : FLT_MAX; // new cutoff candidate
                             ci.i = has_successor;
@@ -1026,7 +1075,7 @@ namespace kaldi {
                                 to_q_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
 
                                 if(ci.cost < blk_cutoff) {
-                                    int new_cutoff = fatomicMin(params.d_cutoff, ci.cost);
+                                    CostType new_cutoff = fatomicMin(params.d_cutoff, ci.cost);
                                     blk_cutoff = fmin(ci.cost, new_cutoff);
                                 }
                             }
@@ -1036,11 +1085,15 @@ namespace kaldi {
                             ci.i -= has_successor; // we want the exclusive sum now
                             int to_q_index = to_q_block_offset + ci.i;
 
-                            // TODO local q in shared
 
                             if(has_successor) {
                                 params.d_aux_q_cost[to_q_index] = total_cost;
+                                
+                                atomicMin(&params.d_lookup[arc_next_state],
+                                floatToOrderedInt(total_cost)
+                                );
 
+                                //printf("cost = %f, cutoff = %f, beam=%f \n", total_cost, blk_cutoff, params.beam);
                                 if(total_cost < blk_cutoff) { // cutoff may have changed
                                     // We write the rest of the token only if necessary
                                     // if the cost is higher than cutoff, 
@@ -1049,10 +1102,16 @@ namespace kaldi {
                                     params.d_aux_q_state[to_q_index] = arc_next_state;
 
                                     InfoToken new_tok_info;
-                                    new_tok_info.prev_token = main_q_idx;
+                                    new_tok_info.prev_token = params.main_q_global_offset + main_q_idx;
                                     new_tok_info.arc_idx = arc_idx;
+                            
 
                                     params.d_aux_q_info[to_q_index] = new_tok_info;
+
+                                    /*
+                                    printf("expand, adding %i (%i)  -> %i \n", new_tok_info.prev_token,
+                                    params.main_q_global_offset, arc_next_state);
+                                    */
                                 }
                             }
         }
@@ -1067,6 +1126,15 @@ namespace kaldi {
                 *params.d_n_CTA_done = 0;
                 *params.d_main_q_narcs = 0;
                 *params.h_main_q_narcs = 0;
+
+                if(params.is_emitting) {
+                    *params.d_main_q_local_offset = 0;
+                    *params.d_main_q_end = 0;
+                    *params.h_main_q_end = 0;
+                } else {
+                    *params.d_main_q_local_offset = main_q_end;
+                }
+
             }
         }
 
@@ -1126,18 +1194,16 @@ namespace kaldi {
 
             __shared__ int total_narcs;
 
-            __shared__ int new_q_end;
-
             int old_q_offset = *params.d_main_q_local_offset;
             int new_q_offset = *params.d_main_q_end;
+            int new_q_end = new_q_offset;
 
             if(threadIdx.x == 0) {
-                new_q_end = new_q_offset;
                 total_narcs = *params.d_main_q_narcs;
             }
 
             __syncthreads();
-
+    
             int old_q_size = new_q_offset - old_q_offset;  // move to end
 
             cutoff = *params.d_cutoff;
@@ -1164,14 +1230,12 @@ namespace kaldi {
 
 
                     // Step 1 : compute_degrees
-                    for(int local_q_idx = threadIdx.x;
-                            local_q_idx < old_q_size;
-                            local_q_idx += blockDim.x) {
+                    for(int q_idx = old_q_offset + threadIdx.x;
+                            q_idx < new_q_offset; // = old_q_end
+                            q_idx += blockDim.x) {
 
-                        int global_q_idx = old_q_offset + local_q_idx;
-
-                        StateId state = params.d_main_q_state[global_q_idx];
-                        BaseFloat cost = params.d_main_q_cost[global_q_idx];
+                        StateId state = params.d_main_q_state[q_idx];
+                        BaseFloat cost = params.d_main_q_cost[q_idx];
 
                         int degree = 0;
                         if(cost < cutoff) {
@@ -1181,11 +1245,11 @@ namespace kaldi {
                                 int start = d_arc_offsets[state];
                                 int end = d_arc_offsets[state+1];
                                 degree = end - start;
-                                params.d_q_arc_offsets[local_q_idx] = start;
+                                params.d_q_arc_offsets[q_idx] = start;
                             }
                         }
 
-                        params.d_degrees_scan[local_q_idx] = degree;
+                        params.d_degrees_scan[q_idx] = degree;
                     }
 
                     __syncthreads();
@@ -1196,17 +1260,19 @@ namespace kaldi {
                             block_off < old_q_size;
                             block_off += blockDim.x) {
 
-                        int local_q_idx = block_off + threadIdx.x;
+                        int q_idx = old_q_offset + block_off + threadIdx.x;
 
-                        int degree = (local_q_idx < old_q_size) 
-                            ? params.d_degrees_scan[local_q_idx]
+                        int degree = (q_idx < new_q_offset) 
+                            ? params.d_degrees_scan[q_idx]
                             : 0;
                         int lscan;
                         BlockScan(temp_storage_scan).ExclusiveSum(degree, lscan);
                         int scan = lscan + total_narcs;
 
-                        if(local_q_idx < old_q_size)
-                            params.d_degrees_scan[local_q_idx] = scan;
+                        if(q_idx < new_q_offset)
+                            params.d_degrees_scan[q_idx] = scan;
+
+                        __syncthreads(); // TODO remove with local narcs
 
                         if(threadIdx.x == (NONEM_LT_DIMX-1)) {
                             int total_in_block = lscan + degree;
@@ -1216,12 +1282,11 @@ namespace kaldi {
                         __syncthreads();
                     }
 
+
                 } else {
                     first = false;    
                 }
 
-                //if(threadIdx.x == 0)
-                //    printf("narcs=%i \n", total_narcs);
 
                 // We already sync'ed
 
@@ -1241,13 +1306,10 @@ namespace kaldi {
 
                     if(valid_input) {
                         //we can do better than that
-                        int local_q_idx = binsearch_maxle(params.d_degrees_scan, th_idx, 0, old_q_size-1); 
+                        q_idx = binsearch_maxle(params.d_degrees_scan, th_idx, old_q_offset, new_q_offset-1); 
 
-                        //printf("thx=%i, q_idx=%i, oldqsize=%i, oldqoff=%i \n", threadIdx.x, q_idx, old_q_size, old_q_offset);
-
-                        int lower_bound = params.d_degrees_scan[local_q_idx];
-                        int arc_offset_start = params.d_q_arc_offsets[local_q_idx];
-                        q_idx = old_q_offset + local_q_idx;
+                        int lower_bound = params.d_degrees_scan[q_idx];
+                        int arc_offset_start = params.d_q_arc_offsets[q_idx];
 
                         arc_idx = arc_offset_start + (th_idx - lower_bound);
 
@@ -1281,9 +1343,9 @@ namespace kaldi {
                         atomicMin(&params.d_lookup[arc_next_state], floatToOrderedInt(total_cost));
 
 
-                    int new_q_idx_block;
-
-                    BlockScan(temp_storage_scan).ExclusiveSum(has_successor, new_q_idx_block);
+                    int new_q_idx_block = has_successor;
+                    int total_in_blk;
+                    BlockScan(temp_storage_scan).ExclusiveSum(new_q_idx_block, new_q_idx_block, total_in_blk);
 
                     if(has_successor) {
                         int new_q_index = new_q_end + new_q_idx_block;
@@ -1292,28 +1354,27 @@ namespace kaldi {
                         params.d_main_q_cost[new_q_index] = total_cost;
 
                         InfoToken new_tok_info;
-                        new_tok_info.prev_token = q_idx;
+                        new_tok_info.prev_token = params.main_q_global_offset + q_idx;
+
                         new_tok_info.arc_idx = arc_idx;
                         params.d_main_q_info[new_q_index] = new_tok_info;
+                        
+                        //printf("new q index = %i (%i+%i) (tot=%i) \n", new_q_index, new_q_end, new_q_idx_block,
+                        //total_in_blk);
+                   }
 
-                    }
-
-                    if(threadIdx.x == (NONEM_LT_DIMX - 1)) {
-                        int total_in_block = new_q_idx_block + has_successor; // exclusive sum
-                        new_q_end += total_in_block;
-                    }
+                    new_q_end += total_in_blk;
                 }
 
-                __syncthreads(); // new_q_end
-
                 old_q_size = new_q_end - new_q_offset; 
-
             }
 
             if(threadIdx.x == 0) {
                 // Next step is ProcessEmitting of next frame, from is currToken_offset
                 *params.d_main_q_end = new_q_end; 
                 *params.h_main_q_end = new_q_end; 
+
+                *params.d_main_q_local_offset = 0; 
 
                 *params.d_cutoff = cutoff;
             }
@@ -1362,7 +1423,8 @@ namespace kaldi {
             }
         }
 
-        best_cost_idx += *h_main_q_global_offset;
+        printf("global_offset=%i \n", main_q_global_offset);
+        best_cost_idx += main_q_global_offset; 
 
         *min = best_cost;
         *arg = best_cost_idx;
@@ -1384,6 +1446,7 @@ namespace kaldi {
     // Outputs an FST corresponding to the single best path
     // through the lattice.
     bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
+        printf("Get best path \n");
         nvtxRangePushA("GetBestPath");
 
         bool isfinal = ReachedFinal();
@@ -1393,7 +1456,7 @@ namespace kaldi {
 
 
         printf("is final = %i \n", isfinal);
-        printf("best cost : %f  with arg = %f \n", best_cost, arg_best);
+        printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
 
         int token_idx = arg_best;
         std::vector<int> reversed_path;
