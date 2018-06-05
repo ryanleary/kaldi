@@ -75,7 +75,7 @@ void FasterDecoder::AdvanceDecoding(DecodableInterface *decodable,
 }
 
 
-bool FasterDecoder::ReachedFinal() {
+bool FasterDecoder::ReachedFinal() const {
   for (const Elem *e = toks_.GetList(); e != NULL; e = e->tail) {
     if (e->val->cost_ != std::numeric_limits<double>::infinity() &&
         fst_.Final(e->key) != Weight::Zero())
@@ -85,7 +85,7 @@ bool FasterDecoder::ReachedFinal() {
 }
 
 bool FasterDecoder::GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
-                                bool use_final_probs) {
+                                bool use_final_probs) const {
   // GetBestPath gets the decoding output.  If "use_final_probs" is true
   // AND we reached a final state, it limits itself to final states;
   // otherwise it gets the most likely token not taking into

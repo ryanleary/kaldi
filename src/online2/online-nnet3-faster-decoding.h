@@ -19,8 +19,8 @@
 // limitations under the License.
 
 
-#ifndef KALDI_ONLINE2_ONLINE_NNET3_CUDA_DECODING_H_
-#define KALDI_ONLINE2_ONLINE_NNET3_CUDA_DECODING_H_
+#ifndef KALDI_ONLINE2_ONLINE_NNET3_DECODING_H_
+#define KALDI_ONLINE2_ONLINE_NNET3_DECODING_H_
 
 #include <string>
 #include <vector>
@@ -34,7 +34,7 @@
 #include "online2/online-endpoint.h"
 #include "online2/online-nnet2-feature-pipeline.h"
 #include "decoder/lattice-faster-online-decoder.h"
-#include "decoder/cuda-decoder.h"
+#include "decoder/faster-decoder.h"
 #include "hmm/transition-model.h"
 #include "hmm/posterior.h"
 
@@ -47,15 +47,15 @@ namespace kaldi {
    You will instantiate this class when you want to decode a single
    utterance using the online-decoding setup for neural nets.
 */
-class SingleUtteranceNnet3CudaDecoder {
+class SingleUtteranceNnet3FasterDecoder {
  public:
 
   // Constructor. The pointer 'features' is not being given to this class to own
   // and deallocate, it is owned externally.
-  SingleUtteranceNnet3CudaDecoder(const CudaDecoderConfig &decoder_opts,
+  SingleUtteranceNnet3FasterDecoder(const FasterDecoderOptions &decoder_opts,
                               const TransitionModel &trans_model,
                               const nnet3::DecodableNnetSimpleLoopedInfo &info,
-                              const CudaFst &fst,
+ 			      const fst::Fst<fst::StdArc> &fst,
                               OnlineNnet2FeaturePipeline *features);
 
   /// advance the decoding as far as we can.
@@ -70,12 +70,12 @@ class SingleUtteranceNnet3CudaDecoder {
   void GetBestPath(bool end_of_utterance,
                    Lattice *best_path) const;
 
-  const CudaDecoder &Decoder() const { return decoder_; }
+  const FasterDecoder &Decoder() const { return decoder_; }
 
-  ~SingleUtteranceNnet3CudaDecoder() { }
+  ~SingleUtteranceNnet3FasterDecoder() { }
  private:
 
-  const CudaDecoderConfig &decoder_opts_;
+  const FasterDecoderOptions &decoder_opts_;
 
   // this is remembered from the constructor; it's ultimately
   // derived from calling FrameShiftInSeconds() on the feature pipeline.
@@ -85,9 +85,9 @@ class SingleUtteranceNnet3CudaDecoder {
   // it's needed by the endpointing code.
   const TransitionModel &trans_model_;
 
-  nnet3::DecodableAmNnetLoopedOnlineCuda decodable_;
+  nnet3::DecodableAmNnetLoopedOnline decodable_;
 
-  CudaDecoder decoder_;
+  FasterDecoder decoder_;
 };
 
 
@@ -97,4 +97,4 @@ class SingleUtteranceNnet3CudaDecoder {
 
 
 
-#endif  // KALDI_ONLINE2_ONLINE_NNET3_CUDA_DECODING_H_
+#endif  // KALDI_ONLINE2_ONLINE_NNET3_DECODING_H_
