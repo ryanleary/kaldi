@@ -94,6 +94,7 @@ namespace kaldi {
             e_offsets_h[i+1]=e_count;
         }
 
+        printf("max ilabel=%i \n", max_ilabel);
         //offset ne_offsets by the number of emitting arcs
         for(int i=0;i<numStates+1;i++) {
             e_offsets_h[i]+=1;          //add dummy arc at the beginingg.
@@ -114,7 +115,8 @@ namespace kaldi {
 
         cudaMalloc((void**)&arc_weights_d,arc_count*sizeof(BaseFloat));
         cudaMalloc((void**)&arc_nextstates_d,arc_count*sizeof(StateId));
-        cudaMalloc((void**)&arc_ilabels_d,arc_count*sizeof(int32)); 
+        // Only the ilabels for the e_arc are needed on the device
+        cudaMalloc((void**)&arc_ilabels_d,e_count*sizeof(int32)); 
 
         //now populate arc data
         int e_idx=1;          //save room for dummy arc (so start at 1)
@@ -141,12 +143,12 @@ namespace kaldi {
                 arc_nextstates_h[idx]=arc.nextstate;
                 arc_ilabels_h[idx]=arc.ilabel;
                 arc_olabels_h[idx]=arc.olabel;
-            }
+               }
         }
 
         cudaMemcpy(arc_weights_d,arc_weights_h,arc_count*sizeof(BaseFloat),cudaMemcpyHostToDevice);
         cudaMemcpy(arc_nextstates_d,arc_nextstates_h,arc_count*sizeof(StateId),cudaMemcpyHostToDevice);
-        cudaMemcpy(arc_ilabels_d,arc_ilabels_h, arc_count*sizeof(int32),cudaMemcpyHostToDevice);
+        cudaMemcpy(arc_ilabels_d,arc_ilabels_h, e_count*sizeof(int32),cudaMemcpyHostToDevice);
 
         cudaDeviceSynchronize();
         cudaCheckError();
