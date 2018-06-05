@@ -288,7 +288,7 @@ namespace kaldi {
         *h_aux_q_end = 1;
 
         cudaMemset(d_main_q_end, 0, sizeof(int));
-        *h_main_q_end = 1;
+        *h_main_q_end = 0;
 
         cudaMemset(d_main_q_local_offset, 0, sizeof(int));
         main_q_global_offset = 0;
@@ -398,6 +398,7 @@ namespace kaldi {
         // make sense) or the decodable object changed between calls
         // (which isn't allowed).
         KALDI_ASSERT(num_frames_ready >= num_frames_decoded_);
+
         int32 target_frames_decoded = num_frames_ready;
         if (max_num_frames >= 0)
             target_frames_decoded = std::min(target_frames_decoded,
@@ -407,26 +408,36 @@ namespace kaldi {
 
         int prev_main_q_size = *h_main_q_end;
         while (num_frames_decoded_ < target_frames_decoded) {
-            //KALDI_LOG << "\n New frame off=" << main_q_global_offset;
+            
+            // Computing a new frame
 
             cudaEventSynchronize(loglikelihood_evt);
             std::swap(next_loglikelihoods_d, loglikelihoods_d);
             num_frames_decoded_++; 
             ComputeLogLikelihoods(decodable);
 
-            //KALDI_LOG << "Emitting, frame=" << num_frames_decoded_;
+            // Emitting 
+            // we will not write in the main q in that step
+            // (preprocess is in place)
+            // we don't need can_write_to_main_q
             ProcessEmitting();
+            // After process emitting we won't need the token
+            // associated with the previous frame
+            // the main q has been flushed, we update its offset
             main_q_global_offset += prev_main_q_size;
             
-            //KALDI_LOG << "Non Emitting";
-
+            // Non Emitting
+            // we will write to the main q 
+            // (preprocess is "contract and preprocess")
             cudaEventSynchronize(can_write_to_main_q);
             ProcessNonemitting(); 
             
             prev_main_q_size = *h_main_q_end;
             
-            //printf("copying %i elements \n", prev_main_q_size);
-            
+            // We are done with the current frame
+            // We copy back its pruned tokens to the host
+            // We only copy the "info" part (arc_idx + prev_token)
+            // because we don't need anything else for the final backtrack
             cudaMemcpyAsync(&h_all_tokens_info[main_q_global_offset], 
                             d_main_q_info, 
                             prev_main_q_size*sizeof(InfoToken),
@@ -434,12 +445,6 @@ namespace kaldi {
                             copy_st);
             cudaEventRecord(can_write_to_main_q, copy_st);
 
-            if(num_frames_decoded_ > 1) {
-                //KALDI_ASSERT(0); 
-            }
-
-            //printf("total to save = %i \n", h_debug_cnt);
-            //computes log likelihoods for the next frame - check order
         }   
 
 
@@ -559,15 +564,15 @@ namespace kaldi {
         nvtxRangePushA("ProcessNonemitting");
 
         // While not done, call it
+        // If remaining n_arcs < 4k, 
+        // ProcessToken will call a persistent kernel
         while(!ProcessToken(fst_.ne_offsets_d, false));
 
         cudaCheckError();
         nvtxRangePop();
     }
 
-    // TODO use struct for params, 
-    // large # of args slow things down
-
+    // TODO rename
     struct F2Sum {
         __device__ int2 operator()(const int2 &a, const int2 &b) const {
             int2 c;
@@ -578,29 +583,32 @@ namespace kaldi {
         }
     };
 
+    typedef CudaDecoder::PreprocessParams PreprocessParams; // TODO move
     /*
+       This kernel preprocess the necessary information for expand (scan of the outgoing degrees) 
+       and explicitly prune the tokens
+
+       It contracts (by pruning) the queue list:
+       raw output from aux_q ----contract----> pruned output in main q
 
        This kernel is responsible for :
 
-       1) Read a token from the input queue [from, to[
+       1) Read a token from the aux queue (raw output from previous expand)
+
        2) Compute the outgoing degree of that token.next_state. For that :
-       -> If that token is suboptimal (cutoff, best_cost), degree = 0
+       -> If that token is suboptimal (cutoff, best_cost), we prune it
        -> Otherwise, we set degree using CSR graph
 
-       The distinction between emitting / non emitting depends on the argument passed
-       as "d_q_arc_offset"
+       3) We move the non-pruned tokens into the main q. After a local prefix sum,
+       we request a spot using the main_q_end_and_narcs counter. 
+       main_q_end_and_narcs.split.end contains the number of tokens in the main q until now
+       main_q_end_and_narcs.split.narcs contains the number of arcs in the main q until now
 
-       3) Compute prefix sums of those degrees within the block :
-       -> We store those "local prefix sums" in d_degrees_scan. Another kernel will finish the job
-       -> We save the sum of all degrees in that block (block_sums)
+       We also do the degrees scan in one pass using the maind_q_end_and_narcs.split.narcs
 
-       4) The last block alive compute the prefix sums of block_sums. 
-       -> We save it, it will be needed to compute global_scan
-       -> We now have the total number of arcs overall, we save it to h_q_token_from_narcs
+       This kernel is used before ProcessNonEmitting
+    */
 
-     */
-
-    typedef CudaDecoder::PreprocessParams PreprocessParams; // TODO
 #define COMPUTE_DEGREES_DIMX 256
     __global__ void contract_and_preprocess_kernel(PreprocessParams params) {
 
@@ -639,17 +647,15 @@ namespace kaldi {
                 } 
             }
 
-            // TODO use struct here, with overloaded operator+
-
             int is_pruned = (arc_start == -1);
             int2 scan_i2;
             scan_i2.x =  is_pruned ? 0 : 1;
             scan_i2.y =  degree;
 
-            int2 zeroi2;
-            zeroi2.x = zeroi2.y = 0;
+            int2 zero_i2;
+            zero_i2.x = zero_i2.y = 0;
 
-            BlockScan(temp_storage).ExclusiveScan(scan_i2, scan_i2, zeroi2, F2Sum());
+            BlockScan(temp_storage).ExclusiveScan(scan_i2, scan_i2, zero_i2, F2Sum());
 
             if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
                 // CUB Scan is exclusive
@@ -658,13 +664,12 @@ namespace kaldi {
                 inclusive_scan.split.narcs = scan_i2.y + degree;
 
                 blk_local_offset_i2.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, inclusive_scan.both);
-                //printf("m_q_end, before = %i, added = %i  \n", blk_local_offset_i2.split.end,
-                //inclusive_scan.split.end);
             }
 
             __syncthreads(); // blk_local_offset + temp_storage
 
             if(!is_pruned) {
+                // Moving non-pruned to the main q
                 int main_q_idx = blk_local_offset_i2.split.end + scan_i2.x;
 
                 InfoToken info = params.d_aux_q_info[aux_q_idx];
@@ -674,7 +679,6 @@ namespace kaldi {
                 params.d_main_q_info[main_q_idx] = info;
 
                 params.d_degrees_scan[main_q_idx] = blk_local_offset_i2.split.narcs + scan_i2.y;
-                //printf("th=%i, idx=%i, scan=%i \n", threadIdx.x, main_q_idx, params.d_degrees_scan[main_q_idx]);
 
                 params.d_main_q_arc_offsets[main_q_idx] = arc_start;
             }
@@ -692,13 +696,26 @@ namespace kaldi {
                 // Avoid a mem copy
                 *params.h_main_q_narcs = *params.d_main_q_narcs; // pinned memory
                 *params.d_n_CTA_done = 0;
-                *params.d_aux_q_end = 0;
+                *params.d_aux_q_end = 0; // we flushed the aux q
 
             }
         }
 
     }
 
+
+/*
+    This kernel is also a preprocessing kernel, but this time does it in place
+    The tokens are already in the main q (they were placed here by a previous "contract and preprocess"). We implicitly
+    prune the non-optimal ones (by setting the degree to 0), and we compute the degrees scan.
+
+    Here we have to do the scan in two passes : the scan will be finished in "finalize_preprocess"
+
+    This preprocess step is used in ProcessEmitting. Tokens were placed in main_q by
+    the ProcessNonEmitting of the previous frame. We cannot renumber them (it would break
+    the prev_token index). We preprocess in place, leaving things as they are in main_q
+
+*/
 
 #define COMPUTE_DEGREES_DIMX 256
     __global__ void preprocess_in_place_kernel(PreprocessParams params) {
@@ -744,14 +761,10 @@ namespace kaldi {
 
 
             if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1))
-            {
                 params.d_degrees_block_scan[block_offset/COMPUTE_DEGREES_DIMX] = (scan + degree); 
-            }
 
             if((block_offset + gridDim.x*blockDim.x) < queue_end)
-            {
                 __syncthreads(); // we'll reuse temp_storage
-            }
         }
 
         if(threadIdx.x == 0) {
@@ -806,7 +819,7 @@ namespace kaldi {
 
 
 
-
+// TODO merge the two struct 
     void CudaDecoder::ContractAndPreprocess(unsigned int *d_arc_offsets) {
         dim3 grid,block;
         block.x = COMPUTE_DEGREES_DIMX;
@@ -966,26 +979,17 @@ namespace kaldi {
 
     }
 
-    typedef CudaDecoder::ExpandArcParams ExpandArcParams; // TODO
+    typedef CudaDecoder::ExpandArcParams ExpandArcParams; // TODO move
 
 #define EXPAND_ARCS_DIMX 256
 
     /*
 
-       This kernel propagates arcs from the current queue [from,to[
-       to the new queue [to,end[
+       This kernel propagates arcs from the main q [main_q_local_offset, main_q_end[
+       to the aux
 
        The main bottleneck is the first binary search. 
-       If we want to remove that bottleneck, cf comments on FinalizeScan
-
-
-       TODO merge reduce and scan for code simplicity + remove syncs
-
-       The last block alive moves the queues indexes :
-       new from is old to
-       new to is new end
-       new end stays new end
-
+       If we want to remove it, preprocess it on the fly in preprocess
 
      */
 
@@ -1169,13 +1173,12 @@ namespace kaldi {
        (by corresponding kernels)
 
        At the end, this kernel finalize the computation for current frame,
-       setting the queue [from,to[ to the complete curr_token queue
        so that it's ready for next ProcessEmitting
 
        We could optimize and speed up this kernel
        It will only gives us a better latency for 1 stream, which is low enough
        Instead, we let it compute while we use the GPU for other streams
-       This kernel only uses one block, and is a free rider on the GPU
+       This kernel only uses one block
 
      */
 
