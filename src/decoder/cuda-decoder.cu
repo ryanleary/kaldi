@@ -1193,17 +1193,12 @@ namespace kaldi {
 
             __shared__ BaseFloat cutoff;
 
-            __shared__ int total_narcs;
 
             int old_q_offset = *params.d_main_q_local_offset;
             int new_q_offset = *params.d_main_q_end;
             int new_q_end = new_q_offset;
 
-            if(threadIdx.x == 0) {
-                total_narcs = *params.d_main_q_narcs;
-            }
-
-            __syncthreads();
+            int total_narcs = *params.d_main_q_narcs;
     
             int old_q_size = new_q_offset - old_q_offset;  // move to end
 
@@ -1222,15 +1217,11 @@ namespace kaldi {
                 new_q_offset = new_q_end;
 
                 if(!first) {
-
-                    if(threadIdx.x == 0)  {
-                        total_narcs = 0;
-                    }
-
-                    __syncthreads();
-
+                    __syncthreads(); // old_q_ready
+                    total_narcs = 0;
 
                     // Step 1 : compute_degrees
+                    // TODO fuse 1 and 2
                     for(int q_idx = old_q_offset + threadIdx.x;
                             q_idx < new_q_offset; // = old_q_end
                             q_idx += blockDim.x) {
@@ -1253,7 +1244,7 @@ namespace kaldi {
                         params.d_degrees_scan[q_idx] = degree;
                     }
 
-                    __syncthreads();
+                    __syncthreads(); // will be removed
 
                     // Step 2 : Scan
 
@@ -1267,20 +1258,15 @@ namespace kaldi {
                             ? params.d_degrees_scan[q_idx]
                             : 0;
                         int lscan;
-                        BlockScan(temp_storage_scan).ExclusiveSum(degree, lscan);
+                        int total_in_blk;
+                        BlockScan(temp_storage_scan).ExclusiveSum(degree, lscan, total_in_blk);
                         int scan = lscan + total_narcs;
+                        total_narcs += total_in_blk;
 
                         if(q_idx < new_q_offset)
                             params.d_degrees_scan[q_idx] = scan;
 
-                        __syncthreads(); // TODO remove with local narcs
-
-                        if(threadIdx.x == (NONEM_LT_DIMX-1)) {
-                            int total_in_block = lscan + degree;
-                            total_narcs += total_in_block;
-                        }
-
-                        __syncthreads();
+                         __syncthreads(); // reusing temp_storage_scan + degrees ready
                     }
 
 
