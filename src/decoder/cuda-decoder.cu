@@ -44,12 +44,7 @@ namespace kaldi {
 
     /***************************************CudaFst Implementation*****************************************/
     HOST DEVICE inline float CudaFst::Final(StateId state) const {
-#ifdef __CUDA_ARCH__
-        return final_d[state];
-#else
         return final_h[state];
-#endif
-
     }
     void CudaFst::initialize(const fst::Fst<StdArc> &fst) {
         nvtxRangePushA("CudaFst constructor");
@@ -61,7 +56,6 @@ namespace kaldi {
         }
         start=fst.Start();
         cudaMallocHost(&final_h,sizeof(float)*numStates);
-        cudaMalloc(&final_d,sizeof(float)*numStates);
 
         //allocate and initialize offset arrays
         e_offsets_h=(unsigned int *)malloc(sizeof(unsigned int)*(numStates+1));
@@ -107,8 +101,6 @@ namespace kaldi {
         }
 
         arc_count=e_count+ne_count+1;
-
-        cudaMemcpy(final_d,final_h,sizeof(float)*numStates,cudaMemcpyHostToDevice);
 
         cudaMemcpy(e_offsets_d,e_offsets_h,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice);
         cudaMemcpy(ne_offsets_d,ne_offsets_h,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice);
@@ -167,7 +159,6 @@ namespace kaldi {
         nvtxRangePushA("CudaFst destructor");
         printf("CudaFst::finalize()\n");
         cudaFreeHost(final_h);
-        cudaFree(final_d);
         free(e_offsets_h);
         free(ne_offsets_h);
 
@@ -187,11 +178,12 @@ namespace kaldi {
 
     /***************************************End CudaFst****************************************************/
 
-    CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), beam_(config.beam),
-    bytes_cudaMalloc(0), max_tokens(config.max_tokens) {
+    CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), 
+                     beam_(config.beam),
+                     bytes_cudaMalloc(0), 
+                     max_tokens_(config.max_tokens), 
+                     max_tokens_per_frame_(config.max_tokens_per_frame) {
         printf("CudaDecoder2 Constructor\n");
-
-        int max_token = config.max_tokens; // for CUB
 
         // Comments about variables are in the .h file
 
@@ -202,45 +194,37 @@ namespace kaldi {
         cudaEventCreate(&q_token_from_narcs_evt);
         cudaEventCreate(&can_write_to_main_q);
 
-        int max_token_frame = 5000000; // move back to params
-        int max_token_all_frames = 1000000000; // move back to params + use a pinned memory vector
+        cudaMalloc(&d_main_q_state, max_tokens_per_frame_ * sizeof(int));
+        cudaMallocHost(&h_main_q_state, max_tokens_per_frame_ * sizeof(int));
+        cudaMalloc(&d_aux_q_state, max_tokens_per_frame_ * sizeof(int));
 
-        // we could use same pointer
-        cudaMalloc(&d_main_q_state, max_token_frame * sizeof(int));
-        cudaMallocHost(&h_main_q_state, max_token_frame * sizeof(int));
-        cudaMalloc(&d_aux_q_state, max_token_frame * sizeof(int));
+        cudaMalloc(&d_main_q_cost, max_tokens_per_frame_ * sizeof(CostType));
+        cudaMallocHost(&h_main_q_cost, max_tokens_per_frame_ * sizeof(CostType));
+        cudaMalloc(&d_aux_q_cost, max_tokens_per_frame_ * sizeof(CostType));
 
-        cudaMalloc(&d_main_q_cost, max_token_frame * sizeof(CostType));
-        cudaMallocHost(&h_main_q_cost, max_token_frame * sizeof(CostType));
-        cudaMalloc(&d_aux_q_cost, max_token_frame * sizeof(CostType));
+        cudaMalloc(&d_main_q_info, max_tokens_per_frame_ * sizeof(InfoToken));
+        cudaMalloc(&d_aux_q_info, max_tokens_per_frame_ * sizeof(InfoToken));
 
-        cudaMalloc(&d_main_q_info, max_token_frame * sizeof(InfoToken));
-        cudaMalloc(&d_aux_q_info, max_token_frame * sizeof(InfoToken));
-
-        int *bufi4;
-        cudaMalloc(&bufi4, 6*sizeof(int));
-
-        d_main_q_local_offset = &bufi4[0];
-        d_aux_q_end = &bufi4[2];
+        cudaMalloc(&d_main_q_local_offset, sizeof(int));
+        cudaMalloc(&d_aux_q_end, sizeof(int));
+        cudaMalloc(&d_n_CTA_done, sizeof(int));
 
         cudaMalloc(&d_main_q_end_and_narcs_i2, sizeof(QEndAndNarcs));
-
         d_main_q_narcs = &d_main_q_end_and_narcs_i2->split.narcs;
         d_main_q_end = &d_main_q_end_and_narcs_i2->split.end;
 
         cudaMalloc(&d_cutoff, sizeof(BaseFloat));
 
-        cudaMallocHost(&h_all_tokens_info, max_token_all_frames * sizeof(InfoToken));
+        cudaMallocHost(&h_all_tokens_info, max_tokens_ * sizeof(InfoToken));
 
         cudaMallocHost(&h_main_q_end, sizeof(int));  
         cudaMallocHost(&h_main_q_narcs, sizeof(int));  
         cudaMallocHost(&h_main_q_local_offset, sizeof(int));  
         cudaMallocHost(&h_aux_q_end, sizeof(int));  
 
-        // we could use same pointer
-        cudaMalloc(&d_degrees_scan, max_token_frame * sizeof(int));
-        cudaMalloc(&d_degrees_block_scan, (max_token_frame / 256 + 2)* sizeof(int)); // TODO remove hardcoded
-        cudaMalloc(&d_main_q_arc_offsets, max_token_frame * sizeof(int));
+        cudaMalloc(&d_degrees_scan, max_tokens_per_frame_ * sizeof(int));
+        cudaMalloc(&d_degrees_block_scan, (max_tokens_per_frame_ / 256 + 2)* sizeof(int)); // TODO remove hardcoded
+        cudaMalloc(&d_main_q_arc_offsets, max_tokens_per_frame_ * sizeof(int));
 
         cudaMalloc(&loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
         cudaMalloc(&next_loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
@@ -248,14 +232,54 @@ namespace kaldi {
 
         cudaMalloc(&d_state_cost,sizeof(CostType)*fst_.numStates);
 
-        cudaMalloc(&d_n_CTA_done, sizeof(int));
-
         cudaCheckError();
     }
 
     CudaDecoder::~CudaDecoder() {
         printf("CUDA DECODER DESTRUCTOR\n");
-        // TODO
+
+        cudaStreamDestroy(compute_st);
+        cudaStreamDestroy(copy_st);
+
+        cudaEventDestroy(loglikelihood_evt);
+        cudaEventDestroy(q_token_from_narcs_evt);
+        cudaEventDestroy(can_write_to_main_q);
+
+        cudaFree(d_main_q_state);
+        cudaFreeHost(h_main_q_state);
+        cudaFree(d_aux_q_state);
+
+        cudaFree(d_main_q_cost);
+        cudaFreeHost(h_main_q_cost);
+        cudaFree(d_aux_q_cost);
+
+        cudaFree(d_main_q_info);
+        cudaFree(d_aux_q_info);
+
+        cudaFree(d_main_q_local_offset);
+        cudaFree(d_aux_q_end);
+        cudaFree(d_n_CTA_done);
+
+        cudaFree(d_main_q_end_and_narcs_i2);
+
+        cudaFree(d_cutoff);
+
+        cudaFreeHost(h_all_tokens_info);
+
+        cudaFreeHost(h_main_q_end);
+        cudaFreeHost(h_main_q_narcs);
+        cudaFreeHost(h_main_q_local_offset);
+        cudaFreeHost(h_aux_q_end);
+
+        cudaFree(d_degrees_scan);
+        cudaFree(d_degrees_block_scan);
+        cudaFree(d_main_q_arc_offsets);
+
+        cudaFree(loglikelihoods_d);
+        cudaFree(next_loglikelihoods_d);
+        cudaFreeHost(loglikelihoods_h);
+
+        cudaFree(d_state_cost);
     }
 
     void CudaDecoder::InitDecoding() {
@@ -447,6 +471,7 @@ namespace kaldi {
 
         }   
 
+        cudaEventSynchronize(can_write_to_main_q); // We want the copy to be done
 
         printf("AdvanceDecoding Done\n");
         nvtxRangePop();

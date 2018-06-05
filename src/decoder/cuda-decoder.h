@@ -85,7 +85,7 @@ class CudaFst {
     int32 *arc_olabels_h;
 
     //final costs
-    float *final_h, *final_d;
+    float *final_h;
     //allocation size
     size_t bytes_cudaMalloc;
 };
@@ -98,16 +98,14 @@ struct CudaDecoderConfig {
   
   CudaDecoderConfig(): beam(16.0),
                        gpu_fraction(1.0/8.0),
-                       max_tokens(300000000) {}
+                       max_tokens(300000000),
+                       max_tokens_per_frame(500000000) {}
   
   void Register(OptionsItf *opts) {
     opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");
-    opts->Register("gpu-fraction", &gpu_fraction, "Percent of GPU to use for this decoder.  "
-                                                  "A single decoding cannot saturate the device.  "
-                                                  "Use multiple decoders in parallel for the best performance.");
-    opts->Register("max-tokens-allocated", &max_tokens, "Total number of tokens allocated.  This controls how many tokens are allocated to the entire decoding process."
-                                                        "  If actual usaged exceeds this the results are undefined.");
-  }
+    opts->Register("max-tokens-pre-allocated", &max_tokens, "Total number of tokens pre-allocated (equivalent to reserve in a std vector).  If actual usaged exceeds this performance will be degraded");
+    opts->Register("tokens-per-frame-allocated", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
+   }
   void Check() const {
     KALDI_ASSERT(beam > 0.0 && gpu_fraction>0 && gpu_fraction <= 1 && max_tokens_per_frame > 0 && max_tokens>0);
   }
@@ -314,8 +312,6 @@ class CudaDecoder {
   // Current cutoff for current frame
   BaseFloat *d_cutoff;
 
-  int max_tokens;
-
   BaseFloat *loglikelihoods_h, *loglikelihoods_d, *next_loglikelihoods_d;  
 
   // Streams, overlap likelihoods copies with compute
@@ -346,14 +342,13 @@ class CudaDecoder {
   const CudaFst fst_;
 
   BaseFloat beam_;
+  int max_tokens_, max_tokens_per_frame_;
+  
 
   // Keep track of the number of frames decoded in the current file.
   int32 num_frames_decoded_;
 
   BaseFloat *cutoff;
-
-  cudaEvent_t event;
-  cudaStream_t st1;
 
   size_t bytes_cudaMalloc, bytes_cudaMallocManaged;
 
