@@ -200,8 +200,11 @@ namespace kaldi {
 
         cudaEventCreate(&loglikelihood_evt);
         cudaEventCreate(&q_token_from_narcs_evt);
+        cudaEventCreate(&can_write_to_main_q);
 
         int max_token_frame = 5000000; // move back to params
+        int max_token_all_frames = 1000000000; // move back to params + use a pinned memory vector
+
         // we could use same pointer
         cudaMalloc(&d_main_q_state, max_token_frame * sizeof(int));
         cudaMallocHost(&h_main_q_state, max_token_frame * sizeof(int));
@@ -227,7 +230,7 @@ namespace kaldi {
 
         cudaMalloc(&d_cutoff, sizeof(BaseFloat));
 
-        cudaMallocHost(&h_main_q_info, max_token_frame * sizeof(InfoToken));
+        cudaMallocHost(&h_all_tokens_info, max_token_all_frames * sizeof(InfoToken));
 
         cudaMallocHost(&h_main_q_end, sizeof(int));  
         cudaMallocHost(&h_main_q_narcs, sizeof(int));  
@@ -303,10 +306,7 @@ namespace kaldi {
         ProcessNonemitting();
 
         int main_q_size = *h_main_q_end;
-        cudaMemcpy(h_main_q_info, d_main_q_info, main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
-        for(int i=0; i < main_q_size; ++i) {
-            h_all_token_info.push_back(h_main_q_info[i]);
-        }
+        cudaMemcpy(h_all_tokens_info, d_main_q_info, main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
 
         printf("CUDA DECODER InitDecoding 2/2\n");
     }
@@ -407,9 +407,7 @@ namespace kaldi {
 
         int prev_main_q_size = *h_main_q_end;
         while (num_frames_decoded_ < target_frames_decoded) {
-            cudaDeviceSynchronize();
             //KALDI_LOG << "\n New frame off=" << main_q_global_offset;
-            cudaDeviceSynchronize();
 
             cudaEventSynchronize(loglikelihood_evt);
             std::swap(next_loglikelihoods_d, loglikelihoods_d);
@@ -419,19 +417,22 @@ namespace kaldi {
             //KALDI_LOG << "Emitting, frame=" << num_frames_decoded_;
             ProcessEmitting();
             main_q_global_offset += prev_main_q_size;
-            //KALDI_LOG << "Non Emitting";
-            ProcessNonemitting(); 
             
-            cudaDeviceSynchronize();
+            //KALDI_LOG << "Non Emitting";
+
+            cudaEventSynchronize(can_write_to_main_q);
+            ProcessNonemitting(); 
             
             prev_main_q_size = *h_main_q_end;
             
             //printf("copying %i elements \n", prev_main_q_size);
             
-            cudaMemcpy(h_main_q_info, d_main_q_info, prev_main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
-            for(int i=0; i < prev_main_q_size; ++i) {
-                h_all_token_info.push_back(h_main_q_info[i]);
-            }
+            cudaMemcpyAsync(&h_all_tokens_info[main_q_global_offset], 
+                            d_main_q_info, 
+                            prev_main_q_size*sizeof(InfoToken),
+                            cudaMemcpyDeviceToHost, 
+                            copy_st);
+            cudaEventRecord(can_write_to_main_q, copy_st);
 
             if(num_frames_decoded_ > 1) {
                 //KALDI_ASSERT(0); 
@@ -1462,9 +1463,9 @@ namespace kaldi {
         std::vector<int> reversed_path;
 
         while(token_idx != INT_MIN) {
-            int arc_idx = h_all_token_info[token_idx].arc_idx;
+            int arc_idx = h_all_tokens_info[token_idx].arc_idx;
             reversed_path.push_back(arc_idx);
-            token_idx = h_all_token_info[token_idx].prev_token;
+            token_idx = h_all_tokens_info[token_idx].prev_token;
         }
 
 

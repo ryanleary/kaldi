@@ -265,7 +265,7 @@ class CudaDecoder {
 
   // Local offset (in d_q_from_*)
   int *d_main_q_local_offset;
-  int *h_main_q_local_offset;
+  int *h_main_q_local_offset; // TODO not needed 
 
   // Global offset (in h_all_*)
   // Used to set the "prev_token" in new tokens
@@ -287,7 +287,7 @@ class CudaDecoder {
   int *d_aux_q_end;
   int *h_aux_q_end;
 
-  InfoToken *h_main_q_info; // on host
+  InfoToken *h_all_tokens_info; // on host
 
   // Those are filled only if necessary
   StateId *h_main_q_state; // on host
@@ -318,11 +318,9 @@ class CudaDecoder {
 
   BaseFloat *loglikelihoods_h, *loglikelihoods_d, *next_loglikelihoods_d;  
 
-  std::vector<InfoToken> h_all_token_info;
-
   // Streams, overlap likelihoods copies with compute
   cudaStream_t compute_st, copy_st;
-  cudaEvent_t loglikelihood_evt, q_token_from_narcs_evt;
+  cudaEvent_t loglikelihood_evt, q_token_from_narcs_evt, can_write_to_main_q;
 
   //pre-computes log likelihoods for the current frame
   void ComputeLogLikelihoods(DecodableInterface *decodable);
