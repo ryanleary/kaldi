@@ -1,0 +1,8 @@
+module purge
+module load  CUDA/9.2.88
+module load Subversion/1.8.14-GCC-5.4.0-2.26
+module load OpenMPI/1.10.7-GCC-5.4.0-2.26-CUDA-9.2.88
+module load ATLAS/3.10.2-GCC-5.4.0-2.26-LAPACK-3.6.1  
+export CXXFLAGS=-fopenmp 
+export LDFLAGS=-fopenmp
+export CXX=mpicxx
