@@ -150,7 +150,7 @@ int main(int argc, char *argv[]) {
     #define MAX_DEVS 8
     CudaFst cuda_fst[MAX_DEVS];
 
-#pragma omp parallel shared(po, cuda_fst) 
+#pragma omp parallel shared(po, cuda_fst) default(shared)
     {
 
       // feature_opts includes configuration for the iVector adaptation,
@@ -163,7 +163,7 @@ int main(int argc, char *argv[]) {
       putenv(vis_dev);
       //int device=1;
       printf("Thread %d of %d on device %d\n", omp_get_thread_num(), omp_get_num_threads(), device);
-      CuDevice::Instantiate().SelectGpuIdUniqueContext(device);
+      CuDevice::Instantiate().SelectGpuId(device);
       CuDevice::Instantiate().AllowMultithreading();
 #endif
 #pragma omp barrier

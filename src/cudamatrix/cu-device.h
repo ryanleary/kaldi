@@ -81,7 +81,7 @@ class CuDevice {
     else allocator_.Free(ptr);
   }
 
-  void SelectGpuIdUniqueContext(int id);
+  void SelectGpuId(int id);
   /// Select a GPU for computation, the 'use_gpu' modes are:
   ///  "yes"      -- Select GPU automatically and die if this fails.
   ///  "optional" -- Do as above, but if it fails, back off to CPU.
