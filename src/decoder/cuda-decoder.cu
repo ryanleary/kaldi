@@ -156,7 +156,6 @@ namespace kaldi {
 
     void CudaFst::finalize() {
         nvtxRangePushA("CudaFst destructor");
-        printf("CudaFst::finalize()\n");
         cudaFreeHost(final_h);
         free(e_offsets_h);
         free(ne_offsets_h);
@@ -182,7 +181,6 @@ namespace kaldi {
                      bytes_cudaMalloc(0), 
                      max_tokens_(config.max_tokens), 
                      max_tokens_per_frame_(config.max_tokens_per_frame) {
-        printf("CudaDecoder2 Constructor\n");
 
         // Comments about variables are in the .h file
 
@@ -232,7 +230,6 @@ namespace kaldi {
     }
 
     CudaDecoder::~CudaDecoder() {
-        printf("CUDA DECODER DESTRUCTOR\n");
 
         cudaStreamDestroy(compute_st);
         cudaStreamDestroy(copy_st);
@@ -276,7 +273,6 @@ namespace kaldi {
     }
 
     void CudaDecoder::InitDecoding() {
-        printf("CUDA DECODER InitDecoding\n");
 
         InitLookup();
 
@@ -319,13 +315,11 @@ namespace kaldi {
 
         num_frames_decoded_ = 0;
 
-        printf("CUDA DECODER InitDecoding 1/2\n");
         ProcessNonemitting();
 
         int main_q_size = *h_main_q_end;
         cudaMemcpy(h_all_tokens_info, d_main_q_info, main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
 
-        printf("CUDA DECODER InitDecoding 2/2\n");
     }
 
 
@@ -403,7 +397,6 @@ namespace kaldi {
 
     void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
             int32 max_num_frames) {
-        printf("AdvanceDecoding\n");
 
         KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                 "You must call InitDecoding() before AdvanceDecoding()");
@@ -463,7 +456,6 @@ namespace kaldi {
 
         cudaEventSynchronize(can_write_to_main_q); // We want the copy to be done
 
-        printf("AdvanceDecoding Done\n");
         nvtxRangePop();
     }
 
@@ -1418,7 +1410,7 @@ namespace kaldi {
             }
         }
 
-        printf("global_offset=%i \n", main_q_global_offset);
+        //printf("global_offset=%i \n", main_q_global_offset);
         best_cost_idx += main_q_global_offset; 
 
         *min = best_cost;
@@ -1441,7 +1433,6 @@ namespace kaldi {
     // Outputs an FST corresponding to the single best path
     // through the lattice.
     bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
-        printf("Get best path \n");
         nvtxRangePushA("GetBestPath");
 
         bool isfinal = ReachedFinal();
@@ -1450,8 +1441,8 @@ namespace kaldi {
         GetBestCost(&best_cost, &arg_best, isfinal);
 
 
-        printf("is final = %i \n", isfinal);
-        printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
+        //printf("is final = %i \n", isfinal);
+        //printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
 
         int token_idx = arg_best;
         std::vector<int> reversed_path;
