@@ -104,12 +104,17 @@ static bool GetCudaContext(int32 num_gpus, std::string *debug_str) {
  *
  */
 void CuDevice::SelectGpuIdUniqueContext(int id) {
+#if 0
    CUdevice device;
    cuDeviceGet(&device,id);
    CUcontext ctx;
    cuCtxCreate(&ctx, 0, device);
    cuCtxSetCurrent(ctx);
    FinalizeActiveGpu();
+#else
+  cudaSetDevice(id);
+  FinalizeActiveGpu();
+#endif
 }
 
 void CuDevice::SelectGpuId(std::string use_gpu) {
