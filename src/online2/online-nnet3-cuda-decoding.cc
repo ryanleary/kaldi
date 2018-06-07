@@ -25,19 +25,18 @@
 namespace kaldi {
 
 SingleUtteranceNnet3CudaDecoder::SingleUtteranceNnet3CudaDecoder(
-    const CudaDecoderConfig &decoder_opts,
     const TransitionModel &trans_model,
     const nnet3::DecodableNnetSimpleLoopedInfo &info,
-    const CudaFst &fst,
-    OnlineNnet2FeaturePipeline *features):
-    decoder_opts_(decoder_opts),
+    CudaDecoder &cuda_decoder,
+    OnlineNnet2FeaturePipeline *features) :
     input_feature_frame_shift_in_seconds_(features->FrameShiftInSeconds()),
     trans_model_(trans_model),
     decodable_(trans_model_, info,
                features->InputFeature(), features->IvectorFeature()),
-    decoder_(fst, decoder_opts_) {
+    decoder_(cuda_decoder) {
   decoder_.InitDecoding();
 }
+
 
 void SingleUtteranceNnet3CudaDecoder::AdvanceDecoding() {
   decoder_.AdvanceDecoding(&decodable_);

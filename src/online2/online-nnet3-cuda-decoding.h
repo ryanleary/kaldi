@@ -52,10 +52,10 @@ class SingleUtteranceNnet3CudaDecoder {
 
   // Constructor. The pointer 'features' is not being given to this class to own
   // and deallocate, it is owned externally.
-  SingleUtteranceNnet3CudaDecoder(const CudaDecoderConfig &decoder_opts,
+  SingleUtteranceNnet3CudaDecoder(
                               const TransitionModel &trans_model,
                               const nnet3::DecodableNnetSimpleLoopedInfo &info,
-                              const CudaFst &fst,
+                              CudaDecoder &cuda_decoder,
                               OnlineNnet2FeaturePipeline *features);
 
   /// advance the decoding as far as we can.
@@ -75,8 +75,6 @@ class SingleUtteranceNnet3CudaDecoder {
   ~SingleUtteranceNnet3CudaDecoder() { }
  private:
 
-  const CudaDecoderConfig &decoder_opts_;
-
   // this is remembered from the constructor; it's ultimately
   // derived from calling FrameShiftInSeconds() on the feature pipeline.
   BaseFloat input_feature_frame_shift_in_seconds_;
@@ -87,7 +85,7 @@ class SingleUtteranceNnet3CudaDecoder {
 
   nnet3::DecodableAmNnetLoopedOnlineCuda decodable_;
 
-  CudaDecoder decoder_;
+  CudaDecoder &decoder_;
 };
 
 

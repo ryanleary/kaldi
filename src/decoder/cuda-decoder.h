@@ -121,8 +121,8 @@ class CudaVector {
 struct CudaDecoderConfig {
   BaseFloat beam;
   double gpu_fraction;
-  uint32_t max_tokens_per_frame;
   uint32_t max_tokens;
+  uint32_t max_tokens_per_frame;
 
 
   CudaDecoderConfig(): beam(16.0),
