@@ -265,6 +265,20 @@ class CudaDecoder {
       int *d_n_CTA_done;
   };
 
+  class TokenVector {
+      size_t capacity, size;
+      cudaStream_t copy_st;
+      InfoToken *h_data;
+      public:
+      TokenVector();
+      void Reset();
+      void SetCudaStream(cudaStream_t st);
+      void CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count);    
+      void Reserve(size_t min_capacity);    
+      InfoToken *GetRawPointer() const;
+      virtual ~TokenVector();
+  };
+
 
   void ExpandArcs(int nthreads, const ExpandArcParams &params);
 
@@ -310,7 +324,7 @@ class CudaDecoder {
   int *d_aux_q_end;
   int *h_aux_q_end;
 
-  InfoToken *h_all_tokens_info; // on host
+  TokenVector h_all_tokens_info; // on host
 
   // Those are filled only if necessary
   StateId *h_main_q_state; // on host

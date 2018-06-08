@@ -54,6 +54,7 @@ namespace kaldi {
         for( fst::StateIterator<fst::Fst<StdArc> > iter(fst); !iter.Done(); iter.Next()) {
             numStates++;
         }
+        printf("num states = %i \n", numStates);
         start=fst.Start();
         cudaMallocHost(&final_h,sizeof(float)*numStates);
 
@@ -94,6 +95,7 @@ namespace kaldi {
             e_offsets_h[i+1]=e_count;
         }
 
+        printf("max ilabel=%i \n", max_ilabel);
         //offset ne_offsets by the number of emitting arcs
         for(int i=0;i<numStates+1;i++) {
             e_offsets_h[i]+=1;          //add dummy arc at the beginingg.
@@ -114,7 +116,8 @@ namespace kaldi {
 
         cudaMalloc((void**)&arc_weights_d,arc_count*sizeof(BaseFloat));
         cudaMalloc((void**)&arc_nextstates_d,arc_count*sizeof(StateId));
-        cudaMalloc((void**)&arc_ilabels_d,arc_count*sizeof(int32)); 
+        // Only the ilabels for the e_arc are needed on the device
+        cudaMalloc((void**)&arc_ilabels_d,e_count*sizeof(int32)); 
 
         //now populate arc data
         int e_idx=1;          //save room for dummy arc (so start at 1)
@@ -141,12 +144,12 @@ namespace kaldi {
                 arc_nextstates_h[idx]=arc.nextstate;
                 arc_ilabels_h[idx]=arc.ilabel;
                 arc_olabels_h[idx]=arc.olabel;
-            }
+               }
         }
 
         cudaMemcpy(arc_weights_d,arc_weights_h,arc_count*sizeof(BaseFloat),cudaMemcpyHostToDevice);
         cudaMemcpy(arc_nextstates_d,arc_nextstates_h,arc_count*sizeof(StateId),cudaMemcpyHostToDevice);
-        cudaMemcpy(arc_ilabels_d,arc_ilabels_h, arc_count*sizeof(int32),cudaMemcpyHostToDevice);
+        cudaMemcpy(arc_ilabels_d,arc_ilabels_h, e_count*sizeof(int32),cudaMemcpyHostToDevice);
 
         cudaDeviceSynchronize();
         cudaCheckError();
@@ -211,7 +214,8 @@ namespace kaldi {
 
         cudaMalloc(&d_cutoff, sizeof(BaseFloat));
 
-        cudaMallocHost(&h_all_tokens_info, max_tokens_ * sizeof(InfoToken));
+        h_all_tokens_info.SetCudaStream(copy_st);
+        h_all_tokens_info.Reserve(max_tokens_);
 
         cudaMallocHost(&h_main_q_end, sizeof(int));  
         cudaMallocHost(&h_main_q_narcs, sizeof(int));  
@@ -256,7 +260,6 @@ namespace kaldi {
 
         cudaFree(d_cutoff);
 
-        cudaFreeHost(h_all_tokens_info);
 
         cudaFreeHost(h_main_q_end);
         cudaFreeHost(h_main_q_narcs);
@@ -305,6 +308,7 @@ namespace kaldi {
 
         cudaMemset(d_main_q_local_offset, 0, sizeof(int));
         main_q_global_offset = 0;
+        h_all_tokens_info.Reset();
 
         CostType cutoff = FLT_MAX;
         cudaMemcpy(d_cutoff, &cutoff, sizeof(CostType), cudaMemcpyHostToDevice);
@@ -318,8 +322,7 @@ namespace kaldi {
         ProcessNonemitting();
 
         int main_q_size = *h_main_q_end;
-        cudaMemcpy(h_all_tokens_info, d_main_q_info, main_q_size*sizeof(InfoToken), cudaMemcpyDeviceToHost);
-
+        h_all_tokens_info.CopyFromDevice(main_q_global_offset, d_main_q_info, main_q_size);
     }
 
 
@@ -445,16 +448,11 @@ namespace kaldi {
             // We copy back its pruned tokens to the host
             // We only copy the "info" part (arc_idx + prev_token)
             // because we don't need anything else for the final backtrack
-            cudaMemcpyAsync(&h_all_tokens_info[main_q_global_offset], 
-                            d_main_q_info, 
-                            prev_main_q_size*sizeof(InfoToken),
-                            cudaMemcpyDeviceToHost, 
-                            copy_st);
+            h_all_tokens_info.CopyFromDevice(main_q_global_offset, d_main_q_info, prev_main_q_size);
             cudaEventRecord(can_write_to_main_q, copy_st);
 
         }   
 
-        cudaEventSynchronize(can_write_to_main_q); // We want the copy to be done
 
         nvtxRangePop();
     }
@@ -1386,6 +1384,7 @@ namespace kaldi {
 
 
     void CudaDecoder::GetBestCost(BaseFloat *min, int *arg, bool isfinal) const {
+        
         CostType best_cost = FLT_MAX; // switch to numeric limits std11
         int best_cost_idx;
         // we need main q end ready
@@ -1435,11 +1434,12 @@ namespace kaldi {
     bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
         nvtxRangePushA("GetBestPath");
 
+        cudaEventSynchronize(can_write_to_main_q); // We want the copy to the host to be done
+
         bool isfinal = ReachedFinal();
         BaseFloat best_cost;
         int arg_best;
         GetBestCost(&best_cost, &arg_best, isfinal);
-
 
         //printf("is final = %i \n", isfinal);
         //printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
@@ -1448,9 +1448,9 @@ namespace kaldi {
         std::vector<int> reversed_path;
 
         while(token_idx != INT_MIN) {
-            int arc_idx = h_all_tokens_info[token_idx].arc_idx;
+            int arc_idx = h_all_tokens_info.GetRawPointer()[token_idx].arc_idx;
             reversed_path.push_back(arc_idx);
-            token_idx = h_all_tokens_info[token_idx].prev_token;
+            token_idx = h_all_tokens_info.GetRawPointer()[token_idx].prev_token;
         }
 
 
@@ -1485,6 +1485,56 @@ namespace kaldi {
     }
 
 
+    CudaDecoder::TokenVector::TokenVector() {
+        capacity = 16; // Not important, we're going to call Reserve anyway
 
+        cudaMallocHost(&h_data, capacity * sizeof(InfoToken)); 
+        SetCudaStream(0);
 
+        Reset();
+    }
+
+    void CudaDecoder::TokenVector::Reset() {
+        size = 0;
+    };
+
+    void CudaDecoder::TokenVector::SetCudaStream(cudaStream_t st) {
+        copy_st = st;
+    }
+
+    void CudaDecoder::TokenVector::CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count) {
+        Reserve(size+count); // making sure we have the space
+
+        cudaMemcpyAsync(&h_data[offset], d_ptr, count*sizeof(InfoToken), cudaMemcpyDeviceToHost, copy_st);
+        size += count;
+    }
+    
+    void CudaDecoder::TokenVector::Reserve(size_t min_capacity) {
+        if(min_capacity <= capacity)
+            return;
+
+        while(capacity < min_capacity)
+            capacity *= 2;
+
+        KALDI_LOG << "Reallocating TokenVector on host (new capacity = " << capacity << " tokens)";
+
+        InfoToken *h_old_data = h_data;
+        cudaMallocHost(&h_data, capacity * sizeof(InfoToken)); 
+
+        if(!h_data)
+            KALDI_ERR << "Host ran out of memory to store tokens. Exiting.";
+        
+        if(size)
+            cudaMemcpyAsync(h_data, h_old_data, size * sizeof(InfoToken), cudaMemcpyHostToHost, copy_st);
+
+        cudaFreeHost(h_old_data);
+    }
+
+    InfoToken * CudaDecoder::TokenVector::GetRawPointer() const {
+        return h_data;
+    }
+
+    CudaDecoder::TokenVector::~TokenVector() {
+        cudaFreeHost(h_data);
+    }
 } // end namespace kaldi.
