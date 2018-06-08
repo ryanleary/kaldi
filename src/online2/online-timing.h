@@ -45,6 +45,7 @@ class OnlineTimingStats {
   /// not-really-online mode where the chunk length was the whole file.  We need
   /// to change the way we interpret the stats and print results, in this case.
   void Print(bool online = true);
+  void GetStats(double &total_time, double &total_audio);
  protected:
   friend class OnlineTimer;
   int32 num_utts_;

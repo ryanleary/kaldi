@@ -26,6 +26,11 @@ OnlineTimingStats::OnlineTimingStats():
     total_time_waited_(0.0), max_delay_(0.0) {
 }
 
+void OnlineTimingStats::GetStats(double &total_time, double &total_audio) {
+    total_time=total_time_taken_ - total_time_waited_;
+    total_audio=total_audio_;
+}
+
 void OnlineTimingStats::Print(bool online){
   if (online) {
     double real_time_factor = total_time_taken_ / total_audio_,
