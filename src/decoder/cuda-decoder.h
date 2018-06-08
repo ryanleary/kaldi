@@ -120,13 +120,11 @@ class CudaVector {
 
 struct CudaDecoderConfig {
   BaseFloat beam;
-  double gpu_fraction;
   uint32_t max_tokens;
   uint32_t max_tokens_per_frame;
 
 
   CudaDecoderConfig(): beam(16.0),
-                       gpu_fraction(1.0/8.0),
                        max_tokens(300000000),
                        max_tokens_per_frame(5000000) {}
   
@@ -136,7 +134,7 @@ struct CudaDecoderConfig {
     opts->Register("tokens-per-frame-allocated", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
    }
   void Check() const {
-    KALDI_ASSERT(beam > 0.0 && gpu_fraction>0 && gpu_fraction <= 1 && max_tokens > 0);
+    KALDI_ASSERT(beam > 0.0 && max_tokens > 0);
   }
 };
 
