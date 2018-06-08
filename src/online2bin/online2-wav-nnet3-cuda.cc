@@ -103,10 +103,11 @@ int main(int argc, char *argv[]) {
     bool online = true;
 
     ParseOptions po(usage);
-    int threads_per_gpu = omp_get_max_threads();
+    int num_gpus = 1;
+
     bool replicate=false;
 
-    po.Register("threads-per-gpu", &threads_per_gpu, "number of CPU threads to assign to each GPU");
+    po.Register("num-gpus", &num_gpus, "number of GPUs to decode on.  Threads are divided evenly across each GPU.");
     po.Register("replicate",&replicate,"Replicate computation across all threads (for benchmarking)\n");
     
     po.Register("chunk-length", &chunk_length_secs,
@@ -127,13 +128,12 @@ int main(int argc, char *argv[]) {
         "--chunk-length=-1.");
     po.Register("num-threads-startup", &g_num_threads,
         "Number of threads used when initializing iVector extractor.");
+    
 
     OnlineNnet2FeaturePipelineConfig  feature_opts;
     nnet3::NnetSimpleLoopedComputationOptions decodable_opts;
     CudaDecoderConfig decoder_opts;
     OnlineEndpointConfig endpoint_opts;
-
-    decoder_opts.gpu_fraction = 1.0 / omp_get_max_threads();
 
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
@@ -147,6 +147,8 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
+    int threads_per_gpu = (omp_get_max_threads()+num_gpus-1)/num_gpus;
+    KALDI_LOG << "Num GPUs: " << num_gpus << " threads per gpu: " << threads_per_gpu << endl;
 
     cuInit(0);
 #define MAX_DEVS 8
@@ -161,7 +163,9 @@ int main(int argc, char *argv[]) {
 
     int utt_idx=0;
 
-#pragma omp parallel shared(po, cuda_fst, utt_idx)
+    double total_time=0, total_audio=0;
+
+#pragma omp parallel shared(po, cuda_fst, utt_idx) reduction(+:total_time,total_audio)
     {
 
       // feature_opts includes configuration for the iVector adaptation,
@@ -173,7 +177,7 @@ int main(int argc, char *argv[]) {
       sprintf(vis_dev,"CUDA_VISIBLE_DEVICES=%d\n",device);
       putenv(vis_dev);
       //int device=1;
-      KALDI_LOG << "Thread " << omp_get_thread_num() << " of " << omp_get_num_threads() << " on device" << device << endl;
+      KALDI_LOG << "Thread " << omp_get_thread_num() << " of " << omp_get_num_threads() << " on device " << device << endl;
       CuDevice::Instantiate().SelectGpuId(device);
       CuDevice::Instantiate().AllowMultithreading();
 #endif
@@ -376,13 +380,14 @@ int main(int argc, char *argv[]) {
         }
       }
       if(num_processed > 0 ) {
-        timing_stats.Print(online);
-
+        //timing_stats.Print(online);
+        timing_stats.GetStats(total_time, total_audio);
+    
         //#pragma omp barrier
 
-        KALDI_LOG << "Decoded " << num_done << " utterances, "
+        KALDI_LOG << "Thread: " << omp_get_thread_num() << " Decoded " << num_done << " utterances, "
           << num_err << " with errors.";
-        KALDI_LOG << "Overall likelihood per frame was " << (tot_like / num_frames)
+        KALDI_LOG << "Thread: " << omp_get_thread_num() << " Overall likelihood per frame was " << (tot_like / num_frames)
           << " per frame over " << num_frames << " frames.";
       }
       delete decode_fst;
@@ -390,6 +395,9 @@ int main(int argc, char *argv[]) {
 #pragma omp barrier
       if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].finalize();
       } //end parallel
+  
+      total_time/=omp_get_max_threads();
+      KALDI_LOG << "Total Time: " << total_time << " Total Audio: " << total_audio << " RealTimeX: " << total_audio/total_time << endl;
       cudaDeviceSynchronize();
       cudaProfilerStop();
       return 0;
