@@ -165,7 +165,8 @@ int main(int argc, char *argv[]) {
 
     double total_time=0, total_audio=0;
 
-#pragma omp parallel shared(po, cuda_fst, utt_idx) reduction(+:total_time,total_audio)
+    CompactLatticeWriter clat_writer(clat_wspecifier);
+#pragma omp parallel shared(po, cuda_fst, utt_idx, clat_writer) reduction(+:total_time,total_audio)
     {
 
       // feature_opts includes configuration for the iVector adaptation,
@@ -227,7 +228,6 @@ int main(int argc, char *argv[]) {
 
       SequentialTokenVectorReader spk2utt_reader(spk2utt_rspecifier);
       RandomAccessTableReader<WaveHolder> wav_reader(wav_rspecifier);
-      CompactLatticeWriter clat_writer(clat_wspecifier);
 
 
       OnlineTimingStats timing_stats;
@@ -398,6 +398,7 @@ int main(int argc, char *argv[]) {
   
       total_time/=omp_get_max_threads();
       KALDI_LOG << "Total Time: " << total_time << " Total Audio: " << total_audio << " RealTimeX: " << total_audio/total_time << endl;
+      clat_writer.Close();
       cudaDeviceSynchronize();
       cudaProfilerStop();
       return 0;
