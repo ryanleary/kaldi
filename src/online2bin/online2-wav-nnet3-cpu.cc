@@ -19,18 +19,16 @@
 // limitations under the License.
 
 #include "feat/wave-reader.h"
-#include "online2/online-nnet3-cuda-decoding.h"
+#include "online2/online-nnet3-faster-decoding.h"
 #include "online2/online-nnet2-feature-pipeline.h"
 #include "online2/onlinebin-util.h"
 #include "online2/online-timing.h"
 #include "online2/online-endpoint.h"
 #include "fstext/fstext-lib.h"
+#include "decoder/faster-decoder.h"
 #include "lat/lattice-functions.h"
 #include "util/kaldi-thread.h"
 #include "nnet3/nnet-utils.h"
-#include <nvToolsExt.h>
-#include <cuda_profiler_api.h>
-#include <cuda.h>
 #include <omp.h>
 namespace kaldi {
 
@@ -101,14 +99,12 @@ int main(int argc, char *argv[]) {
     BaseFloat chunk_length_secs = 0.18;
     bool do_endpointing = false;
     bool online = true;
-    int num_gpus = 1;
     bool write_lattice = true;
     bool replicate=false;
 
     ParseOptions po(usage);
 
     po.Register("write-lattice",&write_lattice, "Output lattice to a file.  Setting to false is useful when benchmarking.");
-    po.Register("num-gpus", &num_gpus, "number of GPUs to decode on.  Threads are divided evenly across each GPU.");
     po.Register("replicate",&replicate,"Replicate computation across all threads (for benchmarking)\n");
     
     po.Register("chunk-length", &chunk_length_secs,
@@ -133,12 +129,12 @@ int main(int argc, char *argv[]) {
 
     OnlineNnet2FeaturePipelineConfig  feature_opts;
     nnet3::NnetSimpleLoopedComputationOptions decodable_opts;
-    CudaDecoderConfig decoder_opts;
+    FasterDecoderOptions decoder_opts;
     OnlineEndpointConfig endpoint_opts;
 
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
-    decoder_opts.Register(&po);
+    decoder_opts.Register(&po,false);
     endpoint_opts.Register(&po);
 
     po.Read(argc, argv);
@@ -148,13 +144,6 @@ int main(int argc, char *argv[]) {
       return 1;
     }
 
-    int threads_per_gpu = (omp_get_max_threads()+num_gpus-1)/num_gpus;
-    KALDI_LOG << "Num GPUs: " << num_gpus << " threads per gpu: " << threads_per_gpu << endl;
-
-    cuInit(0);
-#define MAX_DEVS 8
-    CudaFst cuda_fst[MAX_DEVS];
-
     std::string nnet3_rxfilename = po.GetArg(1),
       fst_rxfilename = po.GetArg(2),
       spk2utt_rspecifier = po.GetArg(3),
@@ -162,27 +151,20 @@ int main(int argc, char *argv[]) {
       clat_wspecifier = po.GetArg(5);
       
 
+
+
+
     int utt_idx=0;
 
     double total_time=0, total_audio=0;
 
     CompactLatticeWriter clat_writer(clat_wspecifier);
-#pragma omp parallel shared(po, cuda_fst, utt_idx, clat_writer) reduction(+:total_time,total_audio)
+#pragma omp parallel shared(po, utt_idx, clat_writer) reduction(+:total_time,total_audio)
     {
 
       // feature_opts includes configuration for the iVector adaptation,
       // as well as the basic features.
 
-#if HAVE_CUDA==1
-      int device=omp_get_thread_num()/threads_per_gpu;
-      char vis_dev[100];
-      sprintf(vis_dev,"CUDA_VISIBLE_DEVICES=%d\n",device);
-      putenv(vis_dev);
-      //int device=1;
-      KALDI_LOG << "Thread " << omp_get_thread_num() << " of " << omp_get_num_threads() << " on device " << device << endl;
-      CuDevice::Instantiate().SelectGpuId(device);
-      CuDevice::Instantiate().AllowMultithreading();
-#endif
 #pragma omp barrier
       OnlineNnet2FeaturePipelineInfo feature_info(feature_opts);
 
@@ -212,10 +194,6 @@ int main(int argc, char *argv[]) {
 
 
       fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
-      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].initialize(*decode_fst);
-#pragma omp barrier
-      CudaDecoder cuda_decoder(cuda_fst[device],decoder_opts);
-#pragma omp barrier
 
       fst::SymbolTable *word_syms = NULL;
       if (word_syms_rxfilename != "")
@@ -297,10 +275,9 @@ int main(int argc, char *argv[]) {
               feature_info.silence_weighting_config,
               decodable_opts.frame_subsampling_factor);
 
-          SingleUtteranceNnet3CudaDecoder decoder(trans_model,
-              decodable_info, cuda_decoder, &feature_pipeline);
+          SingleUtteranceNnet3FasterDecoder decoder(decoder_opts, trans_model,
+              decodable_info, *decode_fst, &feature_pipeline);
 
-          nvtxRangePushA("Timing Start");
           OnlineTimer decoding_timer(utt);
 
 
@@ -350,7 +327,6 @@ int main(int argc, char *argv[]) {
 
           decoding_timer.OutputStats(&timing_stats);
 
-          nvtxRangePop();
 
           if(num_processed>0) {
             CompactLattice clat;
@@ -394,15 +370,11 @@ int main(int argc, char *argv[]) {
       }
       delete decode_fst;
       delete word_syms; // will delete if non-NULL.
-#pragma omp barrier
-      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].finalize();
       } //end parallel
   
       total_time/=omp_get_max_threads();
       KALDI_LOG << "Total Time: " << total_time << " Total Audio: " << total_audio << " RealTimeX: " << total_audio/total_time << endl;
       clat_writer.Close();
-      cudaDeviceSynchronize();
-      cudaProfilerStop();
       return 0;
 
       //return (num_done != 0 ? 0 : 1);
