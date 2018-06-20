@@ -131,10 +131,10 @@ struct CudaDecoderConfig {
   void Register(OptionsItf *opts) {
     opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");
     opts->Register("max-tokens-pre-allocated", &max_tokens, "Total number of tokens pre-allocated (equivalent to reserve in a std vector).  If actual usaged exceeds this performance will be degraded");
-    opts->Register("tokens-per-frame-allocated", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
+    opts->Register("max-tokens-per-frame", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
    }
   void Check() const {
-    KALDI_ASSERT(beam > 0.0 && max_tokens > 0);
+    KALDI_ASSERT(beam > 0.0 && max_tokens > 0 && max_tokens_per_frame > 0);
   }
 };
 
@@ -211,13 +211,18 @@ class CudaDecoder {
       int *d_main_q_end; 
       QEndAndNarcs *d_main_q_end_and_narcs_i2; 
       int *d_main_q_narcs; 
+      int *h_main_q_end;
       int *h_main_q_narcs; 
+
+      int *h_q_overflow; 
+      int q_capacity;
 
       StateId *d_aux_q_state; 
       CostType *d_aux_q_cost;
       InfoToken *d_aux_q_info; 
       int *d_aux_q_end; 
-
+      int *h_aux_q_end;
+      
       int *d_degrees_scan; 
       unsigned int *d_arc_offsets; 
       int *d_main_q_arc_offsets; // offsets, relative to the queue
@@ -251,6 +256,9 @@ class CudaDecoder {
       int *d_aux_q_end;
       int *h_aux_q_end; 
 
+      int *h_q_overflow; 
+      int q_capacity;
+
       int *d_q_arc_offsets; 
       int *arc_ilabels; 
 
@@ -282,8 +290,8 @@ class CudaDecoder {
 
   void ExpandArcs(int nthreads, const ExpandArcParams &params);
 
-  void ContractAndPreprocess(unsigned int *d_arc_offsets);
-  void PreprocessInPlace(unsigned int *d_arc_offsets);
+  void ContractAndPreprocess(PreprocessParams &params);
+  void PreprocessInPlace(PreprocessParams &params);
   void FinalizePreprocessInPlace();
 
   /// This will decode until there are no more frames ready in the decodable
@@ -311,6 +319,7 @@ class CudaDecoder {
   // Pointer to end index in from (equal to size + offset)
   int *d_main_q_end;
   int *h_main_q_end;
+
   // total number of arcs contained in main q [off, end[
   // ie total # of arcs from tok.next_state, where tok is in [off,end[
   // (actually one "valid arcs" are counted, cf Preprocess)
@@ -323,6 +332,8 @@ class CudaDecoder {
   // Pointer to end index in to (equal to size + 0) (no offset)
   int *d_aux_q_end;
   int *h_aux_q_end;
+
+  int *h_q_overflow;
 
   TokenVector h_all_tokens_info; // on host
 
@@ -372,7 +383,7 @@ class CudaDecoder {
   void GetBestCost(BaseFloat *min, int *arg, bool isfinal) const;
   void ProcessEmitting();
   void ProcessNonemitting();
-
+  void PrintOverflowWarning();
  
   bool ProcessToken(unsigned int *d_arc_offsets, bool is_emitting);
 
