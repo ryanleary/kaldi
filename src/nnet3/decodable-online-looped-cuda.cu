@@ -57,12 +57,8 @@ DecodableAmNnetLoopedOnlineCuda::~DecodableAmNnetLoopedOnlineCuda() {
 }
 
 void DecodableAmNnetLoopedOnlineCuda::ComputeLogLikelihoods(BaseFloat *out, int32 subsampled_frame, int32 count, void *stream) {
-//critical section to avoid illegal access errrors in ensure frame is computed.  Not sure what the cause is.  We should root cause and fix properly.  TODO
-#pragma omp critical 
-  {
   EnsureFrameIsComputed(subsampled_frame);
   cudaStreamSynchronize(cudaStreamPerThread);      
-  }
   int threads=128;
   int blocks=(count+threads-1)/threads;
   computeLogLikelihoodsKernel<<<blocks,threads,0,stream>>>(out,count,current_log_post_.Data()+(subsampled_frame-current_log_post_subsampled_offset_)*current_log_post_.Stride(),trans_d_);
