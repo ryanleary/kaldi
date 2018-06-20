@@ -133,8 +133,6 @@ int main(int argc, char *argv[]) {
     CudaDecoderConfig decoder_opts;
     OnlineEndpointConfig endpoint_opts;
 
-    decoder_opts.gpu_fraction = 1.0 / omp_get_max_threads();
-
     feature_opts.Register(&po);
     decodable_opts.Register(&po);
     decoder_opts.Register(&po);
