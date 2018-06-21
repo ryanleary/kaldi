@@ -304,7 +304,9 @@ namespace kaldi {
         *h_aux_q_end = 1;
 
         cudaMemset(d_main_q_end, 0, sizeof(int));
+        cudaMemset(d_main_q_narcs, 0, sizeof(int));
         *h_main_q_end = 0;
+        *h_main_q_narcs = 0;
 
         *h_q_overflow = 0;
 
@@ -427,7 +429,6 @@ namespace kaldi {
         while (num_frames_decoded_ < target_frames_decoded) {
             
             // Computing a new frame
-
 
             num_frames_decoded_++; 
             ComputeLogLikelihoods(decodable);
@@ -1439,7 +1440,10 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
             if(threadIdx.x == 0) {
                 // Next step is ProcessEmitting of next frame, from is currToken_offset
                 *params.d_main_q_end = new_q_end; 
+                *params.d_main_q_narcs = 0;
+
                 *params.h_main_q_end = new_q_end; 
+                *params.h_main_q_narcs = 0; 
 
                 *params.d_main_q_local_offset = 0; 
 
