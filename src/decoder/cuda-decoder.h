@@ -126,7 +126,7 @@ struct CudaDecoderConfig {
 
   CudaDecoderConfig(): beam(16.0),
                        max_tokens(300000000),
-                       max_tokens_per_frame(5000000) {}
+                       max_tokens_per_frame(1000000) {}
   
   void Register(OptionsItf *opts) {
     opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");

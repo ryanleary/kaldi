@@ -28,6 +28,13 @@
 #include <cooperative_groups.h>
 #include <cub/cub.cuh>
 
+#define KERNEL_PREPROCESS_DIMX 256
+#define KERNEL_EXPAND_ARCS_DIMX 256
+#define KERNEL_NONEM_LT_DIMX 1024
+
+// Below that value, we launch the persistent kernel for NonEmitting
+#define NONEM_LT_MAX_NARCS 4096
+
 #define MEMADVISE
 
 //Macro for checking cuda errors following a cuda launch or api call
@@ -223,7 +230,7 @@ namespace kaldi {
         cudaMallocHost(&h_q_overflow, sizeof(int));  
 
         cudaMalloc(&d_degrees_scan, max_tokens_per_frame_ * sizeof(int));
-        cudaMalloc(&d_degrees_block_scan, (max_tokens_per_frame_ / 256 + 2)* sizeof(int)); // TODO remove hardcoded
+        cudaMalloc(&d_degrees_block_scan, (max_tokens_per_frame_ / KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int));
         cudaMalloc(&d_main_q_arc_offsets, max_tokens_per_frame_ * sizeof(int));
 
         cudaMalloc(&loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
@@ -482,8 +489,6 @@ namespace kaldi {
     }
 
 
-    // Below that value, we launch the persistent kernel for NonEmitting
-#define NONEM_LT_MAX_NARCS 4096
     bool CudaDecoder::ProcessToken(unsigned int *d_arc_offsets,
             bool is_emitting) {
 
@@ -665,11 +670,10 @@ namespace kaldi {
        This kernel is used before ProcessNonEmitting
     */
 
-#define COMPUTE_DEGREES_DIMX 256
     __global__ void contract_and_preprocess_kernel(PreprocessParams params) {
 
 
-        typedef cub::BlockScan<int2, COMPUTE_DEGREES_DIMX> BlockScan;
+        typedef cub::BlockScan<int2, KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
         __shared__ QEndAndNarcs blk_local_offset_i2;
@@ -716,7 +720,7 @@ namespace kaldi {
 
             
             QEndAndNarcs inclusive_scan;
-            if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
+            if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1)) {
                 // CUB Scan is exclusive
                 inclusive_scan.split.end = scan_i2.x + (is_pruned ? 0 : 1);
                 inclusive_scan.split.narcs = scan_i2.y + degree;
@@ -729,7 +733,7 @@ namespace kaldi {
 
             // main_q overflow
             if((blk_local_offset_i2.split.end + total_in_CTA) >= params.q_capacity) {
-                if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
+                if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1)) {
                     atomicAdd(&params.d_main_q_end_and_narcs_i2->both, -inclusive_scan.both); // revert
                     *params.h_q_overflow = 1;
                 }
@@ -798,10 +802,9 @@ namespace kaldi {
 
 */
 
-#define COMPUTE_DEGREES_DIMX 256
     __global__ void preprocess_in_place_kernel(PreprocessParams params) {
     
-        typedef cub::BlockScan<int, COMPUTE_DEGREES_DIMX> BlockScan;
+        typedef cub::BlockScan<int, KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
         __shared__ int is_last_CTA;
@@ -839,8 +842,8 @@ namespace kaldi {
                 params.d_degrees_scan[idx] = scan;
 
 
-            if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1))
-                params.d_degrees_block_scan[block_offset/COMPUTE_DEGREES_DIMX] = (scan + degree); 
+            if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1))
+                params.d_degrees_block_scan[block_offset/KERNEL_PREPROCESS_DIMX] = (scan + degree); 
 
             __syncthreads(); // we'll reuse temp_storage
         }
@@ -863,7 +866,7 @@ namespace kaldi {
             }
 
             // following value can be different than gridDim.x 
-            int total_blk_val = (queue_size + COMPUTE_DEGREES_DIMX -1) / COMPUTE_DEGREES_DIMX;
+            int total_blk_val = (queue_size + KERNEL_PREPROCESS_DIMX -1) / KERNEL_PREPROCESS_DIMX;
             int scan_offset = 0;
 
             for(int blk_idx_off = 0; blk_idx_off < total_blk_val; blk_idx_off += blockDim.x) {
@@ -894,7 +897,7 @@ namespace kaldi {
 
     void CudaDecoder::ContractAndPreprocess(PreprocessParams &params) {
         dim3 grid,block;
-        block.x = COMPUTE_DEGREES_DIMX;
+        block.x = KERNEL_PREPROCESS_DIMX;
         grid.x = DIV_ROUND_UP(*h_aux_q_end, block.x);
 
         // We can have grid.x == 0 and still have a valid execution
@@ -905,7 +908,7 @@ namespace kaldi {
 
     void CudaDecoder::PreprocessInPlace(PreprocessParams &params) {
         dim3 grid,block;
-        block.x = COMPUTE_DEGREES_DIMX;
+        block.x = KERNEL_PREPROCESS_DIMX;
         int main_q_size = *h_main_q_end - *h_main_q_local_offset;
 
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
@@ -939,7 +942,7 @@ namespace kaldi {
                 idx < q_size;
                 idx += blockDim.x*gridDim.x) {
 
-            int blk_idx = (idx - q_off) / COMPUTE_DEGREES_DIMX;
+            int blk_idx = (idx - q_off) / KERNEL_PREPROCESS_DIMX;
             int blk_scan_offset = d_blk_scan[blk_idx]; // we rely on L1 for this one, avoiding syncs
 
             d_scan[idx] += blk_scan_offset;
@@ -949,7 +952,7 @@ namespace kaldi {
 
     void CudaDecoder::FinalizePreprocessInPlace() {
         dim3 grid,block;
-        block.x = COMPUTE_DEGREES_DIMX;
+        block.x = KERNEL_PREPROCESS_DIMX;
         int main_q_size = *h_main_q_end - *h_main_q_local_offset;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
@@ -1001,7 +1004,6 @@ namespace kaldi {
 
     typedef CudaDecoder::ExpandArcParams ExpandArcParams; // TODO move
 
-#define EXPAND_ARCS_DIMX 256
 
     /*
        This kernel propagates arcs from the main q [main_q_local_offset, main_q_end[
@@ -1050,7 +1052,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
 
     void __global__ expand_arcs_kernel(ExpandArcParams params) {
-        typedef cub::BlockScan<CostTInt, EXPAND_ARCS_DIMX> BlockScan;
+        typedef cub::BlockScan<CostTInt, KERNEL_EXPAND_ARCS_DIMX> BlockScan;
 
         __shared__ typename BlockScan::TempStorage temp_storage_scan;
 
@@ -1115,7 +1117,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                             BlockScan(temp_storage_scan).InclusiveScan(ci, ci, CISum());
 
-                            if(threadIdx.x == (EXPAND_ARCS_DIMX - 1)) {
+                            if(threadIdx.x == (KERNEL_EXPAND_ARCS_DIMX - 1)) {
                                 int total_successors_in_block = ci.i;
                                 to_q_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
                                 if((to_q_block_offset + total_successors_in_block) >= params.q_capacity) {
@@ -1147,7 +1149,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                             // aux_q is full. UpdateCutoff should prevent this from happening
                             if(to_q_block_offset == params.q_capacity) {
-                                if(threadIdx.x == (EXPAND_ARCS_DIMX - 1)) {
+                                if(threadIdx.x == (KERNEL_EXPAND_ARCS_DIMX - 1)) {
                                     // Revert
                                     int total_successors_in_block = ci.i;
                                     atomicAdd(params.d_aux_q_end, -total_successors_in_block); 
@@ -1259,13 +1261,12 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
      */
 
 
-#define NONEM_LT_DIMX 1024
-    __launch_bounds__(NONEM_LT_DIMX, 1)
+    __launch_bounds__(KERNEL_NONEM_LT_DIMX, 1)
         __global__ void process_nonem_longtail(unsigned int *d_arc_offsets, 
                 ExpandArcParams params) {
 
-            typedef cub::BlockScan<int, NONEM_LT_DIMX> BlockScan;
-            typedef cub::BlockReduce<float, NONEM_LT_DIMX> BlockReduce;
+            typedef cub::BlockScan<int, KERNEL_NONEM_LT_DIMX> BlockScan;
+            typedef cub::BlockReduce<float, KERNEL_NONEM_LT_DIMX> BlockReduce;
 
             __shared__ typename BlockScan::TempStorage temp_storage_scan;
             __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
@@ -1463,7 +1464,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
             const ExpandArcParams &params) {
 
         dim3 grid,block;
-        block.x = NONEM_LT_DIMX;
+        block.x = KERNEL_NONEM_LT_DIMX;
         grid.x = 1; // it is designed for the long tail
         process_nonem_longtail<<<grid,block,0,compute_st>>>(d_arc_offsets, params);
     }
