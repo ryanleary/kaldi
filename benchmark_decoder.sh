@@ -55,7 +55,7 @@ for decoder in online2-wav-nnet3-cuda online2-wav-nnet3-cpu; do # online2-wav-nn
       $model_path/HCLG.fst \
       "ark:$librispeech_path/$test_set/$spk2utt" \
       "scp:$local_data/$test_set/$wavscp" \
-      "ark:|gzip -c > $result_path/lat.$decoder.$test_set.gz" &> $log_file
+      "ark:|gzip -c > $result_path/lat.$decoder.$test_set.gz" &> $log_file 2>&1
 
     if [ $? -ne 0 ]; then
       echo "  Error encountered while decoding. Check $log_file"
