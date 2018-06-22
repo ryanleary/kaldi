@@ -311,6 +311,7 @@ namespace kaldi {
         *h_q_overflow = 0;
 
         cudaMemset(d_main_q_local_offset, 0, sizeof(int));
+        *h_main_q_local_offset = 0;
         main_q_global_offset = 0;
         h_all_tokens_info.Reset();
 
@@ -500,6 +501,7 @@ namespace kaldi {
         preprocess_params.d_main_q_end = d_main_q_end;
         preprocess_params.h_main_q_end = h_main_q_end;
         preprocess_params.d_main_q_local_offset = d_main_q_local_offset;
+        preprocess_params.h_main_q_local_offset = h_main_q_local_offset;
         preprocess_params.d_main_q_end = d_main_q_end;
         preprocess_params.h_main_q_narcs = h_main_q_narcs;
         preprocess_params.q_capacity = max_tokens_per_frame_;
@@ -545,6 +547,7 @@ namespace kaldi {
         expand_params.d_main_q_cost = d_main_q_cost;
         expand_params.d_main_q_info = d_main_q_info;
         expand_params.d_main_q_local_offset = d_main_q_local_offset;
+        expand_params.h_main_q_local_offset = h_main_q_local_offset;
         expand_params.main_q_global_offset = main_q_global_offset;
         expand_params.d_main_q_end = d_main_q_end;
         expand_params.d_main_q_narcs = d_main_q_narcs;
@@ -754,6 +757,12 @@ namespace kaldi {
 
         finalize_kernel:
 
+        // Avoiding races 
+        // We will write d_aux_q_end
+        // And some threads may be still reading it 
+        // At the beg of this kernel
+        __syncthreads();
+        
         if(threadIdx.x == 0) {
             int old = atomicAdd(params.d_n_CTA_done, 1);
             bool is_last_CTA = (old == (gridDim.x -1));
@@ -795,9 +804,7 @@ namespace kaldi {
         typedef cub::BlockScan<int, COMPUTE_DEGREES_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
-        __shared__ int blk_scan_offset;
         __shared__ int is_last_CTA;
-
 
         int queue_offset = *params.d_main_q_local_offset;
         int queue_end = *params.d_main_q_end;
@@ -835,13 +842,11 @@ namespace kaldi {
             if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1))
                 params.d_degrees_block_scan[block_offset/COMPUTE_DEGREES_DIMX] = (scan + degree); 
 
-            if((block_offset + gridDim.x*blockDim.x) < queue_end)
-                __syncthreads(); // we'll reuse temp_storage
+            __syncthreads(); // we'll reuse temp_storage
         }
 
         if(threadIdx.x == 0) {
             int old = atomicAdd(params.d_n_CTA_done, 1); 
-            blk_scan_offset = 0;
             is_last_CTA = (old == (gridDim.x -1));
         }
 
@@ -859,32 +864,29 @@ namespace kaldi {
 
             // following value can be different than gridDim.x 
             int total_blk_val = (queue_size + COMPUTE_DEGREES_DIMX -1) / COMPUTE_DEGREES_DIMX;
+            int scan_offset = 0;
 
             for(int blk_idx_off = 0; blk_idx_off < total_blk_val; blk_idx_off += blockDim.x) {
                 int blk_idx = blk_idx_off + threadIdx.x; 
 
                 int blk_sum = (blk_idx < total_blk_val) ?  params.d_degrees_block_scan[blk_idx] : 0; 
-                int blk_scan;
-                BlockScan(temp_storage).ExclusiveSum(blk_sum, blk_scan);
-                blk_scan += blk_scan_offset; 
+                int blk_scan, iteration_total;
+                BlockScan(temp_storage).ExclusiveSum(blk_sum, blk_scan, iteration_total);
+                blk_scan += scan_offset;
+                scan_offset += iteration_total;
 
                 if(blk_idx < total_blk_val) {
                     params.d_degrees_block_scan[blk_idx] = blk_scan;
                 }
 
-                if(threadIdx.x == (COMPUTE_DEGREES_DIMX-1)) {
-                    int total = blk_scan + blk_sum; 
-                    blk_scan_offset = total;
-                }
-
+                // temp storage
                 __syncthreads();
-                // blk_scan_offset + reuse temp_storage
             }
 
             if(threadIdx.x == 0)
             {
-                *params.d_main_q_narcs = blk_scan_offset; 
-                *params.h_main_q_narcs = blk_scan_offset; // pinned memory
+                *params.d_main_q_narcs = scan_offset; 
+                *params.h_main_q_narcs = scan_offset; // pinned memory
             }
         }
     }
@@ -1190,6 +1192,8 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         finalize_kernel:
 
+        __syncthreads(); // avoiding races on d_main_q_narcs for instance
+
         // Last block alive sets h_aux_q_end (pinned memory)
         if(threadIdx.x == 0) {
             int old = atomicAdd(params.d_n_CTA_done, 1);
@@ -1201,11 +1205,13 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
                 *params.h_main_q_narcs = 0;
 
                 if(params.is_emitting) {
-                    *params.d_main_q_local_offset = 0;
+                    *params.d_main_q_local_offset = 0; // not needed
+                    *params.h_main_q_local_offset = 0; // not needed
                     *params.d_main_q_end = 0;
                     *params.h_main_q_end = 0;
                 } else {
                     *params.d_main_q_local_offset = main_q_end;
+                    *params.h_main_q_local_offset = main_q_end;
                 }
 
             }
@@ -1446,6 +1452,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
                 *params.h_main_q_narcs = 0; 
 
                 *params.d_main_q_local_offset = 0; 
+                *params.h_main_q_local_offset = 0; 
 
                 *params.d_cutoff = cutoff;
             }
@@ -1604,6 +1611,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         KALDI_LOG << "Reallocating TokenVector on host (new capacity = " << capacity << " tokens)";
 
+        cudaStreamSynchronize(copy_st);
         InfoToken *h_old_data = h_data;
         cudaMallocHost(&h_data, capacity * sizeof(InfoToken)); 
 
@@ -1613,6 +1621,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
         if(size)
             cudaMemcpyAsync(h_data, h_old_data, size * sizeof(InfoToken), cudaMemcpyHostToHost, copy_st);
 
+        cudaStreamSynchronize(copy_st);
         cudaFreeHost(h_old_data);
     }
 

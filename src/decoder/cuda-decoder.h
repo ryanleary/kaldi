@@ -208,6 +208,7 @@ class CudaDecoder {
       InfoToken *d_main_q_info; 
 
       int *d_main_q_local_offset; 
+      int *h_main_q_local_offset; 
       int *d_main_q_end; 
       QEndAndNarcs *d_main_q_end_and_narcs_i2; 
       int *d_main_q_narcs; 
@@ -245,6 +246,7 @@ class CudaDecoder {
       int *h_main_q_narcs; 
 
       int *d_main_q_local_offset;
+      int *h_main_q_local_offset;
       int main_q_global_offset;
       int *d_main_q_end;
 
