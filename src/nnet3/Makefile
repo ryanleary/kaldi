@@ -55,7 +55,7 @@ endif
 
 # Implicit rule for kernel compilation,
 %.o : %.cu
-	$(CUDATKDIR)/bin/nvcc -c $< -o $@ $(CUDA_INCLUDE) $(CUDA_FLAGS) $(CUDA_ARCH) -I../
-
+	$(CUDATKDIR)/bin/nvcc -c $< -o $@ $(CUDA_INCLUDE) $(CUDA_FLAGS) $(CUDA_ARCH) -I../ -I$(OPENFSTINC) -Xcompiler \
+	"-pthread -fPIC" -DCUDA_API_PER_THREAD_DEFAULT_STREAM
 
 include ../makefiles/default_rules.mk

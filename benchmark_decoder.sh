@@ -40,7 +40,7 @@ for decoder in online2-wav-nnet3-cuda online2-wav-nnet3-cpu; do # online2-wav-nn
   for test_set in test_clean test_other; do
     log_file="$result_path/log.$decoder.$test_set.out"
 
-    threads=4
+    threads=8
     if [[ $decoder = *"-cpu" ]]; then
       threads=40
     fi
