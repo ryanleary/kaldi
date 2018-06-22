@@ -33,6 +33,10 @@ OBJFILES = nnet-common.o nnet-compile.o nnet-component-itf.o \
   nnet-convolutional-component.o attention.o \
   nnet-attention-component.o
 
+ifeq ($(CUDA), true)
+  OBJFILES += decodable-online-looped-cuda.o
+endif
+
 
 LIBNAME = kaldi-nnet3
 
@@ -42,7 +46,16 @@ ADDLIBS = ../chain/kaldi-chain.a ../cudamatrix/kaldi-cudamatrix.a \
           ../tree/kaldi-tree.a ../util/kaldi-util.a \
           ../matrix/kaldi-matrix.a ../base/kaldi-base.a
 
-decodable-online-looped-cuda.o: decodable-online-looped-cuda.cu decodable-online-looped.o
-	nvcc -g -Xptxas -v -arch=sm_70 -lineinfo -w -std=c++11 -I.. -I../../tools/openfst/include -DKALDI_DOUBLEPRECISION=0 -DHAVE_EXECINFO_H=1 -DHAVE_CXXABI_H -DHAVE_ATLAS -I/home/jluitjens/git/kaldi/tools/ATLAS_headers/include -Xcompiler "-msse -msse2 -pthread -fopenmp" -O3  -Xcompiler -fPIC -DHAVE_CUDA -I${CUDA_HOME}/include -I${CUDA_HOME}/samples/common/inc -I${CUDA_HOME}/include/CL -I${CUDA_HOME}/extras/CUPTI/include -I${CUDA_HOME}/extras/Debugger/include -I${CUDA_HOME}/nvvm/include  -c -o $@ $< -lcuda 
+# Make sure we have CUDA_ARCH from kaldi.mk,
+ifeq ($(CUDA), true)
+  ifndef CUDA_ARCH
+    $(error CUDA_ARCH is undefined, run 'src/configure')
+  endif
+endif
+
+# Implicit rule for kernel compilation,
+%.o : %.cu
+	$(CUDATKDIR)/bin/nvcc -c $< -o $@ $(CUDA_INCLUDE) $(CUDA_FLAGS) $(CUDA_ARCH) -I../
+
 
 include ../makefiles/default_rules.mk
