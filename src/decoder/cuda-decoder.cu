@@ -697,15 +697,19 @@ namespace kaldi {
                 cost = params.d_aux_q_cost[aux_q_idx];
                 state_idx = params.d_aux_q_state[aux_q_idx];
 
-                if(cost < cutoff) {
-                    BaseFloat best_cost = orderedIntToFloat(params.d_state_cost[state_idx]);
+                BaseFloat best_cost = orderedIntToFloat(params.d_state_cost[state_idx]);
 
+                if(cost < cutoff) {
                     if(cost == best_cost) {
                         arc_start = params.d_arc_offsets[state_idx];
                         int arc_end = params.d_arc_offsets[state_idx+1];
                         degree = arc_end - arc_start;
                     }
-                } 
+                }
+
+                if (best_cost >= cutoff)
+                    params.d_state_cost[state_idx] = floatToOrderedInt(FLT_MAX);
+
             }
 
             int is_pruned = (arc_start == -1);
@@ -791,8 +795,9 @@ namespace kaldi {
 
 /*
     This kernel is also a preprocessing kernel, but this time does it in place
-    The tokens are already in the main q (they were placed here by a previous "contract and preprocess"). We implicitly
-    prune the non-optimal ones (by setting the degree to 0), and we compute the degrees scan.
+    The tokens are already in the main q (they were placed here by a previous "contract and preprocess").
+    We avoid performing the next phase on non-optimal ones by setting the degree to 0 and
+    computing a degrees scan.
 
     Here we have to do the scan in two passes : the scan will be finished in "finalize_preprocess"
 
@@ -1164,6 +1169,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                             if(has_successor) {
                                 params.d_aux_q_cost[to_q_index] = total_cost;
+                                params.d_aux_q_state[to_q_index] = arc_next_state;
                                 
                                 atomicMin(&params.d_lookup[arc_next_state],
                                 floatToOrderedInt(total_cost)
@@ -1175,7 +1181,6 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
                                     // if the cost is higher than cutoff, 
                                     // the token will be ignored anyway 
 
-                                    params.d_aux_q_state[to_q_index] = arc_next_state;
 
                                     InfoToken new_tok_info;
                                     new_tok_info.prev_token = params.main_q_global_offset + main_q_idx;
