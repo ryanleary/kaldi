@@ -22,6 +22,20 @@ fi
 mkdir -p $result_path
 
 # copy the dataset to a local path
+#if [ -d "$local_data" ]; then
+#  echo "Local directory already exists, skipping..."
+#else
+#  echo "Copying data to $local_data..."
+#  mkdir -p $local_data
+#  for test_set in test_clean test_other; do
+#    mkdir -p $local_data/$test_set
+#    test_set_dash=$(echo $test_set | sed 's/_/-/g')
+#    cat $librispeech_path/$test_set/wav.scp | awk '{print $1" "$6}' | sed -r "s#(.*) (.*)/$test_set_dash/(.*).flac#\1 $local_data/${test_set_dash}-wav8k/\3.wav#g" > $local_data/$test_set/wav.scp
+#    head $local_data/$test_set/wav.scp > $local_data/$test_set/wav_head.scp
+#  done
+#  cp -R $librispeech_path/test-*-wav8k $local_data/
+#fi
+# copy the dataset to a local path
 if [ -d "$local_data" ]; then
   echo "Local directory already exists, skipping..."
 else
@@ -32,8 +46,9 @@ else
     test_set_dash=$(echo $test_set | sed 's/_/-/g')
     cat $librispeech_path/$test_set/wav.scp | awk '{print $1" "$6}' | sed -r "s#(.*) (.*)/$test_set_dash/(.*).flac#\1 $local_data/${test_set_dash}-wav8k/\3.wav#g" > $local_data/$test_set/wav.scp
     head $local_data/$test_set/wav.scp > $local_data/$test_set/wav_head.scp
+    src=$(head -n 1 $librispeech_path/$test_set/wav.scp |  awk '{print $6}' | cut -d '/' -f -5 | sed -r "s#(.*)/$test_set_dash#\1/${test_set_dash}-wav8k#g")
+    cp -R $src $local_data/
   done
-  cp -R $librispeech_path/LibriSpeech/test-*-wav8k $local_data/
 fi
 
 for decoder in online2-wav-nnet3-cuda online2-wav-nnet3-cpu; do # online2-wav-nnet3-faster; do
@@ -49,7 +64,7 @@ for decoder in online2-wav-nnet3-cuda online2-wav-nnet3-cpu; do # online2-wav-nn
     echo "Running $decoder decoder on $test_set$trunc [$threads threads]..."
     OMP_NUM_THREADS=$threads ./src/online2bin/$decoder \
       --frames-per-chunk=160 --online=false --do-endpointing=false --frame-subsampling-factor=3 \
-      --config="$model_path/online.conf" \
+      --config="$model_path/conf/online.conf" \
       --beam=15.0 --acoustic-scale=1.0 \
       $model_path/final.mdl \
       $model_path/HCLG.fst \
