@@ -21,35 +21,36 @@ fi
 
 mkdir -p $result_path
 
+# check to see if model needs 8 or 16k data
+test_set_suffix="-wav" # assume 16k
+sr=$(cat $model_path/conf/mfcc.conf | grep sample-frequency | cut -d= -f2 | awk '{print $1};')
+if [[ $sr -eq "8000" ]]; then
+  test_set_suffix="-wav8k"
+fi
+
+echo "Using the $test_set_suffix version of the dataset..."
+
 # copy the dataset to a local path
-#if [ -d "$local_data" ]; then
-#  echo "Local directory already exists, skipping..."
-#else
-#  echo "Copying data to $local_data..."
-#  mkdir -p $local_data
-#  for test_set in test_clean test_other; do
-#    mkdir -p $local_data/$test_set
-#    test_set_dash=$(echo $test_set | sed 's/_/-/g')
-#    cat $librispeech_path/$test_set/wav.scp | awk '{print $1" "$6}' | sed -r "s#(.*) (.*)/$test_set_dash/(.*).flac#\1 $local_data/${test_set_dash}-wav8k/\3.wav#g" > $local_data/$test_set/wav.scp
-#    head $local_data/$test_set/wav.scp > $local_data/$test_set/wav_head.scp
-#  done
-#  cp -R $librispeech_path/test-*-wav8k $local_data/
-#fi
-# copy the dataset to a local path
-if [ -d "$local_data" ]; then
-  echo "Local directory already exists, skipping..."
-else
-  echo "Copying data to $local_data..."
+  echo "Copying dataset metadata to $local_data..."
   mkdir -p $local_data
   for test_set in test_clean test_other; do
+    if [ -d "$local_data/$test_set" ]; then
+      echo "Removing existing dataset metadata in $local_data/$test_set"
+      rm -rf $local_data/$test_set
+    fi
     mkdir -p $local_data/$test_set
     test_set_dash=$(echo $test_set | sed 's/_/-/g')
-    cat $librispeech_path/$test_set/wav.scp | awk '{print $1" "$6}' | sed -r "s#(.*) (.*)/$test_set_dash/(.*).flac#\1 $local_data/${test_set_dash}-wav8k/\3.wav#g" > $local_data/$test_set/wav.scp
+    cat $librispeech_path/$test_set/wav.scp | awk '{print $1" "$6}' | sed -r "s#(.*) (.*)/$test_set_dash/(.*).flac#\1 $local_data/${test_set_dash}${test_set_suffix}/\3.wav#g" > $local_data/$test_set/wav.scp
     head $local_data/$test_set/wav.scp > $local_data/$test_set/wav_head.scp
-    src=$(head -n 1 $librispeech_path/$test_set/wav.scp |  awk '{print $6}' | cut -d '/' -f -5 | sed -r "s#(.*)/$test_set_dash#\1/${test_set_dash}-wav8k#g")
-    cp -R $src $local_data/
+    src=$(head -n 1 $librispeech_path/$test_set/wav.scp |  awk '{print $6}' | cut -d '/' -f -5 | sed -r "s#(.*)/$test_set_dash#\1/${test_set_dash}${test_set_suffix}#g")
+
+    if [ -d "$local_data/${test_set_dash}${test_set_suffix}" ]; then
+      echo "Converted data already exists locally for $test_set_dash, skipping..."
+    else
+      echo "Copying converted data locally for $test_set_dash..."
+      cp -R $src $local_data/
+    fi
   done
-fi
 
 for decoder in online2-wav-nnet3-cuda online2-wav-nnet3-cpu; do # online2-wav-nnet3-faster; do
   for test_set in test_clean test_other; do
