@@ -10,8 +10,8 @@ if [ x"$USER_ID" != x"0" ]; then
     NSS_WRAPPER_GROUP=/tmp/group.nss_wrapper
     cat /etc/passwd > $NSS_WRAPPER_PASSWD
     cat /etc/group > $NSS_WRAPPER_GROUP
-    echo "fun3d:x:$USER_ID:0:FUN3D,,,:/work:/bin/bash" >> $NSS_WRAPPER_PASSWD
-    echo "fun3d:x:$GROUP_ID:" >> $NSS_WRAPPER_GROUP
+    echo "kaldi:x:$USER_ID:0:FUN3D,,,:/work:/bin/bash" >> $NSS_WRAPPER_PASSWD
+    echo "kaldi:x:$GROUP_ID:" >> $NSS_WRAPPER_GROUP
     export NSS_WRAPPER_PASSWD
     export NSS_WRAPPER_GROUP
     LD_PRELOAD=/usr/lib/libnss_wrapper.so
