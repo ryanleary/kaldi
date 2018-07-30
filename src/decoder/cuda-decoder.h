@@ -78,7 +78,7 @@ namespace kaldi {
 
             // GetBestPath gets the decoding traceback. If "use_final_probs" is true
             // AND we reached a final state, it limits itself to final states;
-            // otherwise it gets the most likely token not taking into account final-probs.
+            // otherwise it gets the most likely token not taking int32o account final-probs.
             // fst_out will be empty (Start() == kNoStateId) if nothing was available due to
             // search error.
             // If Decode() returned true, it is safe to assume GetBestPath will return true.
@@ -86,7 +86,7 @@ namespace kaldi {
             // using the return value is deprecated.
             bool GetBestPath(Lattice *fst_out, bool use_final_probs = true) const;
 
-            /// *** The next functions are from the "new interface". ***
+            /// *** The next functions are from the "new int32erface". ***
 
             /// FinalRelativeCost() serves the same function as ReachedFinal(), but gives
             /// more information.  It returns the difference between the best (final-cost plus
@@ -96,7 +96,7 @@ namespace kaldi {
             BaseFloat FinalRelativeCost() const;
 
             /// InitDecoding initializes the decoding, and should only be used if you
-            /// intend to call AdvanceDecoding().  If you call Decode(), you don't need
+            /// int32end to call AdvanceDecoding().  If you call Decode(), you don't need
             /// to call this.  You can call InitDecoding if you have already decoded an
             /// utterance and want to start with a new utterance. 
             void InitDecoding();  
@@ -104,15 +104,15 @@ namespace kaldi {
 
             // Count of tokens and arcs in a queue
             // narcs = sum(number of arcs going out of token i) for each token in the queue
-            // We use this struct to keep the two ints adjacent in memory
+            // We use this struct to keep the two int32s adjacent in memory
             // we need this in order to update both using an atomic64 operation
             struct TokenAndArcCount {
-                int ntokens;
-                int narcs;
+                int32 ntokens;
+                int32 narcs;
             };
 
             // Union structure of the TokenAndArcCount
-            // We use split to access the ints
+            // We use split to access the int32s
             // We use both to update both using an atomic64
             union TokenAndArcCountUnion {
                 TokenAndArcCount split;
@@ -124,32 +124,32 @@ namespace kaldi {
                 CostType *d_main_q_cost;
                 InfoToken *d_main_q_info; 
 
-                int *d_main_q_local_offset; 
-                int *h_main_q_local_offset; 
-                int *d_main_q_end; 
+                int32 *d_main_q_local_offset; 
+                int32 *h_main_q_local_offset; 
+                int32 *d_main_q_end; 
                 TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
-                int *d_main_q_narcs; 
-                int *h_main_q_end;
-                int *h_main_q_narcs; 
+                int32 *d_main_q_narcs; 
+                int32 *h_main_q_end;
+                int32 *h_main_q_narcs; 
 
-                int *h_q_overflow; 
-                int q_capacity;
+                int32 *h_q_overflow; 
+                int32 q_capacity;
 
                 StateId *d_aux_q_state; 
                 CostType *d_aux_q_cost;
                 InfoToken *d_aux_q_info; 
-                int *d_aux_q_end; 
-                int *h_aux_q_end;
+                int32 *d_aux_q_end; 
+                int32 *h_aux_q_end;
 
-                int *d_degrees_scan; 
-                unsigned int *d_arc_offsets; 
-                int *d_main_q_arc_offsets; // offsets, relative to the queue
+                int32 *d_degrees_scan; 
+                uint32_t *d_arc_offsets; 
+                int32 *d_main_q_arc_offsets; // offsets, relative to the queue
 
-                int *d_state_cost; 
+                int32 *d_state_cost; 
                 BaseFloat *d_cutoff; 
 
-                int *d_degrees_block_scan; 
-                int *d_n_CTA_done;
+                int32 *d_degrees_block_scan; 
+                int32 *d_n_CTA_done;
             };
 
 
@@ -157,29 +157,29 @@ namespace kaldi {
                 StateId *d_main_q_state; 
                 CostType *d_main_q_cost;
                 InfoToken *d_main_q_info; 
-                int *d_degrees_scan; 
+                int32 *d_degrees_scan; 
 
-                int *d_main_q_narcs; 
-                int *h_main_q_narcs; 
+                int32 *d_main_q_narcs; 
+                int32 *h_main_q_narcs; 
 
-                int *d_main_q_local_offset;
-                int *h_main_q_local_offset;
-                int main_q_global_offset;
-                int *d_main_q_end;
+                int32 *d_main_q_local_offset;
+                int32 *h_main_q_local_offset;
+                int32 main_q_global_offset;
+                int32 *d_main_q_end;
 
-                int *h_main_q_end;
+                int32 *h_main_q_end;
 
                 StateId *d_aux_q_state; 
                 CostType *d_aux_q_cost;
                 InfoToken *d_aux_q_info; 
-                int *d_aux_q_end;
-                int *h_aux_q_end; 
+                int32 *d_aux_q_end;
+                int32 *h_aux_q_end; 
 
-                int *h_q_overflow; 
-                int q_capacity;
+                int32 *h_q_overflow; 
+                int32 q_capacity;
 
-                int *d_q_arc_offsets; 
-                int *arc_ilabels; 
+                int32 *d_q_arc_offsets; 
+                int32 *arc_ilabels; 
 
                 BaseFloat *arc_weights; 
                 StateId *arc_nextstates; 
@@ -187,14 +187,14 @@ namespace kaldi {
                 BaseFloat *d_loglikelihoods;
                 BaseFloat beam; 
 
-                int *d_lookup;
+                int32 *d_lookup;
                 bool is_emitting;
-                int *d_n_CTA_done;
+                int32 *d_n_CTA_done;
             };
 
 
 
-            void ExpandArcs(int nthreads, const ExpandArcParams &params);
+            void ExpandArcs(int32 nthreads, const ExpandArcParams &params);
 
             void ContractAndPreprocess(PreprocessParams &params);
             void PreprocessInPlace(PreprocessParams &params);
@@ -215,31 +215,31 @@ namespace kaldi {
             InfoToken *d_main_q_info, *d_aux_q_info;
 
             // Local offset (in d_q_from_*)
-            int *d_main_q_local_offset;
-            int *h_main_q_local_offset; // TODO not needed 
+            int32 *d_main_q_local_offset;
+            int32 *h_main_q_local_offset; // TODO not needed 
 
             // Global offset (in h_all_*)
             // Used to set the "prev_token" in new tokens
-            int main_q_global_offset;
+            int32 main_q_global_offset;
 
-            // Pointer to end index in from (equal to size + offset)
-            int *d_main_q_end;
-            int *h_main_q_end;
+            // Point32er to end index in from (equal to size + offset)
+            int32 *d_main_q_end;
+            int32 *h_main_q_end;
 
             // total number of arcs contained in main q [off, end[
             // ie total # of arcs from tok.next_state, where tok is in [off,end[
             // (actually one "valid arcs" are counted, cf Preprocess)
-            int *d_main_q_narcs;
-            int *h_main_q_narcs; // pinned
+            int32 *d_main_q_narcs;
+            int32 *h_main_q_narcs; // pinned
 
             // Contains both q_end and narcs
             TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
 
-            // Pointer to end index in to (equal to size + 0) (no offset)
-            int *d_aux_q_end;
-            int *h_aux_q_end;
+            // Point32er to end index in to (equal to size + 0) (no offset)
+            int32 *d_aux_q_end;
+            int32 *h_aux_q_end;
 
-            int *h_q_overflow;
+            int32 *h_q_overflow;
 
             TokenVector h_all_tokens_info; // on host
 
@@ -248,22 +248,22 @@ namespace kaldi {
             CostType *h_main_q_cost; // on host
 
             // Used to detect last CTA alive in some kernels
-            int *d_n_CTA_done;
+            int32 *d_n_CTA_done;
 
             // Scan of the outgoing arc degrees of tokens in [from,to[
-            int *d_degrees_scan;
+            int32 *d_degrees_scan;
             // Scan of the total per block
-            int *d_degrees_block_scan;
+            int32 *d_degrees_block_scan;
 
             // Cf Compute degrees
-            int *d_main_q_arc_offsets;
+            int32 *d_main_q_arc_offsets;
 
 
             // Lookup table of all the costs
             // d_state_cost[state] -> best cost for that state
             // Resetted between frames
-            // Costs is stored as an ordered int representing a float
-            int *d_state_cost;
+            // Costs is stored as an ordered int32 representing a float
+            int32 *d_state_cost;
 
             // Current cutoff for current frame
             BaseFloat *d_cutoff;
@@ -284,20 +284,20 @@ namespace kaldi {
 
             void InitLookup();
             void ResetLookup();
-            void NonEmittingLongTail(unsigned int *d_arc_offsets, const ExpandArcParams &params);
+            void NonEmittingLongTail(uint32_t *d_arc_offsets, const ExpandArcParams &params);
 
-            void GetBestCost(BaseFloat *min, int *arg, bool isfinal) const;
+            void GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const;
             void ProcessEmitting();
             void ProcessNonemitting();
-            void PrintOverflowWarning();
+            void Print32OverflowWarning();
 
-            bool ProcessToken(unsigned int *d_arc_offsets, bool is_emitting);
+            bool ProcessToken(uint32_t *d_arc_offsets, bool is_emitting);
 
 
             const CudaFst fst_;
 
             BaseFloat beam_;
-            int max_tokens_, max_tokens_per_frame_;
+            int32 max_tokens_, max_tokens_per_frame_;
 
 
             // Keep track of the number of frames decoded in the current file.
