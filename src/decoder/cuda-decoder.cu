@@ -60,9 +60,9 @@ namespace kaldi {
         cudaMalloc(&d_aux_q_end, sizeof(int));
         cudaMalloc(&d_n_CTA_done, sizeof(int));
 
-        cudaMalloc(&d_main_q_end_and_narcs_i2, sizeof(QEndAndNarcs));
+        cudaMalloc(&d_main_q_end_and_narcs_i2, sizeof(TokenAndArcCountUnion));
         d_main_q_narcs = &d_main_q_end_and_narcs_i2->split.narcs;
-        d_main_q_end = &d_main_q_end_and_narcs_i2->split.end;
+        d_main_q_end = &d_main_q_end_and_narcs_i2->split.ntokens;
 
         cudaMalloc(&d_cutoff, sizeof(BaseFloat));
 

@@ -101,13 +101,21 @@ namespace kaldi {
             /// utterance and want to start with a new utterance. 
             void InitDecoding();  
 
-            struct EndAndNarcs{
-                int end;
+
+            // Count of tokens and arcs in a queue
+            // narcs = sum(number of arcs going out of token i) for each token in the queue
+            // We use this struct to keep the two ints adjacent in memory
+            // we need this in order to update both using an atomic64 operation
+            struct TokenAndArcCount {
+                int ntokens;
                 int narcs;
             };
 
-            union QEndAndNarcs {
-                EndAndNarcs split;
+            // Union structure of the TokenAndArcCount
+            // We use split to access the ints
+            // We use both to update both using an atomic64
+            union TokenAndArcCountUnion {
+                TokenAndArcCount split;
                 unsigned long long both;
             };
 
@@ -119,7 +127,7 @@ namespace kaldi {
                 int *d_main_q_local_offset; 
                 int *h_main_q_local_offset; 
                 int *d_main_q_end; 
-                QEndAndNarcs *d_main_q_end_and_narcs_i2; 
+                TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
                 int *d_main_q_narcs; 
                 int *h_main_q_end;
                 int *h_main_q_narcs; 
@@ -225,7 +233,7 @@ namespace kaldi {
             int *h_main_q_narcs; // pinned
 
             // Contains both q_end and narcs
-            QEndAndNarcs *d_main_q_end_and_narcs_i2; 
+            TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
 
             // Pointer to end index in to (equal to size + 0) (no offset)
             int *d_aux_q_end;

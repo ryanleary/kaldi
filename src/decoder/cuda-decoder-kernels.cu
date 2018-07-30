@@ -23,7 +23,7 @@
 namespace kaldi {
 
 typedef CudaDecoder::StateId StateId;
-typedef CudaDecoder::QEndAndNarcs QEndAndNarcs;
+typedef CudaDecoder::TokenAndArcCountUnion TokenAndArcCountUnion;
 typedef CudaDecoder::CostType CostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
 typedef CudaDecoder::ExpandArcParams ExpandArcParams; 
@@ -185,7 +185,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         typedef cub::BlockScan<int2, KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
-        __shared__ QEndAndNarcs blk_local_offset_i2;
+        __shared__ TokenAndArcCountUnion blk_local_offset_i2;
         __shared__ int total_in_CTA;
 
         const int aux_q_end = *params.d_aux_q_end;
@@ -232,20 +232,20 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             BlockScan(temp_storage).ExclusiveScan(scan_i2, scan_i2, zero_i2, F2Sum());
 
             
-            QEndAndNarcs inclusive_scan;
+            TokenAndArcCountUnion inclusive_scan;
             if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1)) {
                 // CUB Scan is exclusive
-                inclusive_scan.split.end = scan_i2.x + (is_pruned ? 0 : 1);
+                inclusive_scan.split.ntokens = scan_i2.x + (is_pruned ? 0 : 1);
                 inclusive_scan.split.narcs = scan_i2.y + degree;
 
                 blk_local_offset_i2.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, inclusive_scan.both);
-                total_in_CTA = inclusive_scan.split.end;
+                total_in_CTA = inclusive_scan.split.ntokens;
             }
 
             __syncthreads(); // blk_local_offset + temp_storage
 
             // main_q overflow
-            if((blk_local_offset_i2.split.end + total_in_CTA) >= params.q_capacity) {
+            if((blk_local_offset_i2.split.ntokens + total_in_CTA) >= params.q_capacity) {
                 if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1)) {
                     atomicAdd(&params.d_main_q_end_and_narcs_i2->both, -inclusive_scan.both); // revert
                     *params.h_q_overflow = 1;
@@ -256,7 +256,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             if(!is_pruned) {
                 // Moving non-pruned to the main q
-                int main_q_idx = blk_local_offset_i2.split.end + scan_i2.x;
+                int main_q_idx = blk_local_offset_i2.split.ntokens + scan_i2.x;
 
                 InfoToken info = params.d_aux_q_info[aux_q_idx];
 
