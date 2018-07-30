@@ -103,7 +103,7 @@ namespace kaldi {
 
 
             // Count of tokens and arcs in a queue
-            // narcs = sum(number of arcs going out of token i) for each token in the queue
+            // narcs = sum(number of arcs going out of token i next state) for each token in the queue
             // We use this struct to keep the two int32s adjacent in memory
             // we need this in order to update both using an atomic64 operation
             struct TokenAndArcCount {
@@ -118,6 +118,12 @@ namespace kaldi {
                 TokenAndArcCount split;
                 unsigned long long both;
             };
+
+            // Parameters used by the Preprocess kernels
+            // We store them in a struct to reduce the number of arguments passed to 
+            // the kernel
+            // The cuda kernel launch latency time is linear with the number of args 
+            // Here we will pass only one arg, which is this struct
 
             struct PreprocessParams {
                 StateId *d_main_q_state; 
@@ -151,6 +157,12 @@ namespace kaldi {
                 int32 *d_degrees_block_scan; 
                 int32 *d_n_CTA_done;
             };
+
+            // Parameters used by the Expand kernel
+            // We store them in a struct to reduce the number of arguments passed to 
+            // the kernel
+            // The cuda kernel launch latency time is linear with the number of args 
+            // Here we will pass only one arg, which is this struct
 
 
             struct ExpandArcParams {
@@ -192,12 +204,101 @@ namespace kaldi {
                 int32 *d_n_CTA_done;
             };
 
+private:
+            //
+            // Kernel wrappers
+            // The following functions are wrappers for cuda kernels
+            //
 
+            //
+            // ExpandArcs kernel
+            // This kernel reads token from the main_q and uses the FST graph
+            // to compute new token queue in aux_q
+            // To do this, for each token in the main_q, we traverse each arcs going 
+            // out of that token's next state. If that arc's next state is a valid candidate,
+            // we create a new token and add it to aux_q.
+            // For more information on the condition for the creation of a new token,
+            // please refer to http://kaldi-asr.org/doc/decoders.html
+            //
 
             void ExpandArcs(int32 nthreads, const ExpandArcParams &params);
 
-            void ContractAndPreprocess(PreprocessParams &params);
+            //
+            // PreprocessAndContract kernel
+            // Input  : aux_q, FST, d_state_costs, d_cutoff
+            // Output : main_q, d_degrees_scan
+            //
+            // The Preprocess* kernels are used before executing Expand 
+            // Computing data members needed by Expand (preprocess) and prune tokens on the fly (contract) 
+            //
+            // Pseudo code of the PreprocessAndContract kernel : 
+            // - For each token in the aux_q, 
+            //          compute bool is_best = (token.cost < cutoff) 
+            //                                && (token.cost == d_state_costs[token.nextstate])
+            // If is_best, then :
+            //         1) append this token to the main_q
+            //         2) compute out_degree = (# of outgoing arcs from token.nextstate) 
+            //         3) compute the prefix sum of those out_degrees for all tokens appended in the main_q
+            //         4) save that prefix sum in d_degrees_scan
+            // Else 
+            //    Do nothing (this token is pruned)
+            //
+            // After executing PreprocessAndContract, 
+            // - aux_q is considered empty. d_aux_q_end was resetted to 0
+            // - all tokens generated buy PreprocessAndContract are in the main_q,
+            //   in the index range [d_main_q_local_offset, d_main_q_end[
+            //
+            // Note : Using a trick, we can compute everything (including the prefix sum)
+            // using only one kernel (without global syncs)
+            // We don't need to call FinalizePreprocessInPlace() after PreprocessAndContract
+            //
+
+            void PreprocessAndContract(PreprocessParams &params);
+
+            //
+            // PreprocessInPlace kernel
+            // Input  : main_q, main_q_local_offset, FST, d_state_costs, d_cutoff
+            // Output : main_q, d_degrees_scan
+            //
+            // The Preprocess* kernels are used before executing Expand 
+            // Computing data members needed by Expand (preprocess) in place, without modifying queues
+            // 
+            // This is used when the input tokens were already used to generate children tokens
+            // In practice, it happens when we are in a ProcessEmitting stage
+            // The input tokens in ProcessEmitting at frame i were already used in ProcessNonEmitting at frame (i-1)
+            // It means that those input tokens already have children. Those children token refer to the index of their 
+            // input tokens in their token.prev_token data member. 
+            // If we were to use PreprocessAndContract,
+            // the pruning stage would change the tokens indexes - and we would have to reindex those prev_token,
+            // hence the need for a PreprocessInPlace
+            //
+            // Pseudo code of the PreprocessInPlace kernel :
+            // - For each token in the range [local_offset, end[ of the main_q, 
+            //          compute bool is_best = (token.cost < cutoff) 
+            //                                && (token.cost == d_state_costs[token.nextstate])
+            //
+            //          compute out_degree = is_best
+            //                               ? (# of outgoing arcs from token.nextstate)
+            //                               : 0
+            // 
+            //  By artifically setting the out_degree to 0 we tell the expand kernel to completely ignore that token
+            //  (we rely on the 1 arc = 1 thread exact load balancing of the expand kernel)
+            //
+            // Then we compute the data needed by the expand kernel :
+            //         1) compute the prefix sum of those out_degrees 
+            //         3) save that prefix sum in d_degrees_scan
+            //
+            // After executing PreprocessInPlace,
+            // The "active" main_q[local_offset, end[ range stays the same.
+            //
+            // Note : Only the first pass of the prefix sum is computed in that kernel. We then need to call
+            // FinalizePreprocessInPlace
+            //
+
             void PreprocessInPlace(PreprocessParams &params);
+
+            // This kernel is responsible to compute the second pass of the
+            // prefix sum. Must be called between PreprocessInPlace and ExpandArcs
             void FinalizePreprocessInPlace();
 
             /// This will decode until there are no more frames ready in the decodable
@@ -210,42 +311,99 @@ namespace kaldi {
             /// Returns the number of frames already decoded.  
             int32 NumFramesDecoded() const { return num_frames_decoded_; }
 
+            //
+            // Data members
+            //
+            // Pointers in h_* refer to data on the CPU memory
+            // Pointers in d_* refer to data on the GPU memory
+
+
+            //
+            // Tokens queues
+            // 
+            // We have two token queues : 
+            // - the main queue
+            // - the auxiliary queue
+            // 
+            // The auxiliary queue is used to store the raw output of ExpandArcs.
+            // We then prune that aux queue and move the survival tokens in the main queue.
+            // Tokens stored in the main q can then be used to generate new tokens (using ExpandArcs)
+            //  
+            // As a reminder, here's the data structure of a token :
+            //
+            // struct Token { state, cost, prev_token, arc_idx }
+            //
+            // For performance reasons, we split the tokens in three parts :
+            // { state } , { cost }, { prev_token, arc_idx }
+            // Each part has its associated queue
+            // For instance, d_main_q_state[i], d_main_q_cost[i], d_main_q_info[i]
+            // all refer to the same token (at index i)
+            // The data structure InfoToken contains { prev_token, arc_idx }
+            //
+            // Note : We cannot use the aux queue to generate new tokens 
+            // (ie we cannot use the aux queue as an input of ExpandArcs)
+            // The generated tokens would have parents in the aux queue,
+            // identifying them using their indexes in the queue. Those indexes
+            // are not finals because the aux queue will be pruned.
+            //
+
             StateId *d_main_q_state, *d_aux_q_state; 
             CostType *d_main_q_cost, *d_aux_q_cost;
             InfoToken *d_main_q_info, *d_aux_q_info;
 
-            // Local offset (in d_q_from_*)
+            // ExpandArcs does not use at its input the complete main queue
+            // It only reads from the index range [main_q_local_offset, end[
+            int32 *h_main_q_local_offset; 
             int32 *d_main_q_local_offset;
-            int32 *h_main_q_local_offset; // TODO not needed 
 
-            // Global offset (in h_all_*)
-            // Used to set the "prev_token" in new tokens
-            int32 main_q_global_offset;
 
-            // Point32er to end index in from (equal to size + offset)
+            // end index of the main queue
+            // only tokens at index i with i < main_q_end 
+            // are valid tokens
             int32 *d_main_q_end;
-            int32 *h_main_q_end;
+            int32 *h_main_q_end; // pinned memory
 
-            // total number of arcs contained in main q [off, end[
-            // ie total # of arcs from tok.next_state, where tok is in [off,end[
-            // (actually one "valid arcs" are counted, cf Preprocess)
-            int32 *d_main_q_narcs;
-            int32 *h_main_q_narcs; // pinned
-
-            // Contains both q_end and narcs
-            TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
-
-            // Point32er to end index in to (equal to size + 0) (no offset)
+            // Same thing for the aux queue
             int32 *d_aux_q_end;
             int32 *h_aux_q_end;
 
+            // Each valid token the subqueue main_q[main_q_offset, main_q_end[ has 
+            // a number of outgoing arcs (out-degree)
+            // main_q_narcs is the sum of those numbers
+            // To see when a token is considered as valid, please refer to the Preprocess kernels
+            int32 *d_main_q_narcs;
+            int32 *h_main_q_narcs; // pinned memory
+
+            // Contains both main_q_end and narcs
+            // The pointers refer to the same location than the d_main_q_end and d_main_q_narcs pointers,
+            // ie : 
+            // d_main_q_end = &d_main_q_end_and_narcs->split.ntokens
+            // d_main_q_narcs = &d_main_q_end_and_narcs->split.narcs
+            // We sometime need to update both end and narcs at the same time,
+            // using an 64 bits atomic
+            TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
+
+            // After each frame, we copy the main queue (GPU memory)
+            // to the end of h_all_tokens_info (CPU memory)
+            TokenVector h_all_tokens_info; 
+
+            // The token at index i in the main queue has in reality 
+            // a global index of (i + main_q_global_offset)
+            // This global index is unique and takes into account that 
+            // we've flushed the main_q back to the host. We need unique indexes 
+            // for each token in order to have valid token.prev_token data members
+            // and be able to backtrack at the end
+            int32 main_q_global_offset;
+
             int32 *h_q_overflow;
 
-            TokenVector h_all_tokens_info; // on host
-
-            // Those are filled only if necessary
-            StateId *h_main_q_state; // on host
-            CostType *h_main_q_cost; // on host
+            // Buffers for copies on host on the current main_q
+            // Those are only buffers - and must be considered as containing 
+            // uninitialized data
+            // If you need to read from those,
+            // please explicitely copy data from device first !
+            StateId *h_main_q_state; 
+            CostType *h_main_q_cost; 
 
             // Used to detect last CTA alive in some kernels
             int32 *d_n_CTA_done;
