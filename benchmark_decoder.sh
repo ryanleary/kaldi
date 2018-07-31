@@ -58,7 +58,7 @@ echo "Using the $test_set_suffix version of the dataset..."
     echo "Generating new reference transcripts for model and dataset..."
     cat $librispeech_path/$test_set/text | tr '[:upper:]' '[:lower:]' > $local_data/$test_set/text
     oovtok=$(cat $result_path/words.txt | grep "<unk>" | awk '{print $2}')
-    ./egs/wsj/s5/utils/sym2int.pl --map-oov $oovtok -f 2- $result_path/words.txt $local_data/$test_set/text > $local_data/$test_set/text_ints_$model_path_hash &> /dev/null
+    ./egs/wsj/s5/utils/sym2int.pl --map-oov $oovtok -f 2- $result_path/words.txt $local_data/$test_set/text > $local_data/$test_set/text_ints_$model_path_hash 2> /dev/null
 
     # copy the correct data for each test set locally
     if [ -d "$local_data/${test_set_dash}${test_set_suffix}" ]; then
