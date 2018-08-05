@@ -39,94 +39,94 @@ namespace kaldi {
 
         // Comments about variables are in the .h file
 
-        cudaStreamCreate(&compute_st);
-        cudaStreamCreate(&copy_st);
+        cudaStreamCreate(&compute_st_);
+        cudaStreamCreate(&copy_st_);
 
-        cudaEventCreate(&can_read_h_main_q_narcs);
-        cudaEventCreate(&can_write_to_main_q);
+        cudaEventCreate(&can_read_h_main_q_narcs_);
+        cudaEventCreate(&can_write_to_main_q_);
 
-        cudaMalloc(&d_main_q_state, max_tokens_per_frame_ * sizeof(int));
-        cudaMallocHost(&h_main_q_state, max_tokens_per_frame_ * sizeof(int));
-        cudaMalloc(&d_aux_q_state, max_tokens_per_frame_ * sizeof(int));
+        cudaMalloc(&d_main_q_state_, max_tokens_per_frame_ * sizeof(int32));
+        cudaMallocHost(&h_main_q_state_, max_tokens_per_frame_ * sizeof(int32));
+        cudaMalloc(&d_aux_q_state_, max_tokens_per_frame_ * sizeof(int32));
 
-        cudaMalloc(&d_main_q_cost, max_tokens_per_frame_ * sizeof(CostType));
-        cudaMallocHost(&h_main_q_cost, max_tokens_per_frame_ * sizeof(CostType));
-        cudaMalloc(&d_aux_q_cost, max_tokens_per_frame_ * sizeof(CostType));
+        cudaMalloc(&d_main_q_cost_, max_tokens_per_frame_ * sizeof(CostType));
+        cudaMallocHost(&h_main_q_cost_, max_tokens_per_frame_ * sizeof(CostType));
+        cudaMalloc(&d_aux_q_cost_, max_tokens_per_frame_ * sizeof(CostType));
 
-        cudaMalloc(&d_main_q_info, max_tokens_per_frame_ * sizeof(InfoToken));
-        cudaMalloc(&d_aux_q_info, max_tokens_per_frame_ * sizeof(InfoToken));
+        cudaMalloc(&d_main_q_info_, max_tokens_per_frame_ * sizeof(InfoToken));
+        cudaMalloc(&d_aux_q_info_, max_tokens_per_frame_ * sizeof(InfoToken));
 
-        cudaMalloc(&d_main_q_local_offset, sizeof(int));
-        cudaMalloc(&d_aux_q_end, sizeof(int));
-        cudaMalloc(&d_n_CTA_done, sizeof(int));
+        cudaMalloc(&d_main_q_local_offset_, sizeof(int32));
+        cudaMalloc(&d_aux_q_end_, sizeof(int32));
+        cudaMalloc(&d_n_CTA_done_, sizeof(int32));
 
-        cudaMalloc(&d_main_q_end_and_narcs_i2, sizeof(TokenAndArcCountUnion));
-        d_main_q_narcs = &d_main_q_end_and_narcs_i2->split.narcs;
-        d_main_q_end = &d_main_q_end_and_narcs_i2->split.ntokens;
+        cudaMalloc(&d_main_q_end_and_narcs_i2_, sizeof(TokenAndArcCountUnion));
+        d_main_q_narcs_ = &d_main_q_end_and_narcs_i2_->split.narcs;
+        d_main_q_end_ = &d_main_q_end_and_narcs_i2_->split.ntokens;
 
         cudaMalloc(&d_cutoff, sizeof(BaseFloat));
 
-        h_all_tokens_info.SetCudaStream(copy_st);
-        h_all_tokens_info.Reserve(max_tokens_);
+        h_all_tokens_info_.SetCudaStream(copy_st_);
+        h_all_tokens_info_.Reserve(max_tokens_);
 
-        cudaMallocHost(&h_main_q_end, sizeof(int));  
-        cudaMallocHost(&h_main_q_narcs, sizeof(int));  
-        cudaMallocHost(&h_main_q_local_offset, sizeof(int));  
-        cudaMallocHost(&h_aux_q_end, sizeof(int));  
+        cudaMallocHost(&h_main_q_end_, sizeof(int32));  
+        cudaMallocHost(&h_main_q_narcs_, sizeof(int32));  
+        cudaMallocHost(&h_main_q_local_offset_, sizeof(int32));  
+        cudaMallocHost(&h_aux_q_end_, sizeof(int32));  
 
-        cudaMallocHost(&h_q_overflow, sizeof(int));  
+        cudaMallocHost(&h_q_overflow_, sizeof(int32));  
 
-        cudaMalloc(&d_main_q_degrees_prefix_sum, max_tokens_per_frame_ * sizeof(int));
-        cudaMalloc(&d_main_q_degrees_block_prefix_sum, (max_tokens_per_frame_ / KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int));
-        cudaMalloc(&d_main_q_arc_offsets, max_tokens_per_frame_ * sizeof(int));
+        cudaMalloc(&d_main_q_degrees_prefix_sum_, max_tokens_per_frame_ * sizeof(int32));
+        cudaMalloc(&d_main_q_degrees_block_prefix_sum_, (max_tokens_per_frame_ / KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int32));
+        cudaMalloc(&d_main_q_arc_offsets_, max_tokens_per_frame_ * sizeof(int32));
 
-        cudaMalloc(&loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
+        cudaMalloc(&loglikelihoods_d_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
 
-        cudaMalloc(&d_state_cost,sizeof(CostType)*fst_.numStates);
+        cudaMalloc(&d_state_cost_,sizeof(CostType)*fst_.numStates);
 
         cudaCheckError();
     }
 
     CudaDecoder::~CudaDecoder() {
 
-        cudaStreamDestroy(compute_st);
-        cudaStreamDestroy(copy_st);
+        cudaStreamDestroy(compute_st_);
+        cudaStreamDestroy(copy_st_);
 
-        cudaEventDestroy(can_read_h_main_q_narcs);
-        cudaEventDestroy(can_write_to_main_q);
+        cudaEventDestroy(can_read_h_main_q_narcs_);
+        cudaEventDestroy(can_write_to_main_q_);
 
-        cudaFree(d_main_q_state);
-        cudaFreeHost(h_main_q_state);
-        cudaFree(d_aux_q_state);
+        cudaFree(d_main_q_state_);
+        cudaFreeHost(h_main_q_state_);
+        cudaFree(d_aux_q_state_);
 
-        cudaFree(d_main_q_cost);
-        cudaFreeHost(h_main_q_cost);
-        cudaFree(d_aux_q_cost);
+        cudaFree(d_main_q_cost_);
+        cudaFreeHost(h_main_q_cost_);
+        cudaFree(d_aux_q_cost_);
 
-        cudaFree(d_main_q_info);
-        cudaFree(d_aux_q_info);
+        cudaFree(d_main_q_info_);
+        cudaFree(d_aux_q_info_);
 
-        cudaFree(d_main_q_local_offset);
-        cudaFree(d_aux_q_end);
-        cudaFree(d_n_CTA_done);
+        cudaFree(d_main_q_local_offset_);
+        cudaFree(d_aux_q_end_);
+        cudaFree(d_n_CTA_done_);
 
-        cudaFree(d_main_q_end_and_narcs_i2);
+        cudaFree(d_main_q_end_and_narcs_i2_);
 
         cudaFree(d_cutoff);
 
 
-        cudaFreeHost(h_main_q_end);
-        cudaFreeHost(h_main_q_narcs);
-        cudaFreeHost(h_main_q_local_offset);
-        cudaFreeHost(h_aux_q_end);
+        cudaFreeHost(h_main_q_end_);
+        cudaFreeHost(h_main_q_narcs_);
+        cudaFreeHost(h_main_q_local_offset_);
+        cudaFreeHost(h_aux_q_end_);
 
-        cudaFree(d_main_q_degrees_prefix_sum);
-        cudaFree(d_main_q_degrees_block_prefix_sum);
-        cudaFree(d_main_q_arc_offsets);
+        cudaFree(d_main_q_degrees_prefix_sum_);
+        cudaFree(d_main_q_degrees_block_prefix_sum_);
+        cudaFree(d_main_q_arc_offsets_);
 
-        cudaFree(loglikelihoods_d);
+        cudaFree(loglikelihoods_d_);
 
-        cudaFree(d_state_cost);
+        cudaFree(d_state_cost_);
     }
 
     void CudaDecoder::InitDecoding() {
@@ -145,34 +145,34 @@ namespace kaldi {
 
         // We'll call ProcessNonemitting just after,
         // which will move tokens from aux to main
-        cudaMemcpy(d_aux_q_state, &start_state, sizeof(StateId), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_aux_q_cost, &cost, sizeof(CostType), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_aux_q_info, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aux_q_state_, &start_state, sizeof(StateId), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aux_q_cost_, &cost, sizeof(CostType), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_aux_q_info_, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
 
         // We simulate a regular execution for the first iteration
-        cudaMemcpy(&d_state_cost[start_state], &cost, sizeof(CostType), cudaMemcpyHostToDevice);
+        cudaMemcpy(&d_state_cost_[start_state], &cost, sizeof(CostType), cudaMemcpyHostToDevice);
 
         // Init state is in queue
-        int one = 1;
-        cudaMemcpy(d_aux_q_end, &one, sizeof(int), cudaMemcpyHostToDevice);
-        *h_aux_q_end = 1;
+        int32 one = 1;
+        cudaMemcpy(d_aux_q_end_, &one, sizeof(int32), cudaMemcpyHostToDevice);
+        *h_aux_q_end_ = 1;
 
-        cudaMemset(d_main_q_end, 0, sizeof(int));
-        cudaMemset(d_main_q_narcs, 0, sizeof(int));
-        *h_main_q_end = 0;
-        *h_main_q_narcs = 0;
+        cudaMemset(d_main_q_end_, 0, sizeof(int32));
+        cudaMemset(d_main_q_narcs_, 0, sizeof(int32));
+        *h_main_q_end_ = 0;
+        *h_main_q_narcs_ = 0;
 
-        *h_q_overflow = 0;
+        *h_q_overflow_ = 0;
 
-        cudaMemset(d_main_q_local_offset, 0, sizeof(int));
-        *h_main_q_local_offset = 0;
-        main_q_global_offset = 0;
-        h_all_tokens_info.Reset();
+        cudaMemset(d_main_q_local_offset_, 0, sizeof(int32));
+        *h_main_q_local_offset_ = 0;
+        main_q_global_offset_ = 0;
+        h_all_tokens_info_.Reset();
 
         CostType cutoff = FLT_MAX;
         cudaMemcpy(d_cutoff, &cutoff, sizeof(CostType), cudaMemcpyHostToDevice);
 
-        cudaMemset(d_n_CTA_done, 0, sizeof(int));
+        cudaMemset(d_n_CTA_done_, 0, sizeof(int32));
 
         cudaCheckError();
 
@@ -180,8 +180,8 @@ namespace kaldi {
 
         ProcessNonemitting();
 
-        int main_q_size = *h_main_q_end;
-        h_all_tokens_info.CopyFromDevice(main_q_global_offset, d_main_q_info, main_q_size);
+        int32 main_q_size = *h_main_q_end_;
+        h_all_tokens_info_.CopyFromDevice(main_q_global_offset_, d_main_q_info_, main_q_size);
     }
 
 
@@ -205,7 +205,7 @@ namespace kaldi {
 
         ComputeLogLikelihoods(decodable);
 
-        int prev_main_q_size = *h_main_q_end;
+        int32 prev_main_q_size = *h_main_q_end_;
         while (num_frames_decoded_ < target_frames_decoded) {
             
             // Computing a new frame
@@ -218,29 +218,29 @@ namespace kaldi {
             // the input tokens are already in the main_q
             // (they were put there by the ProcessNonemittings 
             // from the previous frame)
-            // we don't need can_write_to_main_q
+            // we don't need can_write_to_main_q_
             // the output tokens go to aux_q
             ProcessEmitting();
             // After process emitting we won't need the token
             // associated with the previous frame
             // the main q has been flushed at the end of Nonemitting, 
             //we update its offset
-            main_q_global_offset += prev_main_q_size;
+            main_q_global_offset_ += prev_main_q_size;
             
             // Non Emitting
             // we will write to the main q 
             // (preprocess is "contract and preprocess")
-            cudaEventSynchronize(can_write_to_main_q);
+            cudaEventSynchronize(can_write_to_main_q_);
             ProcessNonemitting(); 
             
-            prev_main_q_size = *h_main_q_end;
+            prev_main_q_size = *h_main_q_end_;
             
             // We are done with the current frame
             // We copy back its pruned tokens to the host
             // We only copy the "info" part (arc_idx + prev_token)
             // because we don't need anything else for the final backtrack
-            h_all_tokens_info.CopyFromDevice(main_q_global_offset, d_main_q_info, prev_main_q_size);
-            cudaEventRecord(can_write_to_main_q, copy_st);
+            h_all_tokens_info_.CopyFromDevice(main_q_global_offset_, d_main_q_info_, prev_main_q_size);
+            cudaEventRecord(can_write_to_main_q_, copy_st_);
             
         }   
 
@@ -253,7 +253,7 @@ namespace kaldi {
 
         int32 frame = num_frames_decoded_;
 
-        decodable->ComputeLogLikelihoods(loglikelihoods_d,frame,fst_.max_ilabel+1, compute_st);
+        decodable->ComputeLogLikelihoods(loglikelihoods_d_,frame,fst_.max_ilabel+1, compute_st_);
     }
 
     void CudaDecoder::PrintOverflowWarning() {
@@ -270,49 +270,48 @@ namespace kaldi {
         unsigned int *d_arc_offsets = is_emitting ? fst_.e_offsets_d : fst_.ne_offsets_d;
 
         PreprocessParams preprocess_params;
-        preprocess_params.d_aux_q_state = d_aux_q_state; 
-        preprocess_params.d_aux_q_cost = d_aux_q_cost;
-        preprocess_params.d_aux_q_info = d_aux_q_info; 
-        preprocess_params.d_aux_q_end = d_aux_q_end;
-        preprocess_params.h_aux_q_end = h_aux_q_end;
-        preprocess_params.d_main_q_state = d_main_q_state; 
-        preprocess_params.d_main_q_cost = d_main_q_cost;
-        preprocess_params.d_main_q_info = d_main_q_info; 
-        preprocess_params.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2; 
-        preprocess_params.d_main_q_narcs = d_main_q_narcs;
-        preprocess_params.d_main_q_end = d_main_q_end;
-        preprocess_params.h_main_q_end = h_main_q_end;
-        preprocess_params.d_main_q_local_offset = d_main_q_local_offset;
-        preprocess_params.h_main_q_local_offset = h_main_q_local_offset;
-        preprocess_params.d_main_q_end = d_main_q_end;
-        preprocess_params.h_main_q_narcs = h_main_q_narcs;
+        preprocess_params.d_aux_q_state = d_aux_q_state_; 
+        preprocess_params.d_aux_q_cost = d_aux_q_cost_;
+        preprocess_params.d_aux_q_info = d_aux_q_info_; 
+        preprocess_params.d_aux_q_end = d_aux_q_end_;
+        preprocess_params.h_aux_q_end = h_aux_q_end_;
+        preprocess_params.d_main_q_state = d_main_q_state_; 
+        preprocess_params.d_main_q_cost = d_main_q_cost_;
+        preprocess_params.d_main_q_info = d_main_q_info_; 
+        preprocess_params.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2_; 
+        preprocess_params.d_main_q_narcs = d_main_q_narcs_;
+        preprocess_params.d_main_q_end = d_main_q_end_;
+        preprocess_params.h_main_q_end = h_main_q_end_;
+        preprocess_params.d_main_q_local_offset = d_main_q_local_offset_;
+        preprocess_params.h_main_q_local_offset = h_main_q_local_offset_;
+        preprocess_params.h_main_q_narcs = h_main_q_narcs_;
         preprocess_params.q_capacity = max_tokens_per_frame_;
-        preprocess_params.h_q_overflow = h_q_overflow;
-        preprocess_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum; 
+        preprocess_params.h_q_overflow = h_q_overflow_;
+        preprocess_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
         preprocess_params.d_arc_offsets = d_arc_offsets;
-        preprocess_params.d_main_q_arc_offsets = d_main_q_arc_offsets;
-        preprocess_params.d_state_cost = d_state_cost; 
+        preprocess_params.d_main_q_arc_offsets = d_main_q_arc_offsets_;
+        preprocess_params.d_state_cost = d_state_cost_; 
         preprocess_params.d_cutoff = d_cutoff; 
-        preprocess_params.d_main_q_degrees_block_prefix_sum = d_main_q_degrees_block_prefix_sum; 
-        preprocess_params.d_n_CTA_done = d_n_CTA_done;
+        preprocess_params.d_main_q_degrees_block_prefix_sum = d_main_q_degrees_block_prefix_sum_; 
+        preprocess_params.d_n_CTA_done = d_n_CTA_done_;
 
         if(is_emitting) {
             PreprocessInPlace(preprocess_params);
-            cudaEventRecord(can_read_h_main_q_narcs, compute_st);
+            cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
             ResetStateCostLookup();
             FinalizePreprocessInPlace();
         } else {
             PreprocessAndContract(preprocess_params);
-            cudaEventRecord(can_read_h_main_q_narcs, compute_st);
+            cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
         }
 
 
         // We need h_q_token_from_narcs to be ready
-        cudaEventSynchronize(can_read_h_main_q_narcs);
+        cudaEventSynchronize(can_read_h_main_q_narcs_);
         cudaCheckError();
 
-        int main_q_narcs = *h_main_q_narcs;
-        int q_overflow = *h_q_overflow;
+        int32 main_q_narcs = *h_main_q_narcs_;
+        int32 q_overflow = *h_q_overflow_;
 
         if(q_overflow) {
             // An overflow was prevented in the contract and preprocess kernel
@@ -321,38 +320,38 @@ namespace kaldi {
 
             PrintOverflowWarning();
 
-            *h_q_overflow = 0;
+            *h_q_overflow_ = 0;
         }
 
         ExpandArcParams expand_params;
-        expand_params.d_main_q_state = d_main_q_state;
-        expand_params.d_main_q_cost = d_main_q_cost;
-        expand_params.d_main_q_info = d_main_q_info;
-        expand_params.d_main_q_local_offset = d_main_q_local_offset;
-        expand_params.h_main_q_local_offset = h_main_q_local_offset;
-        expand_params.main_q_global_offset = main_q_global_offset;
-        expand_params.d_main_q_end = d_main_q_end;
-        expand_params.d_main_q_narcs = d_main_q_narcs;
-        expand_params.h_main_q_end = h_main_q_end;
-        expand_params.h_main_q_narcs = h_main_q_narcs;
-        expand_params.d_aux_q_state = d_aux_q_state; 
-        expand_params.d_aux_q_cost = d_aux_q_cost; 
-        expand_params.d_aux_q_info = d_aux_q_info;
-        expand_params.d_aux_q_end = d_aux_q_end;
-        expand_params.h_aux_q_end = h_aux_q_end;
+        expand_params.d_main_q_state = d_main_q_state_;
+        expand_params.d_main_q_cost = d_main_q_cost_;
+        expand_params.d_main_q_info= d_main_q_info_;
+        expand_params.d_main_q_local_offset = d_main_q_local_offset_;
+        expand_params.h_main_q_local_offset = h_main_q_local_offset_;
+        expand_params.main_q_global_offset = main_q_global_offset_;
+        expand_params.d_main_q_end = d_main_q_end_;
+        expand_params.d_main_q_narcs = d_main_q_narcs_;
+        expand_params.h_main_q_end = h_main_q_end_;
+        expand_params.h_main_q_narcs = h_main_q_narcs_;
+        expand_params.d_aux_q_state = d_aux_q_state_; 
+        expand_params.d_aux_q_cost = d_aux_q_cost_; 
+        expand_params.d_aux_q_info = d_aux_q_info_;
+        expand_params.d_aux_q_end = d_aux_q_end_;
+        expand_params.h_aux_q_end = h_aux_q_end_;
         expand_params.q_capacity = max_tokens_per_frame_;
-        expand_params.h_q_overflow = h_q_overflow;
-        expand_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum; 
-        expand_params.d_q_arc_offsets = d_main_q_arc_offsets;
+        expand_params.h_q_overflow = h_q_overflow_;
+        expand_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
+        expand_params.d_q_arc_offsets = d_main_q_arc_offsets_;
         expand_params.arc_ilabels = fst_.arc_ilabels_d;
         expand_params.is_emitting = is_emitting;
         expand_params.arc_weights = fst_.arc_weights_d; 
         expand_params.arc_nextstates = fst_.arc_nextstates_d; 
         expand_params.d_cutoff = d_cutoff;
         expand_params.beam = beam_;
-        expand_params.d_loglikelihoods= loglikelihoods_d;
-        expand_params.d_lookup = d_state_cost;
-        expand_params.d_n_CTA_done = d_n_CTA_done;
+        expand_params.d_loglikelihoods = loglikelihoods_d_;
+        expand_params.d_lookup = d_state_cost_;
+        expand_params.d_n_CTA_done = d_n_CTA_done_;
     
         bool done = false;
 
@@ -369,10 +368,10 @@ namespace kaldi {
             ExpandArcs(main_q_narcs, expand_params);
         }
 
-        cudaStreamSynchronize(compute_st); 
+        cudaStreamSynchronize(compute_st_); 
         cudaCheckError();
 
-        q_overflow = *h_q_overflow;
+        q_overflow = *h_q_overflow_;
 
         if(q_overflow) {
             // An overflow was prevented in the contract and preprocess kernel
@@ -381,7 +380,7 @@ namespace kaldi {
 
             PrintOverflowWarning();
 
-            *h_q_overflow = 0;
+            *h_q_overflow_ = 0;
         }
  
         return done;
@@ -418,25 +417,25 @@ namespace kaldi {
      */
 
 
-    void CudaDecoder::GetBestCost(BaseFloat *min, int *arg, bool isfinal) const {
+    void CudaDecoder::GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const {
         
         CostType best_cost = FLT_MAX; // switch to numeric limits std11
-        int best_cost_idx;
+        int32 best_cost_idx;
         // we need main q end ready
-        int main_q_size = *h_main_q_end;
+        int32 main_q_size = *h_main_q_end_;
 
-        cudaMemcpy(h_main_q_cost, d_main_q_cost, main_q_size * sizeof(CostType), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_main_q_cost_, d_main_q_cost_, main_q_size * sizeof(CostType), cudaMemcpyDeviceToHost);
 
         if(isfinal)
-            cudaMemcpy(h_main_q_state, d_main_q_state, main_q_size * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_main_q_state_, d_main_q_state_, main_q_size * sizeof(int32), cudaMemcpyDeviceToHost);
 
         // TODO add event main q ready once memcpy becomes async
 
-        for(int i=0; i < main_q_size; ++i) {
-            CostType cost = h_main_q_cost[i];
+        for(int32 i=0; i < main_q_size; ++i) {
+            CostType cost = h_main_q_cost_[i];
 
             if(isfinal) 
-                cost += fst_.final_h[h_main_q_state[i]];
+                cost += fst_.final_h[h_main_q_state_[i]];
 
             if(cost < best_cost) {
                 best_cost = cost;
@@ -444,8 +443,8 @@ namespace kaldi {
             }
         }
 
-        //printf("global_offset=%i \n", main_q_global_offset);
-        best_cost_idx += main_q_global_offset; 
+        //printf("global_offset=%i \n", main_q_global_offset_);
+        best_cost_idx += main_q_global_offset_; 
 
         *min = best_cost;
         *arg = best_cost_idx;
@@ -453,12 +452,12 @@ namespace kaldi {
 
 
     bool CudaDecoder::ReachedFinal() const {
-        int main_q_size = *h_main_q_end;
-        cudaMemcpy(h_main_q_state, d_main_q_state, main_q_size * sizeof(int), cudaMemcpyDeviceToHost);
+        int32 main_q_size = *h_main_q_end_;
+        cudaMemcpy(h_main_q_state_, d_main_q_state_, main_q_size * sizeof(int32), cudaMemcpyDeviceToHost);
 
 
-        for(int i=0; i < main_q_size; ++i) {
-            if(fst_.final_h[h_main_q_state[i]] != StdWeight::Zero().Value())
+        for(int32 i=0; i < main_q_size; ++i) {
+            if(fst_.final_h[h_main_q_state_[i]] != StdWeight::Zero().Value())
                 return true;
         }
 
@@ -469,23 +468,23 @@ namespace kaldi {
     bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
         nvtxRangePushA("GetBestPath");
 
-        cudaEventSynchronize(can_write_to_main_q); // We want the copy to the host to be done
+        cudaEventSynchronize(can_write_to_main_q_); // We want the copy to the host to be done
 
         bool isfinal = ReachedFinal();
         BaseFloat best_cost;
-        int arg_best;
+        int32 arg_best;
         GetBestCost(&best_cost, &arg_best, isfinal);
 
         //printf("is final = %i \n", isfinal);
         //printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
 
-        int token_idx = arg_best;
-        std::vector<int> reversed_path;
+        int32 token_idx = arg_best;
+        std::vector<int32> reversed_path;
 
         while(token_idx != INT_MIN) {
-            int arc_idx = h_all_tokens_info.GetRawPointer()[token_idx].arc_idx;
+            int32 arc_idx = h_all_tokens_info_.GetRawPointer()[token_idx].arc_idx;
             reversed_path.push_back(arc_idx);
-            token_idx = h_all_tokens_info.GetRawPointer()[token_idx].prev_token;
+            token_idx = h_all_tokens_info_.GetRawPointer()[token_idx].prev_token;
         }
 
 
@@ -498,8 +497,8 @@ namespace kaldi {
 
         reversed_path.pop_back(); // dummy first arc
 
-        for (int i = reversed_path.size()-1; i >= 1; i--) {
-            int arc_idx = reversed_path[i];
+        for (int32 i = reversed_path.size()-1; i >= 1; i--) {
+            int32 arc_idx = reversed_path[i];
             LatticeArc arc(fst_.arc_ilabels_h[arc_idx], fst_.arc_olabels_h[arc_idx], LatticeWeight(fst_.arc_weights_h[arc_idx], 0), fst_.arc_nextstates_h[arc_idx]);
 
             arc.nextstate = fst_out->AddState();

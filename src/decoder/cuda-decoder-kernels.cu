@@ -107,21 +107,21 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = 256;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        init_lookup_kernel<<<grid,block>>>(d_state_cost, nstates);
+        init_lookup_kernel<<<grid,block>>>(d_state_cost_, nstates);
     }
 
         // Used to reset lookup table between frames
     // Using the queue to reset only the values needed
     // Also takes care of resetting cutof
     // TODO rename to something like "ResetForNewFrame"
-    __global__ void reset_lookup_kernel(StateId *d_main_q_state, const int32 *d_main_q_end, int32 *state_cost, CostType *d_cutoff) {
-        int32 q_from_end = *d_main_q_end; 
+    __global__ void reset_lookup_kernel(StateId *d_main_q_state_, const int32 *d_main_q_end_, int32 *state_cost, CostType *d_cutoff) {
+        int32 q_from_end = *d_main_q_end_; 
 
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
                 idx < q_from_end;
                 idx += blockDim.x*gridDim.x) {
 
-            StateId state = d_main_q_state[idx];
+            StateId state = d_main_q_state_[idx];
             state_cost[state]  = floatToOrderedInt(FLT_MAX);
         }
 
@@ -131,7 +131,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
     void CudaDecoder::ResetStateCostLookup() {
-        int32 size = *h_main_q_end;
+        int32 size = *h_main_q_end_;
 
         KALDI_ASSERT(size > 0);
 
@@ -139,7 +139,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = 256;
         grid.x = DIV_ROUND_UP(size, block.x);
 
-        reset_lookup_kernel<<<grid,block,0,compute_st>>>(d_main_q_state, d_main_q_end, d_state_cost, d_cutoff);
+        reset_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_cost_, d_cutoff);
     }
 
 
@@ -412,25 +412,25 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     void CudaDecoder::PreprocessAndContract(PreprocessParams &params) {
         dim3 grid,block;
         block.x = KERNEL_PREPROCESS_DIMX;
-        grid.x = DIV_ROUND_UP(*h_aux_q_end, block.x);
+        grid.x = DIV_ROUND_UP(*h_aux_q_end_, block.x);
 
         // We can have grid.x == 0 and still have a valid execution
         if(grid.x)
-            contract_and_preprocess_kernel<<<grid,block,0,compute_st>>>(params);
+            contract_and_preprocess_kernel<<<grid,block,0,compute_st_>>>(params);
     }
 
 
     void CudaDecoder::PreprocessInPlace(PreprocessParams &params) {
         dim3 grid,block;
         block.x = KERNEL_PREPROCESS_DIMX;
-        int32 main_q_size = *h_main_q_end - *h_main_q_local_offset;
+        int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
 
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        preprocess_in_place_kernel<<<grid,block,0,compute_st>>>(params);
+        preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
     }
 
 
@@ -447,11 +447,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
        Not done for now, because expand is fast enough
 
      */
-    __global__ void finalize_degrees_scan_kernel(int32 *d_scan, int32 *d_blk_scan, const int32 *d_main_q_local_offset, const int32
-            *d_main_q_end) {
+    __global__ void finalize_degrees_scan_kernel(int32 *d_scan, int32 *d_blk_scan, const int32 *d_main_q_local_offset_, const int32
+            *d_main_q_end_) {
 
-        int32 q_off = *d_main_q_local_offset;
-        int32 q_end = *d_main_q_end;
+        int32 q_off = *d_main_q_local_offset_;
+        int32 q_end = *d_main_q_end_;
         int32 q_size = q_end - q_off;
 
         for(int32 idx = q_off + blockDim.x*blockIdx.x + threadIdx.x;
@@ -469,14 +469,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     void CudaDecoder::FinalizePreprocessInPlace() {
         dim3 grid,block;
         block.x = KERNEL_PREPROCESS_DIMX;
-        int32 main_q_size = *h_main_q_end - *h_main_q_local_offset;
+        int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        finalize_degrees_scan_kernel<<<grid,block,0,compute_st>>>(d_main_q_degrees_prefix_sum, d_main_q_degrees_block_prefix_sum, d_main_q_local_offset,
-                d_main_q_end); 
+        finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_prefix_sum_, d_main_q_degrees_block_prefix_sum_, d_main_q_local_offset_,
+                d_main_q_end_); 
     }
 
 
@@ -673,7 +673,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         __syncthreads(); // avoiding races on d_main_q_narcs for instance
 
-        // Last block alive sets h_aux_q_end (pinned memory)
+        // Last block alive sets h_aux_q_end_ (pinned memory)
         if(threadIdx.x == 0) {
             int32 old = atomicAdd(params.d_n_CTA_done, 1);
             if(old == (gridDim.x -1)) {
@@ -705,7 +705,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         // It's possible to have zero threads and still be valid
         if(grid.x > 0)
-            expand_arcs_kernel<<<grid,block,0,compute_st>>>(params);
+            expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
     }
 
 
@@ -944,7 +944,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
         dim3 grid,block;
         block.x = KERNEL_NONEM_LT_DIMX;
         grid.x = 1; // it is designed for the long tail
-        process_nonem_longtail<<<grid,block,0,compute_st>>>(d_arc_offsets, params);
+        process_nonem_longtail<<<grid,block,0,compute_st_>>>(d_arc_offsets, params);
     }
 
 

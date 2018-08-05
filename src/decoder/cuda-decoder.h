@@ -73,7 +73,13 @@ namespace kaldi {
             /// whether they are in a final state); query ReachedFinal() after Decode()
             /// to see whether we reached a final state.
             bool Decode(DecodableInterface *decodable);
-
+            
+            /// InitDecoding initializes the decoding, and should only be used if you
+            /// int32end to call AdvanceDecoding().  If you call Decode(), you don't need
+            /// to call this.  You can call InitDecoding if you have already decoded an
+            /// utterance and want to start with a new utterance. 
+            void InitDecoding(); 
+            
             /// This will decode until there are no more frames ready in the decodable
             /// object, but if max_num_frames is >= 0 it will decode no more than
             /// that many frames.  If it returns false, then no tokens are alive,
@@ -96,8 +102,11 @@ namespace kaldi {
             // It returns true if the output lattice was nonempty (i.e. had states in it);
             // using the return value is deprecated.
             bool GetBestPath(Lattice *fst_out, bool use_final_probs = true) const;
-
-            /// *** The next functions are from the "new int32erface". ***
+           
+            // GetBestCost sets in *min the token's best cost in the main_q
+            // it also sets in *arg the index of that token (argmin)
+            // is isfinal is true, we take into account the final costs
+            void GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const;
 
             /// FinalRelativeCost() serves the same function as ReachedFinal(), but gives
             /// more information.  It returns the difference between the best (final-cost plus
@@ -105,12 +114,9 @@ namespace kaldi {
             /// on the final frame.  If it is infinity it means no final-states were present
             /// on the final frame.  It will usually be nonnegative.
             BaseFloat FinalRelativeCost() const;
-
-            /// InitDecoding initializes the decoding, and should only be used if you
-            /// int32end to call AdvanceDecoding().  If you call Decode(), you don't need
-            /// to call this.  You can call InitDecoding if you have already decoded an
-            /// utterance and want to start with a new utterance. 
-            void InitDecoding();  
+            //
+            // Data structures used by the kernels
+            //
 
 
             // Count of tokens and arcs in a queue
@@ -347,17 +353,7 @@ private:
             // Pre-computes log likelihoods for the current frame 
             void ComputeLogLikelihoods(DecodableInterface *decodable);
 
-            // GetBestPath gets the decoding traceback. If "use_final_probs" is true
-            // AND we reached a final state, it limits itself to final states;
-            // otherwise it gets the most likely token not taking into account final-probs.
-            // fst_out will be empty (Start() == kNoStateId) if nothing was available due to
-            // search error.
-            // If Decode() returned true, it is safe to assume GetBestPath will return true.
-            // It returns true if the output lattice was nonempty (i.e. had states in it);
-            // using the return value is deprecated.
-            void GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const;
-
-            // ProcessEmitting generates tokens associated with the new frame i
+                       // ProcessEmitting generates tokens associated with the new frame i
             // When we call ProcessEmitting, the main_q contains the tokens associated
             // with the previous frame (i-1). Using d_main_q_state and the emitting arcs from the FST graph,
             // we create a new tokens queue, which will be stored in the aux_q
@@ -390,6 +386,9 @@ private:
             // Pointers in h_* refer to data on the CPU memory
             // Pointers in d_* refer to data on the GPU memory
 
+            // The CudaFst data structure contains the FST graph
+            // in the CSR format
+            const CudaFst fst_;
 
             //
             // Tokens queues
@@ -420,32 +419,32 @@ private:
             // are not finals because the aux queue will be pruned.
             //
 
-            StateId *d_main_q_state, *d_aux_q_state; 
-            CostType *d_main_q_cost, *d_aux_q_cost;
-            InfoToken *d_main_q_info, *d_aux_q_info;
+            StateId *d_main_q_state_, *d_aux_q_state_; 
+            CostType *d_main_q_cost_, *d_aux_q_cost_;
+            InfoToken *d_main_q_info_, *d_aux_q_info_;
 
             // ExpandArcs does not use at its input the complete main queue
             // It only reads from the index range [main_q_local_offset, end[
-            int32 *h_main_q_local_offset; 
-            int32 *d_main_q_local_offset;
+            int32 *h_main_q_local_offset_; 
+            int32 *d_main_q_local_offset_;
 
 
             // end index of the main queue
             // only tokens at index i with i < main_q_end 
             // are valid tokens
-            int32 *d_main_q_end;
-            int32 *h_main_q_end; // pinned memory
+            int32 *d_main_q_end_;
+            int32 *h_main_q_end_; // pinned memory
 
             // Same thing for the aux queue
-            int32 *d_aux_q_end;
-            int32 *h_aux_q_end;
+            int32 *d_aux_q_end_;
+            int32 *h_aux_q_end_;
 
             // Each valid token the subqueue main_q[main_q_offset, main_q_end[ has 
             // a number of outgoing arcs (out-degree)
             // main_q_narcs is the sum of those numbers
             // To see when a token is considered as valid, please refer to the Preprocess kernels
-            int32 *d_main_q_narcs;
-            int32 *h_main_q_narcs; // pinned memory
+            int32 *d_main_q_narcs_;
+            int32 *h_main_q_narcs_; // pinned memory
 
             // Contains both main_q_end and narcs
             // The pointers refer to the same location than the d_main_q_end and d_main_q_narcs pointers,
@@ -454,13 +453,13 @@ private:
             // d_main_q_narcs = &d_main_q_end_and_narcs->split.narcs
             // We sometime need to update both end and narcs at the same time,
             // using an 64 bits atomic
-            TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
+            TokenAndArcCountUnion *d_main_q_end_and_narcs_i2_; 
 
             // After each frame, we copy the main queue (GPU memory)
             // to the end of h_all_tokens_info (CPU memory)
             // We only move to the CPU what's needed for the final backtrack in GetBestPath
             // ie { prev_token, arc_idx } (= struct InfoToken)
-            TokenVector h_all_tokens_info; 
+            TokenVector h_all_tokens_info_; 
 
             // The token at index i in the main queue has in reality 
             // a global index of (i + main_q_global_offset)
@@ -468,7 +467,7 @@ private:
             // we've flushed the main_q back to the host. We need unique indexes 
             // for each token in order to have valid token.prev_token data members
             // and be able to backtrack at the end
-            int32 main_q_global_offset;
+            int32 main_q_global_offset_;
 
 
             // Depending on the value of the parameter "max_tokens_per_frame"
@@ -479,7 +478,7 @@ private:
             // Even if that flag is set, we can continue the execution (quality
             // of the output can be lowered)
             // We use that flag to display a warning to stderr
-            int32 *h_q_overflow;
+            int32 *h_q_overflow_;
 
             // Buffers for copies on host on the current main_q
             // Those are only buffers - and must be considered as containing 
@@ -487,21 +486,21 @@ private:
             // If you need to read from those,
             // please explicitly copy data from device first !
             // We use them in "ReachedFinal" for instance
-            StateId *h_main_q_state; 
-            CostType *h_main_q_cost; 
+            StateId *h_main_q_state_; 
+            CostType *h_main_q_cost_; 
 
             // Some kernels need to perform some operations before exiting
             // d_n_CTA_done is a counter that we increment when a CTA (CUDA blocks)
             // is done
             // Each CTA then tests the value for d_n_CTA_done to detect if it's the last to exit
             // If that's the cast, it does what it has to do, and sets d_n_CTA_done back to 0
-            int32 *d_n_CTA_done;
+            int32 *d_n_CTA_done_;
 
             // The load balancing of the Expand kernel relies on the prefix sum of the degrees 
             // of the state in the queue (more info in the ExpandKernel implementation) 
             // That array contains that prefix sum. It is set by the "Preprocess*" kernels
             // and used by the Expand kernel
-            int32 *d_main_q_degrees_prefix_sum;
+            int32 *d_main_q_degrees_prefix_sum_;
         
             // When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
             // (1) First generate the prefix sum inside each CUDA blocks
@@ -511,54 +510,57 @@ private:
             // Data from step 2 is stored in d_main_q_degrees_block_prefix_sum
             // Note : this is only used by PreprocessInPlace
             // PreprocessAndContract uses a trick to compute the global prefix sum in one pass
-            int32 *d_main_q_degrees_block_prefix_sum;
+            int32 *d_main_q_degrees_block_prefix_sum_;
 
             // d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
             // we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
             // we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
-            int32 *d_main_q_arc_offsets;
+            int32 *d_main_q_arc_offsets_;
 
 
             // d_state_cost[state] -> best cost for that state for the current frame
             // reset between frames
             // type int32 to be able to use native atomicMin instruction
             // we use a 1:1 conversion float <---> sortable int
-            int32 *d_state_cost;
+            int32 *d_state_cost_;
 
-            // Current cutoff for current frame
-            BaseFloat *d_cutoff;
 
             // loglikelihoods computed by the acoustic model
             // we need it to compute the cost of emitting edges
-            BaseFloat *loglikelihoods_d;
+            BaseFloat *loglikelihoods_d_;
 
             // CUDA streams
             // kernels are launched in compute_st
             // copies in copy_st
             // we use two streams to overlap copies and kernels
             // we synchronize the two using events
-            cudaStream_t compute_st, copy_st;
+            cudaStream_t compute_st_, copy_st_;
 
             // CUDA events
 
             // We need to synchronize the streams copy_st and compute_st
             // because of data dependency : they both have to read or write to the main_q 
             // when we're done copying the old main_q to the CPU, we trigger can_write_to_main_q 
-            cudaEvent_t can_write_to_main_q;
+            cudaEvent_t can_write_to_main_q_;
 
             // At the end of Preprocess kernels we set h_main_q_narcs (pinned memory)
             // this event is set in the pipeline after Preprocess kernels to inform that data is ready to be read
-            cudaEvent_t can_read_h_main_q_narcs;
+            cudaEvent_t can_read_h_main_q_narcs_;
 
-            const CudaFst fst_;
-
+            // When we generate a new tokens list we only keep candidates 
+            // that have a cost < best_cost_in_the_queue + beam_
             BaseFloat beam_;
-            int32 max_tokens_, max_tokens_per_frame_;
+
+            // Cutoff for the current frame
+            // contains best_cost_in_the_queue + beam_
+            // Updated during the ExpandArc operation
+            BaseFloat *d_cutoff;
+
+            int32 max_tokens_;
+            int32 max_tokens_per_frame_;
 
             // Keep track of the number of frames decoded in the current file.
             int32 num_frames_decoded_;
-
-            BaseFloat *cutoff;
 
             size_t bytes_cudaMalloc, bytes_cudaMallocManaged;
 
