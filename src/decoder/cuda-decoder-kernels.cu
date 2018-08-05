@@ -79,7 +79,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     __float_as_int(assumed),
                     __float_as_int(value));
 
-        } while(old!=assumed);
+        } while(old!=assumed); // TODO <
 
         return old;
 
@@ -90,7 +90,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 //
 
     // Used before first frame
-    __global__ void init_lookup_kernel(int32 *state_cost, int32 size) {
+    __global__ void _init_lookup_kernel(int32 *state_cost, int32 size) {
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
                 idx < size;
                 idx += blockDim.x*gridDim.x) {
@@ -107,14 +107,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = 256;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        init_lookup_kernel<<<grid,block>>>(d_state_cost_, nstates);
+        _init_lookup_kernel<<<grid,block>>>(d_state_cost_, nstates);
     }
 
         // Used to reset lookup table between frames
     // Using the queue to reset only the values needed
     // Also takes care of resetting cutof
     // TODO rename to something like "ResetForNewFrame"
-    __global__ void reset_lookup_kernel(StateId *d_main_q_state_, const int32 *d_main_q_end_, int32 *state_cost, CostType *d_cutoff) {
+    __global__ void _reset_lookup_kernel(StateId *d_main_q_state_, const int32 *d_main_q_end_, int32 *state_cost, CostType *d_cutoff) {
         int32 q_from_end = *d_main_q_end_; 
 
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
@@ -139,7 +139,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = 256;
         grid.x = DIV_ROUND_UP(size, block.x);
 
-        reset_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_cost_, d_cutoff);
+        _reset_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_cost_, d_cutoff);
     }
 
 
@@ -180,8 +180,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
        This kernel is used before ProcessNonEmitting
     */
 
-    __global__ void contract_and_preprocess_kernel(PreprocessParams params) {
-        typedef cub::BlockScan<int2, KERNEL_PREPROCESS_DIMX> BlockScan;
+    __global__ void _preprocess_and_contract_kernel(PreprocessParams params) {
+        typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
         __shared__ TokenAndArcCountUnion blk_local_offset_i2;
@@ -232,7 +232,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             
             TokenAndArcCountUnion inclusive_scan;
-            if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1)) {
+            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1)) {
                 // CUB Scan is exclusive
                 inclusive_scan.split.ntokens = scan_i2.x + (is_pruned ? 0 : 1);
                 inclusive_scan.split.narcs = scan_i2.y + degree;
@@ -245,7 +245,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             // main_q overflow
             if((blk_local_offset_i2.split.ntokens + total_in_CTA) >= params.q_capacity) {
-                if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1)) {
+                if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1)) {
                     atomicAdd(&params.d_main_q_end_and_narcs_i2->both, -inclusive_scan.both); // revert
                     *params.h_q_overflow = 1;
                 }
@@ -301,6 +301,17 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
+    void CudaDecoder::PreprocessAndContract(PreprocessParams &params) {
+        dim3 grid,block;
+        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+        grid.x = DIV_ROUND_UP(*h_aux_q_end_, block.x);
+
+        // We can have grid.x == 0 and still have a valid execution
+        if(grid.x)
+            _preprocess_and_contract_kernel<<<grid,block,0,compute_st_>>>(params);
+    }
+
+
 
 /*
     This kernel is also a preprocessing kernel, but this time does it in place
@@ -316,9 +327,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
 */
 
-    __global__ void preprocess_in_place_kernel(PreprocessParams params) {
+    __global__ void _preprocess_in_place_kernel(PreprocessParams params) {
     
-        typedef cub::BlockScan<int32, KERNEL_PREPROCESS_DIMX> BlockScan;
+        typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
         __shared__ int32 is_last_CTA;
@@ -356,8 +367,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 params.d_main_q_degrees_prefix_sum[idx] = scan;
 
 
-            if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1))
-                params.d_main_q_degrees_block_prefix_sum[block_offset/KERNEL_PREPROCESS_DIMX] = (scan + degree); 
+            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1))
+                params.d_main_q_degrees_block_prefix_sum[block_offset/KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX] = (scan + degree); 
 
             __syncthreads(); // we'll reuse temp_storage
         }
@@ -380,7 +391,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             }
 
             // following value can be different than gridDim.x 
-            int32 total_blk_val = (queue_size + KERNEL_PREPROCESS_DIMX -1) / KERNEL_PREPROCESS_DIMX;
+            int32 total_blk_val = (queue_size + KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX -1) / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
             int32 scan_offset = 0;
 
             for(int32 blk_idx_off = 0; blk_idx_off < total_blk_val; blk_idx_off += blockDim.x) {
@@ -409,20 +420,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::PreprocessAndContract(PreprocessParams &params) {
-        dim3 grid,block;
-        block.x = KERNEL_PREPROCESS_DIMX;
-        grid.x = DIV_ROUND_UP(*h_aux_q_end_, block.x);
-
-        // We can have grid.x == 0 and still have a valid execution
-        if(grid.x)
-            contract_and_preprocess_kernel<<<grid,block,0,compute_st_>>>(params);
-    }
-
-
     void CudaDecoder::PreprocessInPlace(PreprocessParams &params) {
         dim3 grid,block;
-        block.x = KERNEL_PREPROCESS_DIMX;
+        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
         int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
 
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
@@ -430,7 +430,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
+        _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
     }
 
 
@@ -447,7 +447,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
        Not done for now, because expand is fast enough
 
      */
-    __global__ void finalize_degrees_scan_kernel(int32 *d_scan, int32 *d_blk_scan, const int32 *d_main_q_local_offset_, const int32
+    __global__ void _finalize_degrees_scan_kernel(int32 *d_scan, int32 *d_blk_scan, const int32 *d_main_q_local_offset_, const int32
             *d_main_q_end_) {
 
         int32 q_off = *d_main_q_local_offset_;
@@ -458,7 +458,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 idx < q_size;
                 idx += blockDim.x*gridDim.x) {
 
-            int32 blk_idx = (idx - q_off) / KERNEL_PREPROCESS_DIMX;
+            int32 blk_idx = (idx - q_off) / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
             int32 blk_scan_offset = d_blk_scan[blk_idx]; // we rely on L1 for this one, avoiding syncs
 
             d_scan[idx] += blk_scan_offset;
@@ -468,14 +468,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     void CudaDecoder::FinalizePreprocessInPlace() {
         dim3 grid,block;
-        block.x = KERNEL_PREPROCESS_DIMX;
+        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
         int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_prefix_sum_, d_main_q_degrees_block_prefix_sum_, d_main_q_local_offset_,
+        _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_prefix_sum_, d_main_q_degrees_block_prefix_sum_, d_main_q_local_offset_,
                 d_main_q_end_); 
     }
 
@@ -528,8 +528,8 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 }
 
 
-    void __global__ expand_arcs_kernel(ExpandArcParams params) {
-        typedef cub::BlockScan<CostTInt, KERNEL_EXPAND_ARCS_DIMX> BlockScan;
+    void __global__ _expand_arcs_kernel(ExpandArcParams params) {
+        typedef cub::BlockScan<CostTInt, KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX> BlockScan;
 
         __shared__ typename BlockScan::TempStorage temp_storage_scan;
 
@@ -594,7 +594,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                             BlockScan(temp_storage_scan).InclusiveScan(ci, ci, CISum());
 
-                            if(threadIdx.x == (KERNEL_EXPAND_ARCS_DIMX - 1)) {
+                            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
                                 int32 total_successors_in_block = ci.i;
                                 to_q_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
                                 if((to_q_block_offset + total_successors_in_block) >= params.q_capacity) {
@@ -626,7 +626,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                             // aux_q is full. UpdateCutoff should prevent this from happening
                             if(to_q_block_offset == params.q_capacity) {
-                                if(threadIdx.x == (KERNEL_EXPAND_ARCS_DIMX - 1)) {
+                                if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
                                     // Revert
                                     int32 total_successors_in_block = ci.i;
                                     atomicAdd(params.d_aux_q_end, -total_successors_in_block); 
@@ -705,7 +705,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         // It's possible to have zero threads and still be valid
         if(grid.x > 0)
-            expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
+            _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
     }
 
 
@@ -739,12 +739,12 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
      */
 
 
-    __launch_bounds__(KERNEL_NONEM_LT_DIMX, 1)
-        __global__ void process_nonem_longtail(uint32_t *d_arc_offsets, 
+    __launch_bounds__(KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX, 1)
+        __global__ void _process_nonem_longtail(uint32_t *d_arc_offsets, 
                 ExpandArcParams params) {
 
-            typedef cub::BlockScan<int32, KERNEL_NONEM_LT_DIMX> BlockScan;
-            typedef cub::BlockReduce<float, KERNEL_NONEM_LT_DIMX> BlockReduce;
+            typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockScan;
+            typedef cub::BlockReduce<float, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockReduce;
 
             __shared__ typename BlockScan::TempStorage temp_storage_scan;
             __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
@@ -942,9 +942,9 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
             const ExpandArcParams &params) {
 
         dim3 grid,block;
-        block.x = KERNEL_NONEM_LT_DIMX;
+        block.x = KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX;
         grid.x = 1; // it is designed for the long tail
-        process_nonem_longtail<<<grid,block,0,compute_st_>>>(d_arc_offsets, params);
+        _process_nonem_longtail<<<grid,block,0,compute_st_>>>(d_arc_offsets, params);
     }
 
 

@@ -26,12 +26,6 @@
             exit(EXIT_FAILURE);                                           \
         }                                                                 \
     }
-#define KERNEL_PREPROCESS_DIMX 256
-#define KERNEL_EXPAND_ARCS_DIMX 256
-#define KERNEL_NONEM_LT_DIMX 1024
-
-// Below that value, we launch the persistent kernel for NonEmitting
-#define NONEM_LT_MAX_NARCS 4096
 
 #include "util/stl-utils.h"
 #include "fst/fstlib.h"

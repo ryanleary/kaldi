@@ -77,7 +77,7 @@ namespace kaldi {
         cudaMallocHost(&h_q_overflow_, sizeof(int32));  
 
         cudaMalloc(&d_main_q_degrees_prefix_sum_, max_tokens_per_frame_ * sizeof(int32));
-        cudaMalloc(&d_main_q_degrees_block_prefix_sum_, (max_tokens_per_frame_ / KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int32));
+        cudaMalloc(&d_main_q_degrees_block_prefix_sum_, (max_tokens_per_frame_ / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int32));
         cudaMalloc(&d_main_q_arc_offsets_, max_tokens_per_frame_ * sizeof(int32));
 
         cudaMalloc(&loglikelihoods_d_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
@@ -356,7 +356,7 @@ namespace kaldi {
         bool done = false;
 
         if(!is_emitting 
-                && main_q_narcs < NONEM_LT_MAX_NARCS) { 
+                && main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) { 
             NonEmittingLongTail(d_arc_offsets, expand_params); 
 
             cudaCheckError();
