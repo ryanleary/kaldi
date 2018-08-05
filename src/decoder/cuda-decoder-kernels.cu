@@ -28,7 +28,6 @@ typedef CudaDecoder::CostType CostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
 typedef CudaDecoder::ExpandArcParams ExpandArcParams; 
 
-
 //
 // Utils device function
 //
@@ -99,7 +98,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         }
     }
 
-    void CudaDecoder::InitLookup() {
+    void CudaDecoder::InitStateCostLookup() {
         int32 nstates = fst_.numStates;
 
         KALDI_ASSERT(nstates > 0);
@@ -131,7 +130,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             *d_cutoff = FLT_MAX; 
     }
 
-    void CudaDecoder::ResetLookup() {
+    void CudaDecoder::ResetStateCostLookup() {
         int32 size = *h_main_q_end;
 
         KALDI_ASSERT(size > 0);
@@ -264,7 +263,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 params.d_main_q_cost[main_q_idx] = cost;
                 params.d_main_q_info[main_q_idx] = info;
 
-                params.d_degrees_scan[main_q_idx] = blk_local_offset_i2.split.narcs + scan_i2.y;
+                params.d_main_q_degrees_prefix_sum[main_q_idx] = blk_local_offset_i2.split.narcs + scan_i2.y;
 
                 params.d_main_q_arc_offsets[main_q_idx] = arc_start;
             }
@@ -354,11 +353,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             int32 scan;
             BlockScan(temp_storage).ExclusiveSum(degree, scan);
             if(idx < queue_end) 
-                params.d_degrees_scan[idx] = scan;
+                params.d_main_q_degrees_prefix_sum[idx] = scan;
 
 
             if(threadIdx.x == (KERNEL_PREPROCESS_DIMX-1))
-                params.d_degrees_block_scan[block_offset/KERNEL_PREPROCESS_DIMX] = (scan + degree); 
+                params.d_main_q_degrees_block_prefix_sum[block_offset/KERNEL_PREPROCESS_DIMX] = (scan + degree); 
 
             __syncthreads(); // we'll reuse temp_storage
         }
@@ -387,14 +386,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             for(int32 blk_idx_off = 0; blk_idx_off < total_blk_val; blk_idx_off += blockDim.x) {
                 int32 blk_idx = blk_idx_off + threadIdx.x; 
 
-                int32 blk_sum = (blk_idx < total_blk_val) ?  params.d_degrees_block_scan[blk_idx] : 0; 
+                int32 blk_sum = (blk_idx < total_blk_val) ?  params.d_main_q_degrees_block_prefix_sum[blk_idx] : 0; 
                 int32 blk_scan, iteration_total;
                 BlockScan(temp_storage).ExclusiveSum(blk_sum, blk_scan, iteration_total);
                 blk_scan += scan_offset;
                 scan_offset += iteration_total;
 
                 if(blk_idx < total_blk_val) {
-                    params.d_degrees_block_scan[blk_idx] = blk_scan;
+                    params.d_main_q_degrees_block_prefix_sum[blk_idx] = blk_scan;
                 }
 
                 // temp storage
@@ -410,7 +409,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::ContractAndPreprocess(PreprocessParams &params) {
+    void CudaDecoder::PreprocessAndContract(PreprocessParams &params) {
         dim3 grid,block;
         block.x = KERNEL_PREPROCESS_DIMX;
         grid.x = DIV_ROUND_UP(*h_aux_q_end, block.x);
@@ -476,7 +475,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        finalize_degrees_scan_kernel<<<grid,block,0,compute_st>>>(d_degrees_scan, d_degrees_block_scan, d_main_q_local_offset,
+        finalize_degrees_scan_kernel<<<grid,block,0,compute_st>>>(d_main_q_degrees_prefix_sum, d_main_q_degrees_block_prefix_sum, d_main_q_local_offset,
                 d_main_q_end); 
     }
 
@@ -563,9 +562,9 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
             if(valid_input) {
                 //we can do better than that
-                main_q_idx = binsearch_maxle(params.d_degrees_scan, th_idx, main_q_offset, main_q_end-1); 
+                main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, th_idx, main_q_offset, main_q_end-1); 
 
-                int32 lower_bound = params.d_degrees_scan[main_q_idx];
+                int32 lower_bound = params.d_main_q_degrees_prefix_sum[main_q_idx];
                 int32 arc_offset_start = params.d_q_arc_offsets[main_q_idx];
 
                 arc_idx = arc_offset_start + (block_offset + threadIdx.x - lower_bound);
@@ -800,7 +799,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
                             }
                         }
 
-                        params.d_degrees_scan[q_idx] = degree;
+                        params.d_main_q_degrees_prefix_sum[q_idx] = degree;
                     }
 
                     __syncthreads(); // will be removed
@@ -814,7 +813,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
                         int32 q_idx = old_q_offset + block_off + threadIdx.x;
 
                         int32 degree = (q_idx < new_q_offset) 
-                            ? params.d_degrees_scan[q_idx]
+                            ? params.d_main_q_degrees_prefix_sum[q_idx]
                             : 0;
                         int32 lscan;
                         int32 total_in_blk;
@@ -823,7 +822,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
                         total_narcs += total_in_blk;
 
                         if(q_idx < new_q_offset)
-                            params.d_degrees_scan[q_idx] = scan;
+                            params.d_main_q_degrees_prefix_sum[q_idx] = scan;
 
                          __syncthreads(); // reusing temp_storage_scan + degrees ready
                     }
@@ -852,9 +851,9 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                     if(valid_input) {
                         //we can do better than that
-                        q_idx = binsearch_maxle(params.d_degrees_scan, th_idx, old_q_offset, new_q_offset-1); 
+                        q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, th_idx, old_q_offset, new_q_offset-1); 
 
-                        int32 lower_bound = params.d_degrees_scan[q_idx];
+                        int32 lower_bound = params.d_main_q_degrees_prefix_sum[q_idx];
                         int32 arc_offset_start = params.d_q_arc_offsets[q_idx];
 
                         arc_idx = arc_offset_start + (th_idx - lower_bound);

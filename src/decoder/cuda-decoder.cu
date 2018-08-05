@@ -42,7 +42,7 @@ namespace kaldi {
         cudaStreamCreate(&compute_st);
         cudaStreamCreate(&copy_st);
 
-        cudaEventCreate(&q_token_from_narcs_evt);
+        cudaEventCreate(&can_read_h_main_q_narcs);
         cudaEventCreate(&can_write_to_main_q);
 
         cudaMalloc(&d_main_q_state, max_tokens_per_frame_ * sizeof(int));
@@ -76,8 +76,8 @@ namespace kaldi {
 
         cudaMallocHost(&h_q_overflow, sizeof(int));  
 
-        cudaMalloc(&d_degrees_scan, max_tokens_per_frame_ * sizeof(int));
-        cudaMalloc(&d_degrees_block_scan, (max_tokens_per_frame_ / KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int));
+        cudaMalloc(&d_main_q_degrees_prefix_sum, max_tokens_per_frame_ * sizeof(int));
+        cudaMalloc(&d_main_q_degrees_block_prefix_sum, (max_tokens_per_frame_ / KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int));
         cudaMalloc(&d_main_q_arc_offsets, max_tokens_per_frame_ * sizeof(int));
 
         cudaMalloc(&loglikelihoods_d, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
@@ -92,7 +92,7 @@ namespace kaldi {
         cudaStreamDestroy(compute_st);
         cudaStreamDestroy(copy_st);
 
-        cudaEventDestroy(q_token_from_narcs_evt);
+        cudaEventDestroy(can_read_h_main_q_narcs);
         cudaEventDestroy(can_write_to_main_q);
 
         cudaFree(d_main_q_state);
@@ -120,8 +120,8 @@ namespace kaldi {
         cudaFreeHost(h_main_q_local_offset);
         cudaFreeHost(h_aux_q_end);
 
-        cudaFree(d_degrees_scan);
-        cudaFree(d_degrees_block_scan);
+        cudaFree(d_main_q_degrees_prefix_sum);
+        cudaFree(d_main_q_degrees_block_prefix_sum);
         cudaFree(d_main_q_arc_offsets);
 
         cudaFree(loglikelihoods_d);
@@ -131,7 +131,7 @@ namespace kaldi {
 
     void CudaDecoder::InitDecoding() {
 
-        InitLookup();
+        InitStateCostLookup();
 
         StateId start_state = fst_.Start();
         KALDI_ASSERT(start_state != fst::kNoStateId);
@@ -215,12 +215,16 @@ namespace kaldi {
 
             // Emitting 
             // we will not write in the main q in that step
-            // (preprocess is in place)
+            // the input tokens are already in the main_q
+            // (they were put there by the ProcessNonemittings 
+            // from the previous frame)
             // we don't need can_write_to_main_q
+            // the output tokens go to aux_q
             ProcessEmitting();
             // After process emitting we won't need the token
             // associated with the previous frame
-            // the main q has been flushed, we update its offset
+            // the main q has been flushed at the end of Nonemitting, 
+            //we update its offset
             main_q_global_offset += prev_main_q_size;
             
             // Non Emitting
@@ -261,8 +265,9 @@ namespace kaldi {
     }
 
 
-    bool CudaDecoder::ProcessToken(unsigned int *d_arc_offsets,
-            bool is_emitting) {
+    bool CudaDecoder::ProcessToken(bool is_emitting) {
+
+        unsigned int *d_arc_offsets = is_emitting ? fst_.e_offsets_d : fst_.ne_offsets_d;
 
         PreprocessParams preprocess_params;
         preprocess_params.d_aux_q_state = d_aux_q_state; 
@@ -283,27 +288,27 @@ namespace kaldi {
         preprocess_params.h_main_q_narcs = h_main_q_narcs;
         preprocess_params.q_capacity = max_tokens_per_frame_;
         preprocess_params.h_q_overflow = h_q_overflow;
-        preprocess_params.d_degrees_scan = d_degrees_scan; 
+        preprocess_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum; 
         preprocess_params.d_arc_offsets = d_arc_offsets;
         preprocess_params.d_main_q_arc_offsets = d_main_q_arc_offsets;
         preprocess_params.d_state_cost = d_state_cost; 
         preprocess_params.d_cutoff = d_cutoff; 
-        preprocess_params.d_degrees_block_scan = d_degrees_block_scan; 
+        preprocess_params.d_main_q_degrees_block_prefix_sum = d_main_q_degrees_block_prefix_sum; 
         preprocess_params.d_n_CTA_done = d_n_CTA_done;
 
         if(is_emitting) {
             PreprocessInPlace(preprocess_params);
-            cudaEventRecord(q_token_from_narcs_evt, compute_st);
-            ResetLookup();
+            cudaEventRecord(can_read_h_main_q_narcs, compute_st);
+            ResetStateCostLookup();
             FinalizePreprocessInPlace();
         } else {
-            ContractAndPreprocess(preprocess_params);
-            cudaEventRecord(q_token_from_narcs_evt, compute_st);
+            PreprocessAndContract(preprocess_params);
+            cudaEventRecord(can_read_h_main_q_narcs, compute_st);
         }
 
 
         // We need h_q_token_from_narcs to be ready
-        cudaEventSynchronize(q_token_from_narcs_evt);
+        cudaEventSynchronize(can_read_h_main_q_narcs);
         cudaCheckError();
 
         int main_q_narcs = *h_main_q_narcs;
@@ -337,7 +342,7 @@ namespace kaldi {
         expand_params.h_aux_q_end = h_aux_q_end;
         expand_params.q_capacity = max_tokens_per_frame_;
         expand_params.h_q_overflow = h_q_overflow;
-        expand_params.d_degrees_scan = d_degrees_scan; 
+        expand_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum; 
         expand_params.d_q_arc_offsets = d_main_q_arc_offsets;
         expand_params.arc_ilabels = fst_.arc_ilabels_d;
         expand_params.is_emitting = is_emitting;
@@ -386,8 +391,8 @@ namespace kaldi {
     void CudaDecoder::ProcessEmitting() {
         nvtxRangePushA("ProcessEmitting");
 
-        // Using emitting arc offsets
-        ProcessToken(fst_.e_offsets_d, true); 
+        // true => use emitting arcs
+        ProcessToken(true); 
 
         cudaCheckError();
         nvtxRangePop();
@@ -399,7 +404,8 @@ namespace kaldi {
         // While not done, call it
         // If remaining n_arcs < 4k, 
         // ProcessToken will call a persistent kernel
-        while(!ProcessToken(fst_.ne_offsets_d, false));
+        // false => use non emitting arcs
+        while(!ProcessToken(false));
 
         cudaCheckError();
         nvtxRangePop();

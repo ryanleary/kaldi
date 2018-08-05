@@ -74,6 +74,17 @@ namespace kaldi {
             /// to see whether we reached a final state.
             bool Decode(DecodableInterface *decodable);
 
+            /// This will decode until there are no more frames ready in the decodable
+            /// object, but if max_num_frames is >= 0 it will decode no more than
+            /// that many frames.  If it returns false, then no tokens are alive,
+            /// which is a kind of error state.
+            void AdvanceDecoding(DecodableInterface *decodable,
+                    int32 max_num_frames = -1);
+
+            /// Returns the number of frames already decoded.  
+            int32 NumFramesDecoded() const { return num_frames_decoded_; }
+
+
             bool ReachedFinal() const;
 
             // GetBestPath gets the decoding traceback. If "use_final_probs" is true
@@ -147,14 +158,14 @@ namespace kaldi {
                 int32 *d_aux_q_end; 
                 int32 *h_aux_q_end;
 
-                int32 *d_degrees_scan; 
+                int32 *d_main_q_degrees_prefix_sum; 
                 uint32_t *d_arc_offsets; 
                 int32 *d_main_q_arc_offsets; // offsets, relative to the queue
 
                 int32 *d_state_cost; 
                 BaseFloat *d_cutoff; 
 
-                int32 *d_degrees_block_scan; 
+                int32 *d_main_q_degrees_block_prefix_sum; 
                 int32 *d_n_CTA_done;
             };
 
@@ -169,7 +180,7 @@ namespace kaldi {
                 StateId *d_main_q_state; 
                 CostType *d_main_q_cost;
                 InfoToken *d_main_q_info; 
-                int32 *d_degrees_scan; 
+                int32 *d_main_q_degrees_prefix_sum; 
 
                 int32 *d_main_q_narcs; 
                 int32 *h_main_q_narcs; 
@@ -226,7 +237,7 @@ private:
             //
             // PreprocessAndContract kernel
             // Input  : aux_q, FST, d_state_costs, d_cutoff
-            // Output : main_q, d_degrees_scan
+            // Output : main_q, d_main_q_degrees_prefix_sum
             //
             // The Preprocess* kernels are used before executing Expand 
             // Computing data members needed by Expand (preprocess) and prune tokens on the fly (contract) 
@@ -239,7 +250,7 @@ private:
             //         1) append this token to the main_q
             //         2) compute out_degree = (# of outgoing arcs from token.nextstate) 
             //         3) compute the prefix sum of those out_degrees for all tokens appended in the main_q
-            //         4) save that prefix sum in d_degrees_scan
+            //         4) save that prefix sum in d_main_q_degrees_prefix_sum
             // Else 
             //    Do nothing (this token is pruned)
             //
@@ -255,10 +266,11 @@ private:
 
             void PreprocessAndContract(PreprocessParams &params);
 
+            
             //
             // PreprocessInPlace kernel
             // Input  : main_q, main_q_local_offset, FST, d_state_costs, d_cutoff
-            // Output : main_q, d_degrees_scan
+            // Output : main_q, d_main_q_degrees_prefix_sum
             //
             // The Preprocess* kernels are used before executing Expand 
             // Computing data members needed by Expand (preprocess) in place, without modifying queues
@@ -286,7 +298,7 @@ private:
             //
             // Then we compute the data needed by the expand kernel :
             //         1) compute the prefix sum of those out_degrees 
-            //         3) save that prefix sum in d_degrees_scan
+            //         3) save that prefix sum in d_main_q_degrees_prefix_sum
             //
             // After executing PreprocessInPlace,
             // The "active" main_q[local_offset, end[ range stays the same.
@@ -297,19 +309,80 @@ private:
 
             void PreprocessInPlace(PreprocessParams &params);
 
+            //
+            // FinalizePreprocessInPlace()
             // This kernel is responsible to compute the second pass of the
             // prefix sum. Must be called between PreprocessInPlace and ExpandArcs
+            // TODO merge with ResetLookupTable
+            //
             void FinalizePreprocessInPlace();
 
-            /// This will decode until there are no more frames ready in the decodable
-            /// object, but if max_num_frames is >= 0 it will decode no more than
-            /// that many frames.  If it returns false, then no tokens are alive,
-            /// which is a kind of error state.
-            void AdvanceDecoding(DecodableInterface *decodable,
-                    int32 max_num_frames = -1);
+            //
+            // NonEmittingLongTail
+            // This kernel is called at the end of the ProcessNonEmitting computation
+            // it is used when ProcessNonEmitting generate a small number of new tokens at each iteration 
+            // to avoid calling heavy-lifting kernels such as ExpandArcs too many times, we instead use
+            // NonEmittingLongTail that uses only one CTA 
+            // By using one CTA, we can sync all threads inside the kernel, and iterate until convergence 
+            // without lauching new kernels
+            // This meta-kernel performs :
+            // while we have non-emitting arcs to traverse:
+            //      (1) Preprocess in place
+            //      (2) Expand
+            // This meta-kernel does not call the PreprocessInPlace or Expand kernels
+            // it uses simplified implementations (for one CTA) of those 
+            //
+            void NonEmittingLongTail(uint32_t *d_arc_offsets, const ExpandArcParams &params);
 
-            /// Returns the number of frames already decoded.  
-            int32 NumFramesDecoded() const { return num_frames_decoded_; }
+
+            // InitStateCost initializes all costs to +INF in d_state_cost at the beginning of the computation
+            void InitStateCostLookup();
+
+            // We need to reset d_state_cost between frames. We could use InitStateCost
+            // but a large portion of the lookup table has not been used
+            // ResetStateCostLookup resets only the costs that are not +INF, using the d_main_q_state to do it
+            // d_main_q_state contains the list of states that have been considered and have a best cost < +INF
+            void ResetStateCostLookup();
+
+            // Pre-computes log likelihoods for the current frame 
+            void ComputeLogLikelihoods(DecodableInterface *decodable);
+
+            // GetBestPath gets the decoding traceback. If "use_final_probs" is true
+            // AND we reached a final state, it limits itself to final states;
+            // otherwise it gets the most likely token not taking into account final-probs.
+            // fst_out will be empty (Start() == kNoStateId) if nothing was available due to
+            // search error.
+            // If Decode() returned true, it is safe to assume GetBestPath will return true.
+            // It returns true if the output lattice was nonempty (i.e. had states in it);
+            // using the return value is deprecated.
+            void GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const;
+
+            // ProcessEmitting generates tokens associated with the new frame i
+            // When we call ProcessEmitting, the main_q contains the tokens associated
+            // with the previous frame (i-1). Using d_main_q_state and the emitting arcs from the FST graph,
+            // we create a new tokens queue, which will be stored in the aux_q
+            void ProcessEmitting();
+
+
+            // ProcessNonEmitting
+            // Same thing than for ProcessNonemitting, except that we use non-emitting arcs
+            void ProcessNonemitting();
+
+
+            // ProcessToken is called by both ProcessEmitting and ProcessNonemitting 
+            // It creates new tokens using an old token queue and the associated FST
+            // It only does one iteration [old token queue ---Arcs---> new token queue]
+            // In the Non-emitting computation, we may need multiple iteration to compute all the non-emitting paths
+            // ProcessToken returns false if we need to call it again, because the new token queue still contains tokens
+            // with non-emitting arcs
+            // It returns true if we are done
+            bool ProcessToken(bool is_emitting);
+
+
+            // PrintOverflowWarning
+            // if a kernel sets the flag h_q_overflow, we send a warning to stderr 
+            void PrintOverflowWarning();
+
 
             //
             // Data members
@@ -385,6 +458,8 @@ private:
 
             // After each frame, we copy the main queue (GPU memory)
             // to the end of h_all_tokens_info (CPU memory)
+            // We only move to the CPU what's needed for the final backtrack in GetBestPath
+            // ie { prev_token, arc_idx } (= struct InfoToken)
             TokenVector h_all_tokens_info; 
 
             // The token at index i in the main queue has in reality 
@@ -395,68 +470,90 @@ private:
             // and be able to backtrack at the end
             int32 main_q_global_offset;
 
+
+            // Depending on the value of the parameter "max_tokens_per_frame"
+            // we can end up with an overflow when generating the tokens for a frame
+            // We try to prevent this from happening using an adaptive beam
+            // if an overflow is about to happen, the kernels revert all data
+            // to the last valid state, and set that flag to true
+            // Even if that flag is set, we can continue the execution (quality
+            // of the output can be lowered)
+            // We use that flag to display a warning to stderr
             int32 *h_q_overflow;
 
             // Buffers for copies on host on the current main_q
             // Those are only buffers - and must be considered as containing 
             // uninitialized data
             // If you need to read from those,
-            // please explicitely copy data from device first !
+            // please explicitly copy data from device first !
+            // We use them in "ReachedFinal" for instance
             StateId *h_main_q_state; 
             CostType *h_main_q_cost; 
 
-            // Used to detect last CTA alive in some kernels
+            // Some kernels need to perform some operations before exiting
+            // d_n_CTA_done is a counter that we increment when a CTA (CUDA blocks)
+            // is done
+            // Each CTA then tests the value for d_n_CTA_done to detect if it's the last to exit
+            // If that's the cast, it does what it has to do, and sets d_n_CTA_done back to 0
             int32 *d_n_CTA_done;
 
-            // Scan of the outgoing arc degrees of tokens in [from,to[
-            int32 *d_degrees_scan;
-            // Scan of the total per block
-            int32 *d_degrees_block_scan;
+            // The load balancing of the Expand kernel relies on the prefix sum of the degrees 
+            // of the state in the queue (more info in the ExpandKernel implementation) 
+            // That array contains that prefix sum. It is set by the "Preprocess*" kernels
+            // and used by the Expand kernel
+            int32 *d_main_q_degrees_prefix_sum;
+        
+            // When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
+            // (1) First generate the prefix sum inside each CUDA blocks
+            // (2) then generate the prefix sum of the sums of each CUDA blocks
+            // (3) Use (1) and (2) to generate the global prefix sum
+            // Data from step 1 and 3 is stored in d_main_q_degrees_prefix_sum
+            // Data from step 2 is stored in d_main_q_degrees_block_prefix_sum
+            // Note : this is only used by PreprocessInPlace
+            // PreprocessAndContract uses a trick to compute the global prefix sum in one pass
+            int32 *d_main_q_degrees_block_prefix_sum;
 
-            // Cf Compute degrees
+            // d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
+            // we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
+            // we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
             int32 *d_main_q_arc_offsets;
 
 
-            // Lookup table of all the costs
-            // d_state_cost[state] -> best cost for that state
-            // Resetted between frames
-            // Costs is stored as an ordered int32 representing a float
+            // d_state_cost[state] -> best cost for that state for the current frame
+            // reset between frames
+            // type int32 to be able to use native atomicMin instruction
+            // we use a 1:1 conversion float <---> sortable int
             int32 *d_state_cost;
 
             // Current cutoff for current frame
             BaseFloat *d_cutoff;
 
+            // loglikelihoods computed by the acoustic model
+            // we need it to compute the cost of emitting edges
             BaseFloat *loglikelihoods_d;
 
+            // CUDA streams
+            // kernels are launched in compute_st
+            // copies in copy_st
+            // we use two streams to overlap copies and kernels
+            // we synchronize the two using events
             cudaStream_t compute_st, copy_st;
-            cudaEvent_t q_token_from_narcs_evt, can_write_to_main_q;
 
-            //pre-computes log likelihoods for the current frame
-            void ComputeLogLikelihoods(DecodableInterface *decodable);
+            // CUDA events
 
-            // ProcessEmitting decodes the frame num_frames_decoded_ of the
-            // decodable object, then increments num_frames_decoded_.
-            //void ProcessEmitting(DecodableInterface *decodable);
+            // We need to synchronize the streams copy_st and compute_st
+            // because of data dependency : they both have to read or write to the main_q 
+            // when we're done copying the old main_q to the CPU, we trigger can_write_to_main_q 
+            cudaEvent_t can_write_to_main_q;
 
-            // Descriptions in .cu file
-
-            void InitLookup();
-            void ResetLookup();
-            void NonEmittingLongTail(uint32_t *d_arc_offsets, const ExpandArcParams &params);
-
-            void GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const;
-            void ProcessEmitting();
-            void ProcessNonemitting();
-            void Print32OverflowWarning();
-
-            bool ProcessToken(uint32_t *d_arc_offsets, bool is_emitting);
-
+            // At the end of Preprocess kernels we set h_main_q_narcs (pinned memory)
+            // this event is set in the pipeline after Preprocess kernels to inform that data is ready to be read
+            cudaEvent_t can_read_h_main_q_narcs;
 
             const CudaFst fst_;
 
             BaseFloat beam_;
             int32 max_tokens_, max_tokens_per_frame_;
-
 
             // Keep track of the number of frames decoded in the current file.
             int32 num_frames_decoded_;
