@@ -215,6 +215,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         const BaseFloat cutoff = *params.d_cutoff;
 
         const int32 aux_q_end = *params.d_aux_q_end;
+
+        // The condition of the for loop is the same for all threads in the CUDA block
+        // we want to keep all threads alive at the same time for now
+        // otherwise __syncthreads() would fail
         for(int32 block_offset = blockDim.x*blockIdx.x;
                 block_offset < aux_q_end;
                 block_offset += gridDim.x*blockDim.x) {
@@ -226,21 +230,22 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             StateId token_state;
             CostType token_cost;
 
+            // if aux_q_idx is a valid index in the main_q
             if(aux_q_idx < aux_q_end) {
                 // Cost and state associated with the token
                 token_cost = params.d_aux_q_cost[aux_q_idx];
                 token_state = params.d_aux_q_state[aux_q_idx];
 
                 // Best cost for that token_state
-                // We know we have a token associated with token_state in the queue with the cost best_state_cost
-                BaseFloat best_state_cost = orderedIntToFloat(params.d_state_cost[token_state]);
+                // We know we have a token associated with token_state in the queue with the cost state_best_cost
+                BaseFloat state_best_cost = orderedIntToFloat(params.d_state_cost[token_state]);
 
                 // Cutoff may have decreased since the creation of the token
                 if(token_cost < cutoff) {
                     
                     // We can have duplicates, ie token associated with the same states
                     // If this token is not the best candidate, get rid of it
-                    if(token_cost == best_state_cost) {
+                    if(token_cost == state_best_cost) {
                         arc_start = params.d_arc_offsets[token_state];
                         int32 arc_end = params.d_arc_offsets[token_state+1];
                         degree = arc_end - arc_start;
@@ -249,11 +254,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 // the d_state_cost lookup table is reset to +INF for all states between frame
                 // for perf. reason we only reset states that are in d_main_q_state
-                // however if best_state_cost >= cutoff, all tokens associated with token_state 
+                // however if state_best_cost >= cutoff, all tokens associated with token_state 
                 // will be pruned, and that state will not be in d_main_q_state
                 // we need to reset the lookup table now
 
-                if (best_state_cost >= cutoff)
+                if (state_best_cost >= cutoff)
                     params.d_state_cost[token_state] = floatToOrderedInt(FLT_MAX);
 
             }
@@ -406,12 +411,25 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
 
 /*
+    PreprocessInPlace
     This kernel is also a preprocessing kernel, but this time does it in place
+    ie it will not move tokens from the aux_q to the main_q
+    It will do the preprocess operation directly on the main_q
     The tokens are already in the main q (they were placed here by a previous "contract and preprocess").
-    We avoid performing the next phase on non-optimal ones by setting the degree to 0 and
-    computing a degrees scan.
 
-    Here we have to do the scan in two passes : the scan will be finished in "finalize_preprocess"
+    We cannot prune non-optimal tokens, because the tokens are already in the main_q (we cannot prune 
+    the main_q - it would break the prev_token indexes). To avoid doing unnecessary computation 
+    in the expand kernel, we simulate the pruning by setting non-optimal token's degree to 0
+    We then rely on the 1 thread = 1 arc exact load balacing of expand to ignore that token
+
+    Please note that even if 0 threads will perform work on an ignored token in expand (degree = 0),
+    it is not exactly the same as pruning it : the main_q accesses will not be perfectly coalesced
+    in expand, because some "dead" tokens exist between living ones
+
+    For the preprocess stage we have to compute the prefix sum of the tokens arc degrees
+    Here we have to do the prefix sum in two passes : first local prefix sums inside CUDA block,
+    then in a second kernel (finalize_preprocess_in_place), we add the necessary block offsets to end up 
+    with the global prefix sum
 
     This preprocess step is used in ProcessEmitting. Tokens were placed in main_q by
     the ProcessNonEmitting of the previous frame. We cannot renumber them (it would break
@@ -420,93 +438,185 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 */
 
     __global__ void _preprocess_in_place_kernel(PreprocessParams params) {
-    
+   
+        // Operator for the prefix sum inside the CUDA block
         typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
-        __shared__ int32 is_last_CTA;
 
-        int32 queue_offset = *params.d_main_q_local_offset;
-        int32 queue_end = *params.d_main_q_end;
-        int32 queue_size = queue_end - queue_offset;
+        // All threads in the last CUDA block (CTA) alive will have work to do at the end
+        // this bool will be needed to broadcast the information from thread0 to all threads in the last CTA 
+        __shared__ bool is_last_CTA;
 
-        BaseFloat cutoff = *params.d_cutoff;
+        const int32 main_q_offset = *params.d_main_q_local_offset;
+        const int32 main_q_end = *params.d_main_q_end;
+        const int32 main_q_size = main_q_end - main_q_offset;
 
+        // Final cutoff from the expand kernel
+        const BaseFloat cutoff = *params.d_cutoff;
+
+        // The condition of the for loop is the same for all threads in the CUDA block
+        // we want to keep all threads alive at the same time for now
+        // otherwise __syncthreads() would fail
         for(int32 block_offset = blockDim.x*blockIdx.x;
-                block_offset < queue_size;
-                block_offset += gridDim.x*blockDim.x)
-        {
-            int32 idx = queue_offset + block_offset + threadIdx.x; 
-            int32 degree = 0; 
-            if(idx < queue_end) {
-                StateId state_idx = params.d_main_q_state[idx]; 
-                BaseFloat cost = params.d_main_q_cost[idx];
+                block_offset < main_q_size;
+                block_offset += gridDim.x*blockDim.x) {
 
-                if(cost < cutoff) {
-                    BaseFloat best_cost = orderedIntToFloat(params.d_state_cost[state_idx]); 
-                    if(cost == best_cost) {
-                        int32 start = params.d_arc_offsets[state_idx]; 
-                        int32 end = params.d_arc_offsets[state_idx+1]; 
+            // Position of considered token in the main_q
+            int32 main_q_idx = main_q_offset + block_offset + threadIdx.x; 
+
+            // Total number of arcs from that token's state
+            int32 degree = 0; 
+
+            if(main_q_idx < main_q_end) {
+                StateId token_state = params.d_main_q_state[main_q_idx]; 
+                BaseFloat token_cost = params.d_main_q_cost[main_q_idx];
+
+                // the cutoff may have decreased since the creation of that token
+                if(token_cost < cutoff) {
+
+                    // Best cost for that token_state
+                    // We know we have a token associated with token_state in the queue with the cost state_best_cost
+                    BaseFloat state_best_cost = orderedIntToFloat(params.d_state_cost[token_state]); 
+                    
+                    // We can have duplicates, ie token associated with the same states
+                    // If this token is not the best candidate, get rid of it
+                    if(token_cost == state_best_cost) {
+                        int32 start = params.d_arc_offsets[token_state]; 
+                        int32 end = params.d_arc_offsets[token_state+1]; 
                         degree  = end - start;
-                        params.d_main_q_arc_offsets[idx] = start;
+                        
+                        // Saving the start offset for the expand kernel
+                        // avoid a new random memory access
+                        params.d_main_q_arc_offsets[main_q_idx] = start;
                     }
                 }
             }
 
-            int32 scan;
-            BlockScan(temp_storage).ExclusiveSum(degree, scan);
-            if(idx < queue_end) 
-                params.d_main_q_degrees_prefix_sum[idx] = scan;
+            int32 degree_local_prefix_sum;
+
+            // Computing a local prefix sum inside that CUDA block
+            // A second kernel will take care of adding the necessary offset to those local prefix sums
+            BlockScan(temp_storage).ExclusiveSum(degree, degree_local_prefix_sum);
+
+            if(main_q_idx < main_q_end) {
+                // This is not the final global prefix sum
+                // A second kernel will add the necessary offset
+                params.d_main_q_degrees_prefix_sum[main_q_idx] = degree_local_prefix_sum; 
+            }
+
+            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1)) {
+                // Saving the local sum of degrees of that CUDA block
+                // That's necessary to compute the global offset of that CUDA block,
+                // and that offset is what we need to transform the local prefix sum into a global prefix sum
+
+                int local_sum_index = block_offset/KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+                int local_sum = degree_local_prefix_sum + degree; // the prefix sum was exclusive, adding missing value
+                params.d_main_q_degrees_block_prefix_sum[local_sum_index] = local_sum; 
+            }
 
 
-            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1))
-                params.d_main_q_degrees_block_prefix_sum[block_offset/KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX] = (scan + degree); 
+            // Synchronization for two reasons :
+            // - we may need to reuse temp_storage if the for loop iterates (cf CUB's doc)
+            // - we need all threads to be done before considering the CTA as done (see below)
+            __syncthreads(); 
 
-            __syncthreads(); // we'll reuse temp_storage
         }
 
+        //
+        // The last CUDA block alive will compute the prefix sum of the block degrees sum
+        // We need that prefix sum, because it represents the offsets that each CUDA block has in the global prefix sum
+        // we will then add those offsets in finalize_preprocess_in_place
+
         if(threadIdx.x == 0) {
+            // We indicate that this CTA is done
             int32 old = atomicAdd(params.d_n_CTA_done, 1); 
+            
+            // If we're the last CTA to exit, detect it
             is_last_CTA = (old == (gridDim.x -1));
         }
 
-        // is_last_CTA + temp_storage reuse
+        // Synchronization for two reasons :
+        // - Broadcasting is_last_CTA
+        // - reusing temp_storage (cf CUB's doc)
         __syncthreads();
         
         if(is_last_CTA)
         {
-            // The last block alive takes care of scan of block sums 
+            //
+            // Our goal here is to compute the prefix sum of the previous local sums
+            // What we call local sum is what contains the local_sum variables in the previous lines
+            // it is the sum of degrees inside a given CUDA block, at a given for loop iteration
+            // all local sums are stored in params.d_main_q_degrees_block_prefix_sum
+            // we want to do the prefix sum of that array
+            //
+            // Once this is done, params.d_main_q_degrees_block_prefix_sum[i] will contain the 
+            // offset that we need to add to the local prefix sum #i to convert it to a global
+            // prefix sum
+            // Right now we are only computing the offsets ; adding them to the local prefix sums will be 
+            // done in FinalizePreprocessInPlace
+            //
+
+            //
+            // We are the last CTA alive
+            // which means that all local sums have been written to params.d_main_q_degrees_block_prefix_sum
+            // We can now do the prefix sum of that array   
+            //
+
+            // Making sure that we see changes from other CTAs 
             __threadfence();
 
-            if(threadIdx.x == 0) {
-                *params.d_n_CTA_done = 0;
-            }
+            //
+            // How many local sums values do we have ?
+            // Please note that this number can be different from gridDim.x
+            // We may have applied a upper limit on gridDim.x, and in that case
+            // gridDim.x < number_of_local_sums
+            //
 
-            // following value can be different than gridDim.x 
-            int32 total_blk_val = (queue_size + KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX -1) / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-            int32 scan_offset = 0;
+            int32 number_of_local_sums = DIV_ROUND_UP(main_q_size, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX);
 
-            for(int32 blk_idx_off = 0; blk_idx_off < total_blk_val; blk_idx_off += blockDim.x) {
-                int32 blk_idx = blk_idx_off + threadIdx.x; 
+            // We may iterate the following for loop multiple times
+            // on iteration > 0, we will have to consider the offset from previous iterations
+            int32 prefix_sum_of_local_sums_offset = 0;
 
-                int32 blk_sum = (blk_idx < total_blk_val) ?  params.d_main_q_degrees_block_prefix_sum[blk_idx] : 0; 
-                int32 blk_scan, iteration_total;
-                BlockScan(temp_storage).ExclusiveSum(blk_sum, blk_scan, iteration_total);
-                blk_scan += scan_offset;
-                scan_offset += iteration_total;
+            // local_sum_index is an index in the array d_main_q_degrees_block_prefix
+            // 
+            // The condition inside the loop is common to all threads in the CTA
+            // we want to keep all threads active, we will use syncthreads()
+            for(int32 local_sum_index_offset = 0; 
+                      local_sum_index_offset < number_of_local_sums; 
+                      local_sum_index_offset += blockDim.x) {
 
-                if(blk_idx < total_blk_val) {
-                    params.d_main_q_degrees_block_prefix_sum[blk_idx] = blk_scan;
+                int32 local_sum_index = local_sum_index_offset + threadIdx.x; 
+
+                int32 local_sum = (local_sum_index < number_of_local_sums) 
+                                ? params.d_main_q_degrees_block_prefix_sum[local_sum_index] 
+                                : 0; // neutral element
+
+                int32 prefix_sum_of_local_sums, total_sum_of_local_sums_for_this_iteration;
+
+                BlockScan(temp_storage).ExclusiveSum(local_sum, prefix_sum_of_local_sums, total_sum_of_local_sums_for_this_iteration);
+
+                prefix_sum_of_local_sums += prefix_sum_of_local_sums_offset;
+                prefix_sum_of_local_sums_offset += total_sum_of_local_sums_for_this_iteration;
+
+                if(local_sum_index < number_of_local_sums) {
+                    params.d_main_q_degrees_block_prefix_sum[local_sum_index] = prefix_sum_of_local_sums;
                 }
 
-                // temp storage
+                // Sync'ing to be able to reuse temp_storage (cf CUB's doc)
                 __syncthreads();
             }
 
             if(threadIdx.x == 0)
             {
-                *params.d_main_q_narcs = scan_offset; 
-                *params.h_main_q_narcs = scan_offset; // pinned memory
+                // Final offset is the overall total
+                int total_sum_of_local_sums = prefix_sum_of_local_sums_offset;
+                *params.d_main_q_narcs = total_sum_of_local_sums; 
+                // h_main_q_narcs is in pinned memory, we can write to it from the device
+                *params.h_main_q_narcs = total_sum_of_local_sums; 
+                // reset for next time
+                *params.d_n_CTA_done = 0;
             }
         }
     }
@@ -519,7 +629,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
-        // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
         _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
