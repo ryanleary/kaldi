@@ -68,6 +68,11 @@ namespace kaldi {
             typedef StdArc::Label Label;
             typedef StdArc::StateId StateId;
             typedef float CostType;
+            // IntegerCostType is the type used in the lookup table d_state_cost
+            // and the d_cutoff
+            // We use a 1:1 conversion between CostType <--> IntegerCostType
+            // IntegerCostType is used because it triggers native atomic operations
+            typedef int32 IntegerCostType;
 
             CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config);  
             ~CudaDecoder();
@@ -97,7 +102,8 @@ namespace kaldi {
             /// Returns the number of frames already decoded.  
             int32 NumFramesDecoded() const { return num_frames_decoded_; }
 
-
+            // ReachedFinal returns true if the last frame's token queue 
+            // contains at least one token associated with a final state
             bool ReachedFinal() const;
 
             // GetBestPath gets the decoding traceback. If "use_final_probs" is true
@@ -113,7 +119,7 @@ namespace kaldi {
             // GetBestCost sets in *min the token's best cost in the main_q
             // it also sets in *arg the index of that token (argmin)
             // is isfinal is true, we take into account the final costs
-            void GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const;
+            void GetBestCost(bool isfinal, BaseFloat *best_cost, int32 *best_cost_arg) const;
 
             /// FinalRelativeCost() serves the same function as ReachedFinal(), but gives
             /// more information.  It returns the difference between the best (final-cost plus
@@ -121,6 +127,8 @@ namespace kaldi {
             /// on the final frame.  If it is infinity it means no final-states were present
             /// on the final frame.  It will usually be nonnegative.
             BaseFloat FinalRelativeCost() const;
+
+
             //
             // Data structures used by the kernels
             //
@@ -175,7 +183,7 @@ namespace kaldi {
                 uint32_t *d_arc_offsets; 
                 int32 *d_main_q_arc_offsets; // offsets, relative to the queue
 
-                int32 *d_state_cost; 
+                IntegerCostType *d_state_cost; 
                 BaseFloat *d_cutoff; 
 
                 int32 *d_main_q_degrees_block_prefix_sum; 
@@ -245,7 +253,7 @@ private:
             // please refer to http://kaldi-asr.org/doc/decoders.html
             //
 
-            void ExpandArcs(int32 nthreads, const ExpandArcParams &params);
+            void ExpandArcs(const ExpandArcParams &params, int32 nthreads);
 
             //
             // PreprocessAndContract kernel
@@ -277,7 +285,7 @@ private:
             // We don't need to call FinalizePreprocessInPlace() after PreprocessAndContract
             //
 
-            void PreprocessAndContract(PreprocessParams &params);
+            void PreprocessAndContract(const PreprocessParams &params);
 
             
             //
@@ -320,7 +328,7 @@ private:
             // FinalizePreprocessInPlace
             //
 
-            void PreprocessInPlace(PreprocessParams &params);
+            void PreprocessInPlace(const PreprocessParams &params);
 
             //
             // FinalizePreprocessInPlace()
@@ -345,7 +353,7 @@ private:
             // This meta-kernel does not call the PreprocessInPlace or Expand kernels
             // it uses simplified implementations (for one CTA) of those 
             //
-            void NonEmittingLongTail(uint32_t *d_arc_offsets, const ExpandArcParams &params);
+            void NonEmittingLongTail(const uint32_t *d_arc_offsets, const ExpandArcParams &params);
 
 
             // InitStateCost initializes all costs to +INF in d_state_cost at the beginning of the computation
@@ -529,7 +537,7 @@ private:
             // reset between frames
             // type int32 to be able to use native atomicMin instruction
             // we use a 1:1 conversion float <---> sortable int
-            int32 *d_state_cost_;
+            IntegerCostType *d_state_cost_;
 
 
             // loglikelihoods computed by the acoustic model

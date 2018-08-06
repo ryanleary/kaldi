@@ -23,6 +23,7 @@
 namespace kaldi {
 
 typedef CudaDecoder::StateId StateId;
+typedef CudaDecoder::TokenAndArcCount TokenAndArcCount;
 typedef CudaDecoder::TokenAndArcCountUnion TokenAndArcCountUnion;
 typedef CudaDecoder::CostType CostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
@@ -32,7 +33,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 // Utils device function
 //
 
-    // Used to trigger the fire&forget version of atomicMin (only av for int32/long)
+
+    //
+    // 1:1 Conversion float <---> sortable int
+    // We convert floats to sortable ints in order
+    // to use native atomics operation, which are 
+    // way faster than looping over atomicCAS 
+    //
+
     __device__ int32 floatToOrderedInt(float floatVal) {
 
         int32 intVal = __float_as_int( floatVal );
@@ -47,24 +55,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         return __int_as_float( (intVal >= 0) ? intVal : intVal ^ 0x7FFFFFFF );
 
     } 
-    __forceinline__ __device__ int32 binsearch_maxle(const int32 *vec, const int32 val, int32 low, int32 high) {
-        while(true) {
-            if(low == high)
-                return low; //we know it exists
-            if((low + 1) == high)
-                return (vec[high] <= val) ? high : low;
 
-            int32 mid = low + (high- low) / 2;
-
-            if(vec[mid] > val)
-                high = mid-1;
-            else
-                low = mid;
-        }
-    }
-
-
-    // Temporary used for cutoff - will be removed
+    // Temporary used for cutoff - will be TODO removed
     __device__ float fatomicMin(float *addr, float value)
 
     {
@@ -85,12 +77,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     }
 
-//
-// Kernels
-//
+    //
+    // Kernels
+    //
 
     // Used before first frame
-    __global__ void _init_lookup_kernel(int32 *state_cost, int32 size) {
+    __global__ void _init_lookup_kernel(int32 size, int32 *state_cost) {
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
                 idx < size;
                 idx += blockDim.x*gridDim.x) {
@@ -107,10 +99,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = 256;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        _init_lookup_kernel<<<grid,block>>>(d_state_cost_, nstates);
+        _init_lookup_kernel<<<grid,block>>>(nstates, d_state_cost_);
     }
 
-        // Used to reset lookup table between frames
+    // Used to reset lookup table between frames
     // Using the queue to reset only the values needed
     // Also takes care of resetting cutof
     // TODO rename to something like "ResetForNewFrame"
@@ -143,13 +135,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
+    // Sum operator for the TokenAndArcCount struct (2 ints) 
 
-    // TODO rename
-    struct F2Sum {
-        __device__ int2 operator()(const int2 &a, const int2 &b) const {
-            int2 c;
-            c.x = a.x + b.x;
-            c.y = a.y + b.y;
+    struct TokenAndArcCountSum {
+        __device__ TokenAndArcCount operator()(const TokenAndArcCount &a, const TokenAndArcCount &b) const {
+            TokenAndArcCount c;
+            c.ntokens = a.ntokens + b.ntokens;
+            c.narcs = a.narcs + b.narcs;
 
             return c;
         }
@@ -181,7 +173,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     */
 
     __global__ void _preprocess_and_contract_kernel(PreprocessParams params) {
-        typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
+        typedef cub::BlockScan<TokenAndArcCount, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage;
 
         __shared__ TokenAndArcCountUnion blk_local_offset_i2;
@@ -221,21 +213,24 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             }
 
             int32 is_pruned = (arc_start == -1);
-            int2 scan_i2;
-            scan_i2.x =  is_pruned ? 0 : 1;
-            scan_i2.y =  degree;
+            TokenAndArcCount prefix_sum_token_arc_count;
+            prefix_sum_token_arc_count.ntokens =  is_pruned ? 0 : 1;
+            prefix_sum_token_arc_count.narcs =  degree;
 
-            int2 zero_i2;
-            zero_i2.x = zero_i2.y = 0;
+            TokenAndArcCount zero_struct;
+            zero_struct.ntokens = zero_struct.narcs = 0;
 
-            BlockScan(temp_storage).ExclusiveScan(scan_i2, scan_i2, zero_i2, F2Sum());
+            BlockScan(temp_storage).ExclusiveScan(prefix_sum_token_arc_count, 
+                                                    prefix_sum_token_arc_count, 
+                                                    zero_struct,
+                                                    TokenAndArcCountSum());
 
             
             TokenAndArcCountUnion inclusive_scan;
             if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1)) {
                 // CUB Scan is exclusive
-                inclusive_scan.split.ntokens = scan_i2.x + (is_pruned ? 0 : 1);
-                inclusive_scan.split.narcs = scan_i2.y + degree;
+                inclusive_scan.split.ntokens = prefix_sum_token_arc_count.ntokens + (is_pruned ? 0 : 1);
+                inclusive_scan.split.narcs = prefix_sum_token_arc_count.narcs + degree;
 
                 blk_local_offset_i2.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, inclusive_scan.both);
                 total_in_CTA = inclusive_scan.split.ntokens;
@@ -255,7 +250,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             if(!is_pruned) {
                 // Moving non-pruned to the main q
-                int32 main_q_idx = blk_local_offset_i2.split.ntokens + scan_i2.x;
+                int32 main_q_idx = blk_local_offset_i2.split.ntokens + prefix_sum_token_arc_count.ntokens;
 
                 InfoToken info = params.d_aux_q_info[aux_q_idx];
 
@@ -263,7 +258,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 params.d_main_q_cost[main_q_idx] = cost;
                 params.d_main_q_info[main_q_idx] = info;
 
-                params.d_main_q_degrees_prefix_sum[main_q_idx] = blk_local_offset_i2.split.narcs + scan_i2.y;
+                params.d_main_q_degrees_prefix_sum[main_q_idx] = blk_local_offset_i2.split.narcs 
+                                                                 + prefix_sum_token_arc_count.narcs;
 
                 params.d_main_q_arc_offsets[main_q_idx] = arc_start;
             }
@@ -301,7 +297,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::PreprocessAndContract(PreprocessParams &params) {
+    void CudaDecoder::PreprocessAndContract(const PreprocessParams &params) {
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
         grid.x = DIV_ROUND_UP(*h_aux_q_end_, block.x);
@@ -420,7 +416,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::PreprocessInPlace(PreprocessParams &params) {
+    void CudaDecoder::PreprocessInPlace(const PreprocessParams &params) {
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
         int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
@@ -526,6 +522,22 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
     return fmin(current_cutoff, min_cost + beam);
 }
+
+    __forceinline__ __device__ int32 binsearch_maxle(const int32 *vec, const int32 val, int32 low, int32 high) {
+        while(true) {
+            if(low == high)
+                return low; //we know it exists
+            if((low + 1) == high)
+                return (vec[high] <= val) ? high : low;
+
+            int32 mid = low + (high- low) / 2;
+
+            if(vec[mid] > val)
+                high = mid-1;
+            else
+                low = mid;
+        }
+    }
 
 
     void __global__ _expand_arcs_kernel(ExpandArcParams params) {
@@ -698,7 +710,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
     }
 
-    void CudaDecoder::ExpandArcs(int32 nthreads, const ExpandArcParams &params) {
+    void CudaDecoder::ExpandArcs(const ExpandArcParams &params, int32 nthreads) {
         dim3 grid,block;
         block.x = 256;
         grid.x = DIV_ROUND_UP(nthreads, block.x);
@@ -740,7 +752,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
 
     __launch_bounds__(KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX, 1)
-        __global__ void _process_nonem_longtail(uint32_t *d_arc_offsets, 
+        __global__ void _process_nonem_longtail(const uint32_t *d_arc_offsets, 
                 ExpandArcParams params) {
 
             typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockScan;
@@ -938,7 +950,7 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         }
 
-    void CudaDecoder::NonEmittingLongTail(uint32_t *d_arc_offsets, 
+    void CudaDecoder::NonEmittingLongTail(const uint32_t *d_arc_offsets, 
             const ExpandArcParams &params) {
 
         dim3 grid,block;

@@ -82,7 +82,7 @@ namespace kaldi {
 
         cudaMalloc(&loglikelihoods_d_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
 
-        cudaMalloc(&d_state_cost_,sizeof(CostType)*fst_.numStates);
+        cudaMalloc(&d_state_cost_, sizeof(IntegerCostType)*fst_.numStates);
 
         cudaCheckError();
     }
@@ -150,7 +150,7 @@ namespace kaldi {
         cudaMemcpy(d_aux_q_info_, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
 
         // We simulate a regular execution for the first iteration
-        cudaMemcpy(&d_state_cost_[start_state], &cost, sizeof(CostType), cudaMemcpyHostToDevice);
+        cudaMemcpy(&d_state_cost_[start_state], &cost, sizeof(IntegerCostType), cudaMemcpyHostToDevice);
 
         // Init state is in queue
         int32 one = 1;
@@ -365,7 +365,7 @@ namespace kaldi {
             done = true;
         }
         else {
-            ExpandArcs(main_q_narcs, expand_params);
+            ExpandArcs(expand_params, main_q_narcs);
         }
 
         cudaStreamSynchronize(compute_st_); 
@@ -417,7 +417,7 @@ namespace kaldi {
      */
 
 
-    void CudaDecoder::GetBestCost(BaseFloat *min, int32 *arg, bool isfinal) const {
+    void CudaDecoder::GetBestCost(bool isfinal, BaseFloat *min, int32 *arg) const {
         
         CostType best_cost = FLT_MAX; // switch to numeric limits std11
         int32 best_cost_idx;
@@ -473,7 +473,7 @@ namespace kaldi {
         bool isfinal = ReachedFinal();
         BaseFloat best_cost;
         int32 arg_best;
-        GetBestCost(&best_cost, &arg_best, isfinal);
+        GetBestCost(isfinal, &best_cost, &arg_best);
 
         //printf("is final = %i \n", isfinal);
         //printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
