@@ -448,7 +448,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // this bool will be needed to broadcast the information from thread0 to all threads in the last CTA 
         __shared__ bool is_last_CTA;
 
-        const int32 main_q_offset = *params.d_main_q_local_offset;
+        const int32 main_q_offset = *params.d_main_q_local_offset; // TODO ASSERT offset == 0
         const int32 main_q_end = *params.d_main_q_end;
         const int32 main_q_size = main_q_end - main_q_offset;
 
@@ -638,31 +638,45 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     /*
 
-       Part 2 of the scan for "PreprocessEmitting". For NonEmitting scan is already final
+       Part 2 of the prefix sum for "PreprocessInPlace" 
+       
+       For PreprocessAndContract we were able to do the global prefix sum of degrees in one pass, so we should not call
+       this kernel
 
-       Computes global prefix sum with block prefix sum and block offsets
+       Our final goal is to have the prefix sum of the degrees of the token's state of the main_q
+       and store that prefix sum in d_main_q_degrees_prefix_sum
 
-       If we want to speed up expand, we can compute lower and upper bound to restrain 
+       In PreprocessInPlace we've computed two things :
+       
+       - "local prefix sums" of the degree. Each CUDA block has computed the local prefix sum of its degrees. We've
+       stored each of the local prefix sums in d_main_q_degrees_prefix_sum
+       - the prefix sum of the local sums (local sum = sum of all degrees in a CUDA block). This gives us the offset
+       to add to each local prefix sum to end up with a global prefix sum
+
+       Note : If we want to speed up expand, we can compute lower and upper bound to restrain 
        the binary search in expand
        This can be done on the fly here, and removes main bottleneck of expand
-       Not done for now, because expand is fast enough
 
+       TODO merge with ResetStateCostLookup
      */
-    __global__ void _finalize_degrees_scan_kernel(int32 *d_scan, int32 *d_blk_scan, const int32 *d_main_q_local_offset_, const int32
-            *d_main_q_end_) {
 
-        int32 q_off = *d_main_q_local_offset_;
-        int32 q_end = *d_main_q_end_;
-        int32 q_size = q_end - q_off;
+    // d_main_q_degrees_prefix is both an input and an output
+    __global__ void _finalize_degrees_scan_kernel(const int32 *d_local_sums_prefix_sum, 
+                                                  const int32 *d_main_q_local_offset, 
+                                                  const int32 *d_main_q_end, 
+                                                  int32 *d_main_q_degrees_prefix_sum) {
 
-        for(int32 idx = q_off + blockDim.x*blockIdx.x + threadIdx.x;
-                idx < q_size;
-                idx += blockDim.x*gridDim.x) {
+        const int32 main_q_offset = *d_main_q_local_offset;
+        const int32 main_q_end = *d_main_q_end;
 
-            int32 blk_idx = (idx - q_off) / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-            int32 blk_scan_offset = d_blk_scan[blk_idx]; // we rely on L1 for this one, avoiding syncs
+        for(int32 main_q_idx = main_q_offset + blockDim.x*blockIdx.x + threadIdx.x;
+                  main_q_idx < main_q_end;
+                  main_q_idx += blockDim.x*gridDim.x) {
 
-            d_scan[idx] += blk_scan_offset;
+            int32 local_sum_idx = (main_q_idx - main_q_offset) / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+            int32 local_sum_offset = d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
+
+            d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
         }
 
     }
@@ -670,65 +684,92 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     void CudaDecoder::FinalizePreprocessInPlace() {
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+
+        // Should be called only at Emitting phase
+        // during that phase, the main_q_offset must be zero
+        KALDI_ASSERT(*h_main_q_local_offset_ == 0);
+
+        // TODO remove code related to offset in that code
         int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_prefix_sum_, d_main_q_degrees_block_prefix_sum_, d_main_q_local_offset_,
-                d_main_q_end_); 
+        _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_block_prefix_sum_, 
+                                                            d_main_q_local_offset_,
+                                                            d_main_q_end_, 
+                                                            d_main_q_degrees_prefix_sum_);
     }
 
 
 
+   //
+   // Helper functions/data structure for the ExpandArc kernel
+   //
 
-    /*
-       This kernel propagates arcs from the main q [main_q_local_offset, main_q_end[
-       to the aux
 
-       The main bottleneck is the first binary search. 
-       If we want to remove it, preprocess it on the fly in preprocess
+   // We'll need to do a BlockScan on both an int and a cost
+   // data struct and its associated binary operation
 
-     */
-
-    struct CostTInt {
+    struct CostTypeAndInt {
         CostType cost;
         int32 i;
     };
 
-    struct CISum {
-        __device__ CostTInt operator()(const CostTInt &a, const CostTInt &b) const {
-            CostTInt c;
+    // 
+    // We'll use the same BlockScan to compute two things :
+    //     1) The prefix sum of indexes
+    //     1) The minimum cost overall all costs in the CUDA Block 
+    //
+    // We use a + for the prefix sum, and a min for the min
+    //
+
+    struct MinCostPlusInt {
+        __device__ CostTypeAndInt operator()(const CostTypeAndInt &a, const CostTypeAndInt &b) const {
+            CostTypeAndInt c;
             c.cost = fmin(a.cost, b.cost);
             c.i = a.i + b.i;
-
             return c;
         }
     };
 
+    //
+    // GetCutoffCandidate is used by ExpandArc and NonEmittingLongTail
+    // It computes a candidate for a new cutoff. It will not necessarily be the new cutoff,
+    // we'll apply an atomicMin(d_cutoff, cutoff_candidate)
+    //
+    // The cutoff represents the upper limit of acceptable token cost 
+    // with min_cost = minimum token.cost for all token of the current frame,
+    // we will not consider token with cost > (min_cost + beam), beam being a parameter
+    //
+    // However, given the fact that the output token queue (aux_q) is too small to store 
+    // all possible tokens in the worst case scenario (where we could generate "nstates" tokens),
+    // we need to tighten the beam if we notice that we are at risk of overflowing the aux_q
+    //
 
-__device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
-                                const CostType min_cost,
-                                const CostType default_beam,
-                                const int32 q_size,
-                                const int32 q_capacity) {
-                                 
+    __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
+            const CostType min_cost_in_block,
+            const CostType default_beam,
+            const int32 q_size,
+            const int32 q_capacity) {
 
-    // Doing something simple for now
-    // We have to keep beam large enough,
-    // the final cutoff will be used for the final
-    // prune. If it is too small, we won't keep enough tokens
 
-   CostType beam = default_beam;
+        // Doing something simple for now
+        // We have to keep beam large enough,
+        // the final cutoff will be used for the final
+        // prune. If it is too small, we won't keep enough tokens
 
-   if(q_size >= q_capacity/2) 
-       beam /= 2;
+        CostType beam = default_beam;
 
-    return fmin(current_cutoff, min_cost + beam);
-}
+        // TODO do something better 
+        if(q_size >= q_capacity/2) 
+            beam /= 2;
 
-    __forceinline__ __device__ int32 binsearch_maxle(const int32 *vec, const int32 val, int32 low, int32 high) {
+        return fmin(current_cutoff, min_cost_in_block + beam);
+    }
+
+    __device__ __forceinline__ int32 binsearch_maxle(const int32 *vec, const int32 val, int32 low, int32 high) {
         while(true) {
             if(low == high)
                 return low; //we know it exists
@@ -745,13 +786,61 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
     }
 
 
-    void __global__ _expand_arcs_kernel(ExpandArcParams params) {
-        typedef cub::BlockScan<CostTInt, KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX> BlockScan;
+    //
+    // ExpandArc kernel
+    // This kernel does the actual work of traversing arcs 
+    //
+    // Pseudo code :
+    // for all token tok in main_q[main_q_offset...end]:
+    //      u = tok.next_state
+    //      for all arc a(u->v) in the FST:
+    //          v_cost = tok.cost + a.cost + accoustic_cost
+    // 
+    //          if v_cost < cutoff and v_cost < best_state_cost[v]
+    //              generate token associated to v, add to aux_q
+    //              update best_state_cost[v]
+    //              if necessary update cutoff
+    //
+    // For more information please refer to http://kaldi-asr.org/doc/decoders.html
+    //
+    // ExpandArc rely on some preprocessed data to be able to function 
+    // for instance, it needs the prefix sum of the arc degree of all token.state in the
+    // main_q
+    // We need to call a Preprocess kernel before ExpandArc
+    //
+    // ExpandArc is used for both emitting and nonemitting phases
+    // Differences between emitting and nonemitting :
+    //      1) params.d_q_arc_offset contains offsets to either emitting or nonemitting arcs. 
+    //         It is transparent for this kernel. The differentiation was done in the Preprocess kernel,
+    //         which is responsible for filling the params.d_q_arc_offset array
+    //      2) Computation of the acoustic cost. If nonemitting, it is equal to 0. If emitting, we need
+    //         to use values from the acoustic model (through the d_loglikelihoods array)
+    //
+    //
+    //
+    // Note : ExpandArc is not the only kernel able to traverse arcs. 
+    // NonEmittingLongTail contains a simplified version of expand for only one CUDA block
+    //
 
+    void __global__ _expand_arcs_kernel(ExpandArcParams params) {
+
+        // BlockScan that we will use to compute token indexes in the output queue, 
+        // and to find the min cost in the block
+        typedef cub::BlockScan<CostTypeAndInt, KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage temp_storage_scan;
 
-        __shared__ int32 to_q_block_offset;
-        __shared__ CostType blk_cutoff;
+        // This kernel writes the new token to the output queue aux_q
+        // We will request a spot to store all the new tokens created by threads in this CUDA block
+        // aux_q_index_block_offset indicates where to store them in the aux_q
+        // tokens created in this CUDA block will be store in :
+        // aux_q[aux_q_index_block_offset], aux_q[aux_q_index_block_offset + 1], ...
+        __shared__ int32 aux_q_index_block_offset;
+
+        //
+        // Cutoff, stored in shared for caching purposes
+        // TODO rely on cache ?
+        //
+        __shared__ CostType cached_cutoff;
 
         const int32 total_narcs = *params.d_main_q_narcs;
         const int32 main_q_offset = *params.d_main_q_local_offset;
@@ -759,153 +848,277 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
         
         if(threadIdx.x == 0) {
-            blk_cutoff = *params.d_cutoff;
+            cached_cutoff = *params.d_cutoff;
         }
 
         __syncthreads();
 
-        // Keeping the whole CTA alive, we'll have syncs
-        for(int32 block_offset = blockDim.x*blockIdx.x;
-                block_offset < total_narcs;
-                block_offset += gridDim.x*blockDim.x) {
+        // The condition of this for loop is common for all threads in the block
+        // We need to keep all threads in the block alive in the same time
+        // We'll have syncs inside the for loop, and we need to have all threads alive during
+        // those syncs
+        // in the future we may rely on coop groups
+        for(int32 main_q_arc_index_block_offset = blockDim.x*blockIdx.x;
+                  main_q_arc_index_block_offset < total_narcs;
+                  main_q_arc_index_block_offset += gridDim.x*blockDim.x) {
 
-            int32 th_idx = block_offset + threadIdx.x;
-            bool valid_input = (th_idx < total_narcs);
+            //
+            // Important : this thread is not responsible for a token in the input queue main_q
+            // but for an arc, going out of a token in the main_q
+            // The main_q contains in total total_narcs
+            // and this thread will compute the main_q_arc_index-th arc of the main_q
+            // For instance, first thread in the grid with threadIdx.x == 0 and blockIdx.x == 0 
+            // will process the first arc of the token in main_q[main_q_offset + 0] 
+            // (if that token has at least one arc)
+            //
+            // This insure a perfect one thread = one arc load balancing
+            // but we have work to do to know exactly which arc is the main_q_arc_index-th arc
+            // (what's its source ? its destination ? its arc_idx the FST CSR ?)
+            //
 
-            BaseFloat total_cost = FLT_MAX;
+            int32 main_q_arc_index = main_q_arc_index_block_offset + threadIdx.x;
+
+            // We'll need those variables later in the kernel
+            // we declare them outside of the "valid_input" scope
+            // to be able to access them later
+
+            int32 main_q_idx;
             int32 arc_idx;
             StateId arc_next_state;
-            int32 main_q_idx;
+            BaseFloat total_cost = FLT_MAX;
 
-            if(valid_input) {
-                //we can do better than that
-                main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, th_idx, main_q_offset, main_q_end-1); 
+            if(main_q_arc_index < total_narcs) {
+
+                //
+                // Current thread must take care of main_q_arc_index-th arc
+                // we need to now what's the source of that arc
+                // ie which token.state in main_q does it start from ? 
+                // We use a binary search in the prefix sum of the token's degree to get that information
+                // 
+                // Example : main_q contains 3 tokens
+                // - First token is associated to a state which has 3 outgoing arc
+                // - Second token is associated to a state which has 0 outgoing arc
+                // - Third token is associated to a state which has 2 outgoing arc
+                //
+                // We store the degrees in an array :
+                // [3, 0, 2]
+                //
+                // We then compute the exclusive prefix sum of that array :
+                // [0, 3, 3, 5]
+                //
+                // In total, we have 5 arcs in the main_q. ExpandArc will use 5 threads.
+                //
+                // Let's say we are the fifth thread in ExpandArc. 
+                // we have threadIdx.x == 4, and blockIdx.x == 0
+                // it gives us main_q_arc_index == 4
+                // From there we have no idea what we're supposed to do next, we need to have information about the
+                // arc that we're supposed to traverse
+                //
+                // To do that, we look for the maximum index maxle_i in the prefix sum array such prefix_sum[i] <= 4
+                //
+                // [0, 3, 3, 5]
+                //         /\
+                //         here
+                // maxle_i = 2
+                // it means that our source token is at index 2 in the main_q
+                // and we are computing the arc at index (main_q_arc_index - prefix_sum[maxle_i]) of that token 
+                // ie the arc at index (4-3) = 1, the second arc of the second token in main_q
+                //
+
+                main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, main_q_offset, main_q_end-1); 
 
                 int32 lower_bound = params.d_main_q_degrees_prefix_sum[main_q_idx];
                 int32 arc_offset_start = params.d_q_arc_offsets[main_q_idx];
 
-                arc_idx = arc_offset_start + (block_offset + threadIdx.x - lower_bound);
+                arc_idx = arc_offset_start + (main_q_arc_index - lower_bound);
                 arc_next_state = params.arc_nextstates[arc_idx];
 
+                // Building the total cost incrementally 
+                // we'll add the acoustic cost and the old token's cost
                 total_cost = params.arc_weights[arc_idx];
 
                 int32 arc_ilabel = params.is_emitting ? params.arc_ilabels[arc_idx] : 0;
                 total_cost += (arc_ilabel != 0) ? -params.d_loglikelihoods[arc_ilabel] : 0.0; 
                 total_cost += params.d_main_q_cost[main_q_idx];
 
-                if(total_cost >= blk_cutoff)
-                    valid_input = false;
+                // If the total_cost is too large compared to our cutoff (beam search)
+                // then let's drop it
+                if(total_cost >= cached_cutoff)
+                    total_cost = FLT_MAX;
                 else {
-                    // switch back to red, worst case is bad
-                    BaseFloat next_state_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
+                    // We need to check if we already have a token going to that next_state,
+                    // and if that token has a lower cost that we have
+                    // params.d_lookup[state] contains the best cost for that state in the current frame
+                    BaseFloat next_state_best_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
 
-                    if(total_cost >= next_state_cost)
-                        valid_input = false;
+                    // If that token is the best for that state, drop it
+                    if(total_cost >= next_state_best_cost)
+                        total_cost = FLT_MAX;
                 }
             }
 
-                            int32 has_successor = valid_input ? 1 : 0;  // Need a spot in the new q
-                            CostTInt ci;
-                            ci.cost = valid_input ? total_cost : FLT_MAX; 
-                            ci.i = has_successor;
+            //
+            // If total_cost < FLT_MAX, it means that : 
+            // - this thread had a valid input (main_q_arc_index < total_narcs)
+            // - the total_cost of the generated token is < cutoff
+            // - the generated token is the best candidate for that next_state
+            // We will then add that new token in the output queue, aux_q
+            // We need to know where to put that token in the aux_q
+            // we'll first compute its index inside the CUDA block
+            // the first valid output token in the CUDA block will have index 0, 
+            // the second index 1... We compute that using a prefix sum
+            //
+            // We also need to find the overall min cost in the CUDA block
+            // a prefix sum is a scan operation, and a min a reduce operation
+            // we can perform a reduce operation using a scan (using the last value)
+            // we compute the prefix sum and the min in one scan, using the data 
+            // struct CostTypeAndInt
+            //
 
-                            BlockScan(temp_storage_scan).InclusiveScan(ci, ci, CISum());
+            int32 has_successor = (total_cost < FLT_MAX) ? 1 : 0; 
 
-                            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
-                                int32 total_successors_in_block = ci.i;
-                                to_q_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
-                                if((to_q_block_offset + total_successors_in_block) >= params.q_capacity) {
-                                    to_q_block_offset = params.q_capacity; // used to broadcast the info
+            CostTypeAndInt cost_and_index;
+            cost_and_index.cost = total_cost; 
+            cost_and_index.i = has_successor;
 
-                                }
-                                /*
-                                
-                                GetCutoffCandidate takes int32o account the current value of 
-                                d_aux_q_end and compares it with its maximum capacity.
-                                If necessary it progressively cuts down the beam 
-                                (reducing the cutoff) to only keep the best candidates
-                                and avoiding an overflow
+            // This is an /inclusive/ scan
+            BlockScan(temp_storage_scan).InclusiveScan(cost_and_index, cost_and_index, MinCostPlusInt());
 
-                                */
-                                CostType cutoff_candidate = GetCutoffCandidate(blk_cutoff,
-                                                                  ci.cost,
-                                                                  params.beam,
-                                                                  to_q_block_offset + total_successors_in_block,
-                                                                  params.q_capacity);
+            if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
+                // This is the last thread. The last value of the inclusive scan is the total
+                int32 total_successors_in_block = cost_and_index.i;
+                
+                // Requesting a spot of size total_successors_in_block in the aux_q
+                aux_q_index_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
 
-                                blk_cutoff = (cutoff_candidate < blk_cutoff) 
-                                             ? fmin(fatomicMin(params.d_cutoff, cutoff_candidate), cutoff_candidate)
-                                             : fmin(*params.d_cutoff, blk_cutoff);
-                            }
+                //
+                // Here we detect an overflow of the aux_q
+                // we detect it before actually using the aux_q
+                // We try to prevent an overflow from happening using an adaptive beam (cf GetCutoffCandidate)
+                //
+                if((aux_q_index_block_offset + total_successors_in_block) >= params.q_capacity) {
+                    // aux_q_index_block_offset is in shared memory
+                    // its value is currently invalid (overflow)
+                    // we set it to a special value and use it as a flag to broadcast
+                    // the fact that we have an overflow and that all threads should exit
+                    aux_q_index_block_offset = params.q_capacity;
 
-                            __syncthreads(); // to_q_block_offset
+                    // We revert the last operation. All threads that detected the overflow 
+                    // will revert what they've done. It means that at the end of the kernel,
+                    // we'll be back to the last valid state 
+                    // We'll be able to continue computation, but quality of the output
+                    // may be lower (we weren't able to save all tokens)
+                    atomicAdd(params.d_aux_q_end, -total_successors_in_block); 
+
+                    // Setting the flag for the host. It will be used to print a warning to stderr
+                    *params.h_q_overflow = 1; 
+                } else {
+
+                    /*
+
+                       GetCutoffCandidate takes into account the current value of 
+                       d_aux_q_end and compares it with its maximum capacity.
+                       If necessary it progressively cuts down the beam 
+                       (reducing the cutoff) to only keep the best candidates
+                       and avoiding an overflow
+
+                     */
+
+                    CostType cutoff_candidate = GetCutoffCandidate(cached_cutoff,
+                            cost_and_index.cost,
+                            params.beam,
+                            aux_q_index_block_offset + total_successors_in_block,
+                            params.q_capacity);
+
+                    cached_cutoff = (cutoff_candidate < cached_cutoff) 
+                        ? fmin(fatomicMin(params.d_cutoff, cutoff_candidate), cutoff_candidate)
+                        : fmin(*params.d_cutoff, cached_cutoff);
+                }
+            }
+
+            // Sync'ing for two reasons :
+            // - Broadcasting aux_q_index_block_offset
+            // - reusing temp_storage (cf CUB's doc)
+            __syncthreads(); 
 
 
-                            // aux_q is full. UpdateCutoff should prevent this from happening
-                            if(to_q_block_offset == params.q_capacity) {
-                                if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
-                                    // Revert
-                                    int32 total_successors_in_block = ci.i;
-                                    atomicAdd(params.d_aux_q_end, -total_successors_in_block); 
-                                    *params.h_q_overflow = 1; 
-                                }
+            // The only case where we can have that condition met,
+            // if we detected an overflow if the previous lines
+            // we need to finalize our work and quit 
+            if(aux_q_index_block_offset == params.q_capacity) 
+                goto finalize_kernel; // keeping things clean before aborting
 
-                                goto finalize_kernel; // keeping things clean before aborting
-                            }
+            //
+            // If we're executing the following lines it means everything
+            // is valid and we are not overflowing the aux_q
+            //
 
-                            ci.i -= has_successor; // we want the exclusive sum now
-                            int32 to_q_index = to_q_block_offset + ci.i;
+            cost_and_index.i -= has_successor; // we want the exclusive sum now
 
-                            if(has_successor) {
-                                params.d_aux_q_cost[to_q_index] = total_cost;
-                                params.d_aux_q_state[to_q_index] = arc_next_state;
-                                
-                                atomicMin(&params.d_lookup[arc_next_state],
-                                floatToOrderedInt(total_cost)
-                                );
+            int32 aux_q_block_index = cost_and_index.i;
+            int32 aux_q_index = aux_q_index_block_offset + aux_q_block_index;
 
-                                //print32f("cost = %f, cutoff = %f, beam=%f \n", total_cost, blk_cutoff, params.beam);
-                                if(total_cost < blk_cutoff) { // cutoff may have changed
-                                    // We write the rest of the token only if necessary
-                                    // if the cost is higher than cutoff, 
-                                    // the token will be ignored anyway 
+            if(has_successor) {
+                // We save the new token to the aux_q
+                
+                params.d_aux_q_cost[aux_q_index] = total_cost;
+                params.d_aux_q_state[aux_q_index] = arc_next_state;
+                
+                // Updating the best_state_cost lookup table with our new best cost
+                atomicMin(&params.d_lookup[arc_next_state],
+                        floatToOrderedInt(total_cost)
+                        );
 
+                // We've updated the cached_cutoff since created the new token
+                // there's a chance that we no longer need to use that token
+                // we've saved the cost and the state to be able to ignore it in the following prune operation
+                // but there's no need to write out the infos
 
-                                    InfoToken new_tok_info;
-                                    new_tok_info.prev_token = params.main_q_global_offset + main_q_idx;
-                                    new_tok_info.arc_idx = arc_idx;
-                            
+                if(total_cost < cached_cutoff) { 
+                    InfoToken new_tok_info;
+                    // Index of the parent token
+                    // the parent is the token used as input 
+                    // that parent is at index main_q_idx in the GPU memory
+                    // However, the main_q is emptied before processing a new frame
+                    // we need to add the offset related to the previous frames index
+                    // we add params.main_q_global_offset
+                    new_tok_info.prev_token = params.main_q_global_offset + main_q_idx;
+                    new_tok_info.arc_idx = arc_idx;
 
-                                    params.d_aux_q_info[to_q_index] = new_tok_info;
-
-                                    /*
-                                    print32f("expand, adding %i (%i)  -> %i \n", new_tok_info.prev_token,
-                                    params.main_q_global_offset, arc_next_state);
-                                    */
-                                }
-                            }
+                    params.d_aux_q_info[aux_q_index] = new_tok_info;
+                }
+            }
         }
 
         finalize_kernel:
 
-        __syncthreads(); // avoiding races on d_main_q_narcs for instance
+        // We want to be sure that all threads are done before declaring this CUDA block as done
+        __syncthreads(); 
 
-        // Last block alive sets h_aux_q_end_ (pinned memory)
         if(threadIdx.x == 0) {
+            // Declaring this CTA as done
             int32 old = atomicAdd(params.d_n_CTA_done, 1);
+
+            // If we're the last CTA to exit - detect it
             if(old == (gridDim.x -1)) {
                 __threadfence(); // we want last value of d_aux_q_end
+
+                // h_* pointers are in pinned memory, we can update them from the GPU
                 *params.h_aux_q_end = *params.d_aux_q_end;
-                *params.d_n_CTA_done = 0;
                 *params.d_main_q_narcs = 0;
                 *params.h_main_q_narcs = 0;
+                *params.d_n_CTA_done = 0; 
 
                 if(params.is_emitting) {
                     *params.d_main_q_local_offset = 0; // not needed
                     *params.h_main_q_local_offset = 0; // not needed
+
+                    // It was the last time that we were using tokens in the main_q
+                    // flushing it now
                     *params.d_main_q_end = 0;
                     *params.h_main_q_end = 0;
                 } else {
+                    // Tokens processed in that nonemitting iteration will be ignored in the next iteration
                     *params.d_main_q_local_offset = main_q_end;
                     *params.h_main_q_local_offset = main_q_end;
                 }
@@ -920,9 +1133,9 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
         block.x = 256;
         grid.x = DIV_ROUND_UP(nthreads, block.x);
 
-        // It's possible to have zero threads and still be valid
-        if(grid.x > 0)
-            _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
+        KALDI_ASSERT(grid.x > 0);
+
+        _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
     }
 
 
@@ -1054,12 +1267,12 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                 // Step 3 : expand arcs
 
-                for(int32 block_offset = 0;
-                        block_offset < total_narcs;
-                        block_offset += blockDim.x) {
+                for(int32 main_q_arc_index_block_offset = 0;
+                        main_q_arc_index_block_offset < total_narcs;
+                        main_q_arc_index_block_offset += blockDim.x) {
 
-                    int32 th_idx = block_offset + threadIdx.x;
-                    bool valid_input = (th_idx < total_narcs);
+                    int32 main_q_arc_index = main_q_arc_index_block_offset + threadIdx.x;
+                    bool valid_input = (main_q_arc_index < total_narcs);
 
                     BaseFloat total_cost = FLT_MAX;
                     int32 arc_idx;
@@ -1068,12 +1281,12 @@ __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
 
                     if(valid_input) {
                         //we can do better than that
-                        q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, th_idx, old_q_offset, new_q_offset-1); 
+                        q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, old_q_offset, new_q_offset-1); 
 
                         int32 lower_bound = params.d_main_q_degrees_prefix_sum[q_idx];
                         int32 arc_offset_start = params.d_q_arc_offsets[q_idx];
 
-                        arc_idx = arc_offset_start + (th_idx - lower_bound);
+                        arc_idx = arc_offset_start + (main_q_arc_index - lower_bound);
 
                         arc_next_state = params.arc_nextstates[arc_idx];
                         BaseFloat arc_weight = params.arc_weights[arc_idx];
