@@ -78,11 +78,10 @@ namespace kaldi {
     };
 
     // FIXME move back to cuda-decoder.cu
-    struct InfoToken { // we needed to take StateId out
+    struct InfoToken {
         int prev_token;
         int arc_idx;
     };
-
 
     class TokenVector {
         size_t capacity, size;

@@ -1139,11 +1139,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    // Wrote for single CTA
 
     /*
-
-       Persistent kernel
+        
+       NonEmittingLongTail
+       Meta-kernel (merging preprocess and expand) but only works with 1 CUDA block
 
        Used to avoid calling multiple "heavy lifting" kernels for the tail of non emitting
        (lots of iterations with small number of arcs)
@@ -1151,20 +1151,27 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
        Code is greatly simplified because we can have only one CTA alive
 
        Repeat until new queue empty:
-       1) Computes degrees (cf ComputeDegrees) 
-       2) Compute scan
-       3) Expand arcs
+       1) Preprocess 
+       2) Expand arcs
 
-       1 and 2 are not done on the first iteration, because it's already done
-       (by corresponding kernels)
+       The preprocess stage is not done on the first iteration, because it was
+       already done by the ProcessAndContract kernel. We always call ProcessAndContract
+       before calling NonEmittingLongTail 
 
        At the end, this kernel finalize the computation for current frame,
        so that it's ready for next ProcessEmitting
 
-       We could optimize and speed up this kernel
-       It will only gives us a better latency for 1 stream, which is low enough
-       Instead, we let it compute while we use the GPU for other streams
-       This kernel only uses one block
+       TODO This kernel could be easily optimized  
+
+       Note : For a detailed description on how the Preprocess and Expand operation work,
+       please refer to the PreprocessInPlace and ExpandArc kernel implemention. The algorithm are 
+       described there. In this kernel, we compute simplified version of preprocess and expand, because
+       we do not need inter-block communication (we launch only one CUDA block)
+
+       Important : in ExpandArc, the input is the main_q, the ouput is the aux_q. We then call PreprocessAndContract
+       that move the tokens from the aux_q to the main_q.
+       Here we directly output the tokens in the main_q. It helps use simplify the code, and we are not generating a lot
+       of tokens anyway (so the pruning stage of PreprocessAndContract is less critical)
 
      */
 
@@ -1172,58 +1179,79 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     __launch_bounds__(KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX, 1)
         __global__ void _process_nonem_longtail(const uint32_t *d_arc_offsets, 
                 ExpandArcParams params) {
-
-            typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockScan;
+            
+            // Used to find the minimum cost in the CUDA block
             typedef cub::BlockReduce<float, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockReduce;
-
-            __shared__ typename BlockScan::TempStorage temp_storage_scan;
             __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
 
+            // Used to compute the index in the output queue
+            typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockScan;
+            __shared__ typename BlockScan::TempStorage temp_storage_scan;
+
+            // Cutoff for the beam search. 
+            // during the execution of the kernel, it will not be necessary to update params.d_cutoff
+            // (from the global memory). We're the only CUDA block executing 
             __shared__ BaseFloat cutoff;
 
+            //
+            // main_q is both input and output
+            // We are using offsets to differenciate the two subqueue
+            //
+            // main_q [0 .... input_q_offset ...... output_q_offset ...... output_q_end]
+            //                                 /\                     /\ 
+            //                            Input queue            Output queue
+            //
+            // At the beginning of the iteration, output_q_offset == output_q_end
+            // we then fill the output queue and increment output_q_end
+            //
 
-            int32 old_q_offset = *params.d_main_q_local_offset;
-            int32 new_q_offset = *params.d_main_q_end;
-            int32 new_q_end = new_q_offset;
+            int32 input_q_offset = *params.d_main_q_local_offset;
+            int32 output_q_offset = *params.d_main_q_end;
+            
+            int32 output_q_end = output_q_offset;
 
             int32 total_narcs = *params.d_main_q_narcs;
     
-            int32 old_q_size = new_q_offset - old_q_offset;  // move to end
+            int32 input_q_size = output_q_offset - input_q_offset;  
 
             cutoff = *params.d_cutoff;
 
             // We'll switch queue at the beg of the loop
-            // Cleaner that way - we need the offsets ready for
-            // the global updates at the very end of this kernel
-            new_q_offset = old_q_offset;
+            output_q_offset = input_q_offset;
 
             bool first = true;
 
-            while(old_q_size > 0) {
-                // Step 0 : move queues        
-                old_q_offset = new_q_offset;
-                new_q_offset = new_q_end;
+            while(input_q_size > 0) {
 
+                // cutoff ready
+                __syncthreads(); 
+                
+                // Step 0 : move queues        
+                input_q_offset = output_q_offset;
+                output_q_offset = output_q_end;
+
+                // Used to clarify the code
+                int32 input_q_end = output_q_offset;
+                
                 if(!first) {
-                    __syncthreads(); // old_q_ready
                     total_narcs = 0;
 
                     // Step 1 : compute_degrees
                     // TODO fuse 1 and 2
-                    for(int32 q_idx = old_q_offset + threadIdx.x;
-                            q_idx < new_q_offset; // = old_q_end
-                            q_idx += blockDim.x) {
+                    for(int32 q_idx = input_q_offset + threadIdx.x;
+                              q_idx < input_q_end;
+                              q_idx += blockDim.x) {
 
-                        StateId state = params.d_main_q_state[q_idx];
-                        BaseFloat cost = params.d_main_q_cost[q_idx];
+                        StateId token_state = params.d_main_q_state[q_idx];
+                        BaseFloat token_cost = params.d_main_q_cost[q_idx];
 
                         int32 degree = 0;
-                        if(cost < cutoff) {
-                            BaseFloat best_cost = orderedIntToFloat(params.d_lookup[state]);
+                        if(token_cost < cutoff) {
+                            BaseFloat best_cost = orderedIntToFloat(params.d_lookup[token_state]);
 
-                            if(cost == best_cost) {
-                                int32 start = d_arc_offsets[state];
-                                int32 end = d_arc_offsets[state+1];
+                            if(token_cost == best_cost) {
+                                int32 start = d_arc_offsets[token_state];
+                                int32 end = d_arc_offsets[token_state+1];
                                 degree = end - start;
                                 params.d_q_arc_offsets[q_idx] = start;
                             }
@@ -1237,21 +1265,22 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     // Step 2 : Scan
 
                     for(int32 block_off = 0;
-                            block_off < old_q_size;
-                            block_off += blockDim.x) {
+                              block_off < input_q_size;
+                              block_off += blockDim.x) {
 
-                        int32 q_idx = old_q_offset + block_off + threadIdx.x;
+                        int32 q_idx = input_q_offset + block_off + threadIdx.x;
 
-                        int32 degree = (q_idx < new_q_offset) 
+                        int32 degree = (q_idx < output_q_offset) 
                             ? params.d_main_q_degrees_prefix_sum[q_idx]
                             : 0;
-                        int32 lscan;
-                        int32 total_in_blk;
-                        BlockScan(temp_storage_scan).ExclusiveSum(degree, lscan, total_in_blk);
-                        int32 scan = lscan + total_narcs;
-                        total_narcs += total_in_blk;
 
-                        if(q_idx < new_q_offset)
+                        int32 degree_prefix_sum;
+                        int32 degree_sum_for_this_iteration;
+                        BlockScan(temp_storage_scan).ExclusiveSum(degree, degree_prefix_sum, degree_sum_for_this_iteration);
+                        int32 scan = degree_prefix_sum + total_narcs;
+                        total_narcs += degree_sum_for_this_iteration;
+
+                        if(q_idx < output_q_offset)
                             params.d_main_q_degrees_prefix_sum[q_idx] = scan;
 
                          __syncthreads(); // reusing temp_storage_scan + degrees ready
@@ -1274,6 +1303,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     int32 main_q_arc_index = main_q_arc_index_block_offset + threadIdx.x;
                     bool valid_input = (main_q_arc_index < total_narcs);
 
+                    // For details on how this code works, please refer to ExpandArc's comments
+
+
                     BaseFloat total_cost = FLT_MAX;
                     int32 arc_idx;
                     StateId arc_next_state;
@@ -1281,7 +1313,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                     if(valid_input) {
                         //we can do better than that
-                        q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, old_q_offset, new_q_offset-1); 
+                        q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, input_q_offset, output_q_offset-1); 
 
                         int32 lower_bound = params.d_main_q_degrees_prefix_sum[q_idx];
                         int32 arc_offset_start = params.d_q_arc_offsets[q_idx];
@@ -1307,7 +1339,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         cutoff = GetCutoffCandidate(cutoff,
                                 min_cost,
                                 params.beam,
-                                new_q_end,
+                                output_q_end,
                                 params.q_capacity);
                     }
 
@@ -1322,14 +1354,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     int32 total_in_blk;
                     BlockScan(temp_storage_scan).ExclusiveSum(new_q_idx_block, new_q_idx_block, total_in_blk);
 
-                    if((new_q_end + total_in_blk) >= params.q_capacity) {
+                    if((output_q_end + total_in_blk) >= params.q_capacity) {
                         *params.h_q_overflow = 1;
                         
                         goto finalize_kernel; // keeping things clean before aborting
                     }
 
                     if(has_successor) {
-                        int32 new_q_index = new_q_end + new_q_idx_block;
+                        int32 new_q_index = output_q_end + new_q_idx_block;
                         params.d_main_q_state[new_q_index] = arc_next_state;
 
                         params.d_main_q_cost[new_q_index] = total_cost;
@@ -1340,24 +1372,24 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         new_tok_info.arc_idx = arc_idx;
                         params.d_main_q_info[new_q_index] = new_tok_info;
                         
-                        //print32f("new q index = %i (%i+%i) (tot=%i) \n", new_q_index, new_q_end, new_q_idx_block,
+                        //print32f("new q index = %i (%i+%i) (tot=%i) \n", new_q_index, output_q_end, new_q_idx_block,
                         //total_in_blk);
                    }
 
-                    new_q_end += total_in_blk;
+                    output_q_end += total_in_blk;
                 }
 
-                old_q_size = new_q_end - new_q_offset; 
+                input_q_size = output_q_end - output_q_offset; 
             }
 
             finalize_kernel:
 
             if(threadIdx.x == 0) {
                 // Next step is ProcessEmitting of next frame, from is currToken_offset
-                *params.d_main_q_end = new_q_end; 
+                *params.d_main_q_end = output_q_end; 
                 *params.d_main_q_narcs = 0;
 
-                *params.h_main_q_end = new_q_end; 
+                *params.h_main_q_end = output_q_end; 
                 *params.h_main_q_narcs = 0; 
 
                 *params.d_main_q_local_offset = 0; 
