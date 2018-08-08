@@ -61,40 +61,50 @@ namespace kaldi {
             //Offset arrays are numStates+1 in size. 
             //Arc values for state i are stored in the range of [i,i+1)
             //size numStates+1
-            unsigned int *e_offsets_h,*e_offsets_d;               //Emitting offset arrays 
-            unsigned int *ne_offsets_h, *ne_offsets_d;            //Non-emitting offset arrays
+            unsigned int *h_e_offsets,*d_e_offsets;               //Emitting offset arrays 
+            unsigned int *h_ne_offsets, *d_ne_offsets;            //Non-emitting offset arrays
 
             //These are the values for each arc. Arcs belonging to state i are found in the range of [offsets[i], offsets[i+1]) 
             //non-zeros (Size arc_count+1)
-            BaseFloat *arc_weights_h, *arc_weights_d;
-            StateId *arc_nextstates_h, *arc_nextstates_d;
-            int32 *arc_ilabels_h, *arc_ilabels_d;
-            int32 *arc_olabels_h;
+            BaseFloat *h_arc_weights, *d_arc_weights;
+            StateId *h_arc_nextstates, *d_arc_nextstates;
+            int32 *h_arc_ilabels, *d_arc_ilabels;
+            int32 *h_arc_olabels;
 
             //final costs
-            float *final_h;
+            float *h_final;
             //allocation size
             size_t bytes_cudaMalloc;
     };
 
-    // FIXME move back to cuda-decoder.cu
+    // InfoToken contains data that needs to be saved for the backtrack
+    // in GetBestPath
+    // It will be moved back to CPU memory using a InfoTokenVector
     struct InfoToken {
         int prev_token;
         int arc_idx;
     };
 
-    class TokenVector {
-        size_t capacity, size;
-        cudaStream_t copy_st;
-        InfoToken *h_data;
+    //
+    // InfoTokenVector
+    // Vector for InfoToken that uses CPU pinned memory
+    // We use it to transfer the relevant parts of the tokens
+    // back to the CPU memory
+    //
+    class InfoTokenVector {
+        size_t capacity_, size_;
+        // Stream used for the async copies device->host
+        cudaStream_t copy_st_;
+        InfoToken *h_data_;
+
         public:
-        TokenVector();
+        InfoTokenVector(int initial_capacity, cudaStream_t st);
         void Reset();
         void SetCudaStream(cudaStream_t st);
         void CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count);    
         void Reserve(size_t min_capacity);    
         InfoToken *GetRawPointer() const;
-        virtual ~TokenVector();
+        virtual ~InfoTokenVector();
     };
 
 } // end namespace kaldi

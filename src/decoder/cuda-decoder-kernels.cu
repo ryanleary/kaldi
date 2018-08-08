@@ -103,23 +103,23 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        _init_state_cost_lookup_kernel<<<grid,block>>>(nstates, d_state_cost_);
+        _init_state_cost_lookup_kernel<<<grid,block>>>(nstates, d_state_best_cost_);
     }
 
     // Used to reset lookup table between frames
     // Using the queue to reset only the values needed
     // Also takes care of resetting cutoff
-    __global__ void _reset_state_cost_lookup_kernel(const StateId *d_main_q_state_, const int32 *d_main_q_end_, int32 *d_state_cost, CostType *d_cutoff) {
+    __global__ void _reset_state_cost_lookup_kernel(const StateId *d_main_q_state_, const int32 *d_main_q_end_, int32 *d_state_best_cost, CostType *d_cutoff) {
         int32 main_q_end = *d_main_q_end_; 
 
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
                 idx < main_q_end;
                 idx += blockDim.x*gridDim.x) {
             // d_main_q_state_ contains the list of states that we've considered in the last frame
-            // it corresponds to the list of indexes i such as d_state_cost[i] < +INF
+            // it corresponds to the list of indexes i such as d_state_best_cost[i] < +INF
             // faster than init_state_cost_lookup_kernel by a factor of ~10
             StateId state = d_main_q_state_[idx];
-            d_state_cost[state]  = floatToOrderedInt(FLT_MAX);
+            d_state_best_cost[state]  = floatToOrderedInt(FLT_MAX);
         }
 
         if(blockIdx.x == 0 && threadIdx.x == 0)
@@ -135,7 +135,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(size, block.x);
 
-        _reset_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_cost_, d_cutoff);
+        _reset_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_best_cost_, d_cutoff);
     }
 
 
@@ -238,7 +238,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 // Best cost for that token_state
                 // We know we have a token associated with token_state in the queue with the cost state_best_cost
-                BaseFloat state_best_cost = orderedIntToFloat(params.d_state_cost[token_state]);
+                BaseFloat state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
 
                 // Cutoff may have decreased since the creation of the token
                 if(token_cost < cutoff) {
@@ -252,14 +252,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     }
                 }
 
-                // the d_state_cost lookup table is reset to +INF for all states between frame
+                // the d_state_best_cost lookup table is reset to +INF for all states between frame
                 // for perf. reason we only reset states that are in d_main_q_state
                 // however if state_best_cost >= cutoff, all tokens associated with token_state 
                 // will be pruned, and that state will not be in d_main_q_state
                 // we need to reset the lookup table now
 
                 if (state_best_cost >= cutoff)
-                    params.d_state_cost[token_state] = floatToOrderedInt(FLT_MAX);
+                    params.d_state_best_cost[token_state] = floatToOrderedInt(FLT_MAX);
 
             }
 
@@ -477,7 +477,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                     // Best cost for that token_state
                     // We know we have a token associated with token_state in the queue with the cost state_best_cost
-                    BaseFloat state_best_cost = orderedIntToFloat(params.d_state_cost[token_state]); 
+                    BaseFloat state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]); 
                     
                     // We can have duplicates, ie token associated with the same states
                     // If this token is not the best candidate, get rid of it
@@ -512,7 +512,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 int local_sum_index = block_offset/KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
                 int local_sum = degree_local_prefix_sum + degree; // the prefix sum was exclusive, adding missing value
-                params.d_main_q_degrees_block_prefix_sum[local_sum_index] = local_sum; 
+                params.d_main_q_degrees_block_sums_prefix_sum[local_sum_index] = local_sum; 
             }
 
 
@@ -547,10 +547,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // Our goal here is to compute the prefix sum of the previous local sums
             // What we call local sum is what contains the local_sum variables in the previous lines
             // it is the sum of degrees inside a given CUDA block, at a given for loop iteration
-            // all local sums are stored in params.d_main_q_degrees_block_prefix_sum
+            // all local sums are stored in params.d_main_q_degrees_block_sums_prefix_sum
             // we want to do the prefix sum of that array
             //
-            // Once this is done, params.d_main_q_degrees_block_prefix_sum[i] will contain the 
+            // Once this is done, params.d_main_q_degrees_block_sums_prefix_sum[i] will contain the 
             // offset that we need to add to the local prefix sum #i to convert it to a global
             // prefix sum
             // Right now we are only computing the offsets ; adding them to the local prefix sums will be 
@@ -559,7 +559,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             //
             // We are the last CTA alive
-            // which means that all local sums have been written to params.d_main_q_degrees_block_prefix_sum
+            // which means that all local sums have been written to params.d_main_q_degrees_block_sums_prefix_sum
             // We can now do the prefix sum of that array   
             //
 
@@ -590,7 +590,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 int32 local_sum_index = local_sum_index_offset + threadIdx.x; 
 
                 int32 local_sum = (local_sum_index < number_of_local_sums) 
-                                ? params.d_main_q_degrees_block_prefix_sum[local_sum_index] 
+                                ? params.d_main_q_degrees_block_sums_prefix_sum[local_sum_index] 
                                 : 0; // neutral element
 
                 int32 prefix_sum_of_local_sums, total_sum_of_local_sums_for_this_iteration;
@@ -601,7 +601,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 prefix_sum_of_local_sums_offset += total_sum_of_local_sums_for_this_iteration;
 
                 if(local_sum_index < number_of_local_sums) {
-                    params.d_main_q_degrees_block_prefix_sum[local_sum_index] = prefix_sum_of_local_sums;
+                    params.d_main_q_degrees_block_sums_prefix_sum[local_sum_index] = prefix_sum_of_local_sums;
                 }
 
                 // Sync'ing to be able to reuse temp_storage (cf CUB's doc)
@@ -696,7 +696,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // If the main_q is empty, we will not be able to continue
         KALDI_ASSERT(grid.x > 0);
 
-        _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_block_prefix_sum_, 
+        _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_block_sums_prefix_sum_, 
                                                             d_main_q_local_offset_,
                                                             d_main_q_end_, 
                                                             d_main_q_degrees_prefix_sum_);
@@ -948,8 +948,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 else {
                     // We need to check if we already have a token going to that next_state,
                     // and if that token has a lower cost that we have
-                    // params.d_lookup[state] contains the best cost for that state in the current frame
-                    BaseFloat next_state_best_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
+                    // params.d_state_best_cost[state] contains the best cost for that state in the current frame
+                    BaseFloat next_state_best_cost = orderedIntToFloat(params.d_state_best_cost[arc_next_state]);
 
                     // If that token is the best for that state, drop it
                     if(total_cost >= next_state_best_cost)
@@ -1065,7 +1065,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 params.d_aux_q_state[aux_q_index] = arc_next_state;
                 
                 // Updating the best_state_cost lookup table with our new best cost
-                atomicMin(&params.d_lookup[arc_next_state],
+                atomicMin(&params.d_state_best_cost[arc_next_state],
                         floatToOrderedInt(total_cost)
                         );
 
@@ -1247,7 +1247,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                         int32 degree = 0;
                         if(token_cost < cutoff) {
-                            BaseFloat best_cost = orderedIntToFloat(params.d_lookup[token_state]);
+                            BaseFloat best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
 
                             if(token_cost == best_cost) {
                                 int32 start = d_arc_offsets[token_state];
@@ -1312,7 +1312,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     int32 q_idx;
 
                     if(valid_input) {
-                        //we can do better than that
                         q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, input_q_offset, output_q_offset-1); 
 
                         int32 lower_bound = params.d_main_q_degrees_prefix_sum[q_idx];
@@ -1322,7 +1321,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                         arc_next_state = params.arc_nextstates[arc_idx];
                         BaseFloat arc_weight = params.arc_weights[arc_idx];
-                        BaseFloat next_state_cost = orderedIntToFloat(params.d_lookup[arc_next_state]);
+                        BaseFloat next_state_cost = orderedIntToFloat(params.d_state_best_cost[arc_next_state]);
                         BaseFloat old_tok_cost = params.d_main_q_cost[q_idx];
 
                         total_cost = arc_weight + old_tok_cost;
@@ -1348,7 +1347,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     int32 has_successor = (total_cost < cutoff && valid_input) ? 1 : 0;
 
                     if(has_successor) 
-                        atomicMin(&params.d_lookup[arc_next_state], floatToOrderedInt(total_cost));
+                        atomicMin(&params.d_state_best_cost[arc_next_state], floatToOrderedInt(total_cost));
 
                     int32 new_q_idx_block = has_successor;
                     int32 total_in_blk;

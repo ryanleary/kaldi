@@ -38,32 +38,38 @@
 
 namespace kaldi {
 
-    /** 
-     * Simple Cuda Decoder
-     */
-    class CudaDecoder;
+   class CudaDecoder;
 
-    struct CudaDecoderConfig {
-        BaseFloat beam;
-        uint32_t max_tokens;
-        uint32_t max_tokens_per_frame;
+   struct CudaDecoderConfig {
+       BaseFloat beam;
+       uint32_t max_tokens;
+       uint32_t max_tokens_per_frame;
 
 
-        CudaDecoderConfig(): beam(16.0),
-        max_tokens(300000000),
-        max_tokens_per_frame(1000000) {}
+       CudaDecoderConfig(): beam(16.0),
+       max_tokens(300000000),
+       max_tokens_per_frame(1000000) {}
 
-        void Register(OptionsItf *opts) {
-            opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");
-            opts->Register("max-tokens-pre-allocated", &max_tokens, "Total number of tokens pre-allocated (equivalent to reserve in a std vector).  If actual usaged exceeds this performance will be degraded");
-            opts->Register("max-tokens-per-frame", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
-        }
-        void Check() const {
-            KALDI_ASSERT(beam > 0.0 && max_tokens > 0 && max_tokens_per_frame > 0);
-        }
-    };
+       void Register(OptionsItf *opts) {
+           opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");
+           opts->Register("max-tokens-pre-allocated", &max_tokens, "Total number of tokens pre-allocated (equivalent to reserve in a std vector).  If actual usaged exceeds this performance will be degraded");
+           opts->Register("max-tokens-per-frame", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
+       }
+       void Check() const {
+           KALDI_ASSERT(beam > 0.0 && max_tokens > 0 && max_tokens_per_frame > 0);
+       }
+   };
 
-    class CudaDecoder {
+
+   //
+   // CudaDecoder
+   // path-based (one-best) decoder 
+   // Implementation of the CudaDecoder methods are in two files :
+   // - cuda-decoder-kernels.cu for the CUDA kernels and their wrapper
+   // - cuda-decoder.cu for everything else
+   //
+
+   class CudaDecoder {
 
         public:
             typedef fst::StdArc StdArc;
@@ -71,7 +77,7 @@ namespace kaldi {
             typedef StdArc::Label Label;
             typedef StdArc::StateId StateId;
             typedef float CostType;
-            // IntegerCostType is the type used in the lookup table d_state_cost
+            // IntegerCostType is the type used in the lookup table d_state_best_cost
             // and the d_cutoff
             // We use a 1:1 conversion between CostType <--> IntegerCostType
             // IntegerCostType is used because it triggers native atomic operations
@@ -186,10 +192,10 @@ namespace kaldi {
                 uint32_t *d_arc_offsets; 
                 int32 *d_main_q_arc_offsets; // offsets, relative to the queue
 
-                IntegerCostType *d_state_cost; 
+                IntegerCostType *d_state_best_cost; 
                 BaseFloat *d_cutoff; 
 
-                int32 *d_main_q_degrees_block_prefix_sum; 
+                int32 *d_main_q_degrees_block_sums_prefix_sum; 
                 int32 *d_n_CTA_done;
             };
 
@@ -234,7 +240,7 @@ namespace kaldi {
                 BaseFloat *d_loglikelihoods;
                 BaseFloat beam; 
 
-                int32 *d_lookup;
+                int32 *d_state_best_cost;
                 bool is_emitting;
                 int32 *d_n_CTA_done;
             };
@@ -260,7 +266,7 @@ private:
 
             //
             // PreprocessAndContract kernel
-            // Input  : aux_q, FST, d_state_costs, d_cutoff
+            // Input  : aux_q, FST, d_state_best_costs, d_cutoff
             // Output : main_q, d_main_q_degrees_prefix_sum
             //
             // The Preprocess* kernels are used before executing Expand 
@@ -269,7 +275,7 @@ private:
             // Pseudo code of the PreprocessAndContract kernel : 
             // - For each token in the aux_q, 
             //          compute bool is_best = (token.cost < cutoff) 
-            //                                && (token.cost == d_state_costs[token.nextstate])
+            //                                && (token.cost == d_state_best_costs[token.nextstate])
             // If is_best, then :
             //         1) append this token to the main_q
             //         2) compute out_degree = (# of outgoing arcs from token.nextstate) 
@@ -293,7 +299,7 @@ private:
             
             //
             // PreprocessInPlace kernel
-            // Input  : main_q, main_q_local_offset, FST, d_state_costs, d_cutoff
+            // Input  : main_q, main_q_local_offset, FST, d_state_best_costs, d_cutoff
             // Output : main_q, d_main_q_degrees_prefix_sum
             //
             // The Preprocess* kernels are used before executing Expand 
@@ -311,7 +317,7 @@ private:
             // Pseudo code of the PreprocessInPlace kernel :
             // - For each token in the range [local_offset, end[ of the main_q, 
             //          compute bool is_best = (token.cost < cutoff) 
-            //                                && (token.cost == d_state_costs[token.nextstate])
+            //                                && (token.cost == d_state_best_costs[token.nextstate])
             //
             //          compute out_degree = is_best
             //                               ? (# of outgoing arcs from token.nextstate)
@@ -359,10 +365,10 @@ private:
             void NonEmittingLongTail(const uint32_t *d_arc_offsets, const ExpandArcParams &params);
 
 
-            // InitStateCost initializes all costs to +INF in d_state_cost at the beginning of the computation
+            // InitStateCost initializes all costs to +INF in d_state_best_cost at the beginning of the computation
             void InitStateCostLookup();
 
-            // We need to reset d_state_cost between frames. We could use InitStateCost
+            // We need to reset d_state_best_cost between frames. We could use InitStateCost
             // but a large portion of the lookup table has not been used
             // ResetStateCostLookup resets only the costs that are not +INF, using the d_main_q_state to do it
             // d_main_q_state contains the list of states that have been considered and have a best cost < +INF
@@ -477,7 +483,7 @@ private:
             // to the end of h_all_tokens_info (CPU memory)
             // We only move to the CPU what's needed for the final backtrack in GetBestPath
             // ie { prev_token, arc_idx } (= struct InfoToken)
-            TokenVector h_all_tokens_info_; 
+            InfoTokenVector h_all_tokens_info_; 
 
             // The token at index i in the main queue has in reality 
             // a global index of (i + main_q_global_offset)
@@ -525,10 +531,10 @@ private:
             // (2) then generate the prefix sum of the sums of each CUDA blocks
             // (3) Use (1) and (2) to generate the global prefix sum
             // Data from step 1 and 3 is stored in d_main_q_degrees_prefix_sum
-            // Data from step 2 is stored in d_main_q_degrees_block_prefix_sum
+            // Data from step 2 is stored in d_main_q_degrees_block_sums_prefix_sum
             // Note : this is only used by PreprocessInPlace
             // PreprocessAndContract uses a trick to compute the global prefix sum in one pass
-            int32 *d_main_q_degrees_block_prefix_sum_;
+            int32 *d_main_q_degrees_block_sums_prefix_sum_;
 
             // d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
             // we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
@@ -536,16 +542,16 @@ private:
             int32 *d_main_q_arc_offsets_;
 
 
-            // d_state_cost[state] -> best cost for that state for the current frame
+            // d_state_best_cost[state] -> best cost for that state for the current frame
             // reset between frames
             // type int32 to be able to use native atomicMin instruction
             // we use a 1:1 conversion float <---> sortable int
-            IntegerCostType *d_state_cost_;
+            IntegerCostType *d_state_best_cost_;
 
 
             // loglikelihoods computed by the acoustic model
             // we need it to compute the cost of emitting edges
-            BaseFloat *loglikelihoods_d_;
+            BaseFloat *d_loglikelihoods_;
 
             // CUDA streams
             // kernels are launched in compute_st

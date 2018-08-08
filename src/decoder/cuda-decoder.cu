@@ -1,8 +1,5 @@
 // decoder/cuda-decoder.cu
 
-// Copyright 2009-2011 Microsoft Corporation
-//           2012-2013 Johns Hopkins University (author: Daniel Povey)
-
 // See ../../COPYING for clarification regarding multiple authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,15 +26,20 @@
 
 #define MEMADVISE
 
+#define DIV_ROUND_UP(a,b) ((a+b-1)/b)
+
 namespace kaldi {
 
     CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), 
                      beam_(config.beam),
                      bytes_cudaMalloc(0), 
                      max_tokens_(config.max_tokens), 
-                     max_tokens_per_frame_(config.max_tokens_per_frame) {
+                     max_tokens_per_frame_(config.max_tokens_per_frame),
+                     h_all_tokens_info_(config.max_tokens, copy_st_) {
 
-        // Comments about variables are in the .h file
+        //
+        // For a description of the class members, please refer to the cuda-decoder.h file
+        //
 
         cudaStreamCreate(&compute_st_);
         cudaStreamCreate(&copy_st_);
@@ -66,9 +68,6 @@ namespace kaldi {
 
         cudaMalloc(&d_cutoff, sizeof(BaseFloat));
 
-        h_all_tokens_info_.SetCudaStream(copy_st_);
-        h_all_tokens_info_.Reserve(max_tokens_);
-
         cudaMallocHost(&h_main_q_end_, sizeof(int32));  
         cudaMallocHost(&h_main_q_narcs_, sizeof(int32));  
         cudaMallocHost(&h_main_q_local_offset_, sizeof(int32));  
@@ -77,18 +76,23 @@ namespace kaldi {
         cudaMallocHost(&h_q_overflow_, sizeof(int32));  
 
         cudaMalloc(&d_main_q_degrees_prefix_sum_, max_tokens_per_frame_ * sizeof(int32));
-        cudaMalloc(&d_main_q_degrees_block_prefix_sum_, (max_tokens_per_frame_ / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX + 1 + 1)* sizeof(int32));
+
+        // d_main_q_degrees_block_sums_prefix_sum_ is the prefix sum of the "block sums"
+        // a block sum is, for each CUDA block, the sum of the arc degrees of all tokens associated to that CUDA block
+        // we add +1 because we want the last element of the prefix sum (a prefix sum of n elements generates (n+1) values)
+        cudaMalloc(&d_main_q_degrees_block_sums_prefix_sum_, 
+                (DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)* sizeof(int32));
+
         cudaMalloc(&d_main_q_arc_offsets_, max_tokens_per_frame_ * sizeof(int32));
 
-        cudaMalloc(&loglikelihoods_d_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
+        cudaMalloc(&d_loglikelihoods_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
 
-        cudaMalloc(&d_state_cost_, sizeof(IntegerCostType)*fst_.numStates);
+        cudaMalloc(&d_state_best_cost_, sizeof(IntegerCostType)*fst_.numStates);
 
         cudaCheckError();
     }
 
     CudaDecoder::~CudaDecoder() {
-
         cudaStreamDestroy(compute_st_);
         cudaStreamDestroy(copy_st_);
 
@@ -96,84 +100,96 @@ namespace kaldi {
         cudaEventDestroy(can_write_to_main_q_);
 
         cudaFree(d_main_q_state_);
-        cudaFreeHost(h_main_q_state_);
         cudaFree(d_aux_q_state_);
-
         cudaFree(d_main_q_cost_);
-        cudaFreeHost(h_main_q_cost_);
         cudaFree(d_aux_q_cost_);
-
         cudaFree(d_main_q_info_);
         cudaFree(d_aux_q_info_);
-
         cudaFree(d_main_q_local_offset_);
         cudaFree(d_aux_q_end_);
         cudaFree(d_n_CTA_done_);
-
         cudaFree(d_main_q_end_and_narcs_i2_);
-
         cudaFree(d_cutoff);
-
+        cudaFree(d_main_q_degrees_prefix_sum_);
+        cudaFree(d_main_q_degrees_block_sums_prefix_sum_);
+        cudaFree(d_main_q_arc_offsets_);
+        cudaFree(d_loglikelihoods_);
+        cudaFree(d_state_best_cost_);
 
         cudaFreeHost(h_main_q_end_);
         cudaFreeHost(h_main_q_narcs_);
         cudaFreeHost(h_main_q_local_offset_);
         cudaFreeHost(h_aux_q_end_);
-
-        cudaFree(d_main_q_degrees_prefix_sum_);
-        cudaFree(d_main_q_degrees_block_prefix_sum_);
-        cudaFree(d_main_q_arc_offsets_);
-
-        cudaFree(loglikelihoods_d_);
-
-        cudaFree(d_state_cost_);
+        cudaFreeHost(h_main_q_cost_);
+        cudaFreeHost(h_main_q_state_);
     }
 
     void CudaDecoder::InitDecoding() {
+        cudaStreamSynchronize(compute_st_);
 
+        // Filling the best state cost lookup table with +INF
         InitStateCostLookup();
+        
+        // The cutoff is the beam search cutoff 
+        // with best_cost = min(token.cost for all token from this frame)
+        // cutoff = best_cost + beam
+        // for now we reset the cutoff
+        CostType cutoff = FLT_MAX;
+        cudaMemcpyAsync(d_cutoff, &cutoff, sizeof(CostType), cudaMemcpyHostToDevice, compute_st_);
 
-        StateId start_state = fst_.Start();
-        KALDI_ASSERT(start_state != fst::kNoStateId);
+        // Adding the start state to the initial token queue
+        StateId first_token_state;
+        CostType first_token_cost;
+        InfoToken first_token_info;
 
-        cudaCheckError();
-        InfoToken it_init;
-        it_init.prev_token = INT_MIN;
-        it_init.arc_idx = -1;
+        first_token_state = fst_.Start();
+        first_token_cost = StdWeight::One().Value();
+        first_token_info.prev_token = INT_MIN;
+        first_token_info.arc_idx = -1;
 
-        CostType cost = StdWeight::One().Value();
+        KALDI_ASSERT(first_token_state != fst::kNoStateId);
 
-        // We'll call ProcessNonemitting just after,
-        // which will move tokens from aux to main
-        cudaMemcpy(d_aux_q_state_, &start_state, sizeof(StateId), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_aux_q_cost_, &cost, sizeof(CostType), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_aux_q_info_, &it_init, sizeof(InfoToken), cudaMemcpyHostToDevice);
+        //
+        // We add that initial token to the aux_q
+        // it will be moved to the main_q during the ProcessNonemitting phase 
+        // that will be called in a few lines
+        //
+        // Note : we launch copies in the compute stream here
+        // It means that we want them to be in the main pipeline
+        // compute_st_ is just a name - it's a generic CUDA stream
+        //
+        cudaMemcpyAsync(d_aux_q_state_, &first_token_state, sizeof(StateId), cudaMemcpyHostToDevice, compute_st_);
+        cudaMemcpyAsync(d_aux_q_cost_, &first_token_cost, sizeof(CostType), cudaMemcpyHostToDevice, compute_st_);
+        cudaMemcpyAsync(d_aux_q_info_, &first_token_info, sizeof(InfoToken), cudaMemcpyHostToDevice, compute_st_);
 
-        // We simulate a regular execution for the first iteration
-        cudaMemcpy(&d_state_cost_[start_state], &cost, sizeof(IntegerCostType), cudaMemcpyHostToDevice);
+        // Updating the best state cost lookup table for the initial token state
+        cudaMemcpyAsync(&d_state_best_cost_[first_token_state], &first_token_cost, sizeof(IntegerCostType),
+                        cudaMemcpyHostToDevice, compute_st_);
 
-        // Init state is in queue
+        // We have one token is the aux_q
         int32 one = 1;
-        cudaMemcpy(d_aux_q_end_, &one, sizeof(int32), cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(d_aux_q_end_, &one, sizeof(int32), cudaMemcpyHostToDevice, compute_st_);
         *h_aux_q_end_ = 1;
 
-        cudaMemset(d_main_q_end_, 0, sizeof(int32));
-        cudaMemset(d_main_q_narcs_, 0, sizeof(int32));
+        // The main_q is empty
+        cudaMemsetAsync(d_main_q_end_, 0, sizeof(int32), compute_st_);
         *h_main_q_end_ = 0;
+        cudaMemsetAsync(d_main_q_narcs_, 0, sizeof(int32), compute_st_);
         *h_main_q_narcs_ = 0;
+        cudaMemsetAsync(d_main_q_local_offset_, 0, sizeof(int32), compute_st_);
+        *h_main_q_local_offset_ = 0;
+        
+        // Resetting the TokenInfoVector in the CPU host
+        h_all_tokens_info_.Reset();
+        main_q_global_offset_ = 0;
 
+        // Initializing flag
         *h_q_overflow_ = 0;
 
-        cudaMemset(d_main_q_local_offset_, 0, sizeof(int32));
-        *h_main_q_local_offset_ = 0;
-        main_q_global_offset_ = 0;
-        h_all_tokens_info_.Reset();
 
-        CostType cutoff = FLT_MAX;
-        cudaMemcpy(d_cutoff, &cutoff, sizeof(CostType), cudaMemcpyHostToDevice);
+        cudaMemsetAsync(d_n_CTA_done_, 0, sizeof(int32), compute_st_);
 
-        cudaMemset(d_n_CTA_done_, 0, sizeof(int32));
-
+        cudaStreamSynchronize(compute_st_);
         cudaCheckError();
 
         num_frames_decoded_ = 0;
@@ -253,7 +269,7 @@ namespace kaldi {
 
         int32 frame = num_frames_decoded_;
 
-        decodable->ComputeLogLikelihoods(loglikelihoods_d_,frame,fst_.max_ilabel+1, compute_st_);
+        decodable->ComputeLogLikelihoods(d_loglikelihoods_,frame,fst_.max_ilabel+1, compute_st_);
     }
 
     void CudaDecoder::PrintOverflowWarning() {
@@ -267,7 +283,7 @@ namespace kaldi {
 
     bool CudaDecoder::ProcessToken(bool is_emitting) {
 
-        unsigned int *d_arc_offsets = is_emitting ? fst_.e_offsets_d : fst_.ne_offsets_d;
+        unsigned int *d_arc_offsets = is_emitting ? fst_.d_e_offsets : fst_.d_ne_offsets;
 
         PreprocessParams preprocess_params;
         preprocess_params.d_aux_q_state = d_aux_q_state_; 
@@ -290,9 +306,9 @@ namespace kaldi {
         preprocess_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
         preprocess_params.d_arc_offsets = d_arc_offsets;
         preprocess_params.d_main_q_arc_offsets = d_main_q_arc_offsets_;
-        preprocess_params.d_state_cost = d_state_cost_; 
+        preprocess_params.d_state_best_cost = d_state_best_cost_; 
         preprocess_params.d_cutoff = d_cutoff; 
-        preprocess_params.d_main_q_degrees_block_prefix_sum = d_main_q_degrees_block_prefix_sum_; 
+        preprocess_params.d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_; 
         preprocess_params.d_n_CTA_done = d_n_CTA_done_;
 
         if(is_emitting) {
@@ -343,14 +359,14 @@ namespace kaldi {
         expand_params.h_q_overflow = h_q_overflow_;
         expand_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
         expand_params.d_q_arc_offsets = d_main_q_arc_offsets_;
-        expand_params.arc_ilabels = fst_.arc_ilabels_d;
+        expand_params.arc_ilabels = fst_.d_arc_ilabels;
         expand_params.is_emitting = is_emitting;
-        expand_params.arc_weights = fst_.arc_weights_d; 
-        expand_params.arc_nextstates = fst_.arc_nextstates_d; 
+        expand_params.arc_weights = fst_.d_arc_weights; 
+        expand_params.arc_nextstates = fst_.d_arc_nextstates; 
         expand_params.d_cutoff = d_cutoff;
         expand_params.beam = beam_;
-        expand_params.d_loglikelihoods = loglikelihoods_d_;
-        expand_params.d_lookup = d_state_cost_;
+        expand_params.d_loglikelihoods = d_loglikelihoods_;
+        expand_params.d_state_best_cost = d_state_best_cost_;
         expand_params.d_n_CTA_done = d_n_CTA_done_;
     
         bool done = false;
@@ -435,7 +451,7 @@ namespace kaldi {
             CostType cost = h_main_q_cost_[i];
 
             if(isfinal) 
-                cost += fst_.final_h[h_main_q_state_[i]];
+                cost += fst_.h_final[h_main_q_state_[i]];
 
             if(cost < best_cost) {
                 best_cost = cost;
@@ -457,7 +473,7 @@ namespace kaldi {
 
 
         for(int32 i=0; i < main_q_size; ++i) {
-            if(fst_.final_h[h_main_q_state_[i]] != StdWeight::Zero().Value())
+            if(fst_.h_final[h_main_q_state_[i]] != StdWeight::Zero().Value())
                 return true;
         }
 
@@ -499,7 +515,11 @@ namespace kaldi {
 
         for (int32 i = reversed_path.size()-1; i >= 1; i--) {
             int32 arc_idx = reversed_path[i];
-            LatticeArc arc(fst_.arc_ilabels_h[arc_idx], fst_.arc_olabels_h[arc_idx], LatticeWeight(fst_.arc_weights_h[arc_idx], 0), fst_.arc_nextstates_h[arc_idx]);
+
+            LatticeArc arc(fst_.h_arc_ilabels[arc_idx], 
+                           fst_.h_arc_olabels[arc_idx],
+                           LatticeWeight(fst_.h_arc_weights[arc_idx], 0), 
+                           fst_.h_arc_nextstates[arc_idx]);
 
             arc.nextstate = fst_out->AddState();
             fst_out->AddArc(cur_state, arc);
@@ -508,7 +528,7 @@ namespace kaldi {
 
         if (isfinal && use_final_probs)
             fst_out->SetFinal(cur_state,
-                    LatticeWeight(fst_.final_h[fst_.arc_nextstates_h[reversed_path[0]]], 0.0));
+                    LatticeWeight(fst_.h_final[fst_.h_arc_nextstates[reversed_path[0]]], 0.0));
         else
             fst_out->SetFinal(cur_state, LatticeWeight::One());
 
