@@ -928,9 +928,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, main_q_offset, main_q_end-1); 
 
                 int32 lower_bound = params.d_main_q_degrees_prefix_sum[main_q_idx];
+
+                // TODO add comment
                 int32 arc_offset_start = params.d_q_arc_offsets[main_q_idx];
 
-                arc_idx = arc_offset_start + (main_q_arc_index - lower_bound);
+                arc_idx = arc_offset_start + (main_q_arc_index - lower_bound); // TODO add variable
+
                 arc_next_state = params.arc_nextstates[arc_idx];
 
                 // Building the total cost incrementally 
@@ -1110,8 +1113,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 *params.d_n_CTA_done = 0; 
 
                 if(params.is_emitting) {
-                    *params.d_main_q_local_offset = 0; // not needed
-                    *params.h_main_q_local_offset = 0; // not needed
+                    *params.d_main_q_local_offset = 0; // TODO not needed
+                    *params.h_main_q_local_offset = 0; // TODO not needed
 
                     // It was the last time that we were using tokens in the main_q
                     // flushing it now
