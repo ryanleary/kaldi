@@ -186,7 +186,6 @@ namespace kaldi {
         // Initializing flag
         *h_q_overflow_ = 0;
 
-
         cudaMemsetAsync(d_n_CTA_done_, 0, sizeof(int32), compute_st_);
 
         cudaStreamSynchronize(compute_st_);
@@ -219,45 +218,74 @@ namespace kaldi {
             target_frames_decoded = std::min(target_frames_decoded,
                     num_frames_decoded_ + max_num_frames);
 
-        ComputeLogLikelihoods(decodable);
-
         int32 prev_main_q_size = *h_main_q_end_;
         while (num_frames_decoded_ < target_frames_decoded) {
             
             // Computing a new frame
 
-            num_frames_decoded_++; 
+            // Loglikelihoods from the acoustic model
             ComputeLogLikelihoods(decodable);
 
-            // Emitting 
-            // we will not write in the main q in that step
-            // the input tokens are already in the main_q
+            // ProcessEmitting 
+            // 
+            // Before executing ProcessEmitting, we have :
+            // - The main_q contains tokens from the last frame
+            // - The aux_q is empty
+            //
+            // ProcessEmitting will do the operation :
+            //
+            // read tokens from main_q ----FST---> create new tokens in the aux_q
+            //
+            // We will not write in the main q in that step
+            // The input tokens are already in the main_q
             // (they were put there by the ProcessNonemittings 
             // from the previous frame)
-            // we don't need can_write_to_main_q_
-            // the output tokens go to aux_q
+            // We don't need can_write_to_main_q_
+            // because we won't write to the main_q
+            // The output tokens will go to aux_q
             ProcessEmitting();
-            // After process emitting we won't need the token
-            // associated with the previous frame
-            // the main q has been flushed at the end of Nonemitting, 
-            //we update its offset
+
+            // After ProcessEmitting we won't need the token
+            // associated with the previous frame anymore
+            // At the end of ProcessEmitting the main_q was flushed 
+            // (by setting main_q_end == 0)
+            // Tokens that were flushed at that step have been previously 
+            // moved to the host memory 
+            // We update the global offset of the main_q
+            // the global offset takes into account all tokens that have been moved
+            // to the host memory
+
             main_q_global_offset_ += prev_main_q_size;
             
-            // Non Emitting
-            // we will write to the main q 
-            // (preprocess is "contract and preprocess")
+            // ProcessNonemitting
+            //
+            // Processing non emitting arcs
+            //
+            // The operation is :
+            //
+            // read input tokens from aux_q 
+            //     ---contract (prune)--->
+            // write non-pruned input tokens to main_q (append at the end of the queue)
+            // read input tokens from main_q 
+            //     ---FST--->
+            // create new tokens in the aux_q
+            //
+            // We then iterate those operations until no new tokens are created 
+
+            // We will write to main_q. We need it to be ready
             cudaEventSynchronize(can_write_to_main_q_);
             ProcessNonemitting(); 
             
             prev_main_q_size = *h_main_q_end_;
             
             // We are done with the current frame
-            // We copy back its pruned tokens to the host
+            // We copy back its  tokens to the host
             // We only copy the "info" part (arc_idx + prev_token)
             // because we don't need anything else for the final backtrack
             h_all_tokens_info_.CopyFromDevice(main_q_global_offset_, d_main_q_info_, prev_main_q_size);
             cudaEventRecord(can_write_to_main_q_, copy_st_);
             
+            num_frames_decoded_++; 
         }   
 
 
@@ -281,8 +309,17 @@ namespace kaldi {
     }
 
 
+    //
+    // ProcessToken does the heavy work of ProcessEmitting and ProcessNonemitting
+    // The only differences between emitting and non emitting case are the CSR offsets
+    // and the boolean params.is_emitting
+    //
+    // It first calls the appropriate Preprocess kernel
+    // and then ExpandArc to traverse the arcs
+    //
     bool CudaDecoder::ProcessToken(bool is_emitting) {
 
+        // Traversing either emitting or nonemitting arcs of the FST
         unsigned int *d_arc_offsets = is_emitting ? fst_.d_e_offsets : fst_.d_ne_offsets;
 
         PreprocessParams preprocess_params;
@@ -312,17 +349,33 @@ namespace kaldi {
         preprocess_params.d_n_CTA_done = d_n_CTA_done_;
 
         if(is_emitting) {
+            // If we are emitting, all tokens from previous frame are already
+            // in the main_q. They were put there by PreprocessAndContracts,
+            // in the ProcessNonEmittings from previous frames 
+            // Those tokens already have children (through the ProcessNonemittings)
+            // we cannot prune them - it would break the prev_token indexes
+            // We do the PreprocessInPlace, we read from main_q and do not modify it
+            // 
             PreprocessInPlace(preprocess_params);
+            // Preprocess sets h_main_q_narcs (pinned memory) at the end of its executing
             cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
+
+            // Resetting the lookup table for the new frame
             ResetStateCostLookup();
+
+            // Finalizing the prefix sum from Preprocess kernel
             FinalizePreprocessInPlace();
         } else {
             PreprocessAndContract(preprocess_params);
+            
+            // Preprocess sets h_main_q_narcs (pinned memory) at the end of its executing
             cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
+
+            // No need to call FinalizePreprocessInPlace - the prefix sum is done in one pass in PreprocessAndContract
         }
 
 
-        // We need h_q_token_from_narcs to be ready
+        // We need h_main_q_narcs to be ready
         cudaEventSynchronize(can_read_h_main_q_narcs_);
         cudaCheckError();
 
@@ -369,8 +422,15 @@ namespace kaldi {
         expand_params.d_state_best_cost = d_state_best_cost_;
         expand_params.d_n_CTA_done = d_n_CTA_done_;
     
-        bool done = false;
 
+        // If we are non emitting and have a small number of arcs to process,
+        // we use NonEmittingLongTail
+        // it is a persistent kernel which will iterate on Preprocess/ExpandArc
+        // internally, using in-block syncs
+        // it avoids calling too many kernels during the multiple iterations of NonEmitting
+        // In any cases, we need to call NonEmittingLongTail to finalize ProcessNonemitting
+        // it takes care of finalizing our work for the frame (moving offsets, etc.)
+        bool done = false;
         if(!is_emitting 
                 && main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) { 
             NonEmittingLongTail(d_arc_offsets, expand_params); 
@@ -417,7 +477,7 @@ namespace kaldi {
         nvtxRangePushA("ProcessNonemitting");
 
         // While not done, call it
-        // If remaining n_arcs < 4k, 
+        // If remaining n_arcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS, 
         // ProcessToken will call a persistent kernel
         // false => use non emitting arcs
         while(!ProcessToken(false));
@@ -426,27 +486,44 @@ namespace kaldi {
         nvtxRangePop();
     }
 
-    /*
-       GetBestCost, GetBestPath, IsFinal
-       CPU only, called only at the end
-
-     */
-
-
-    void CudaDecoder::GetBestCost(bool isfinal, BaseFloat *min, int32 *arg) const {
+    // GetBestCost
+    // CPU-only code
+    // returns the minimum cost among all tokens cost in the current frame
+    // also returns the index of one token with that min cost
+    //
+    // Only called at the end of the computation of one audio file
+    // not optimized
+    //
+    void CudaDecoder::GetBestCost(bool isfinal, BaseFloat *min, int32 *argmin) const {
         
-        CostType best_cost = FLT_MAX; // switch to numeric limits std11
-        int32 best_cost_idx;
-        // we need main q end ready
-        int32 main_q_size = *h_main_q_end_;
+        CostType best_cost = std::numeric_limits<CostType>::max();
+        int32 min_cost_token_index;
 
-        cudaMemcpy(h_main_q_cost_, d_main_q_cost_, main_q_size * sizeof(CostType), cudaMemcpyDeviceToHost);
+        // we need h_main_q_end_ ready
+        cudaStreamSynchronize(compute_st_);
+
+        // Copying the costs from current frame back to host memory
+        // h_main_q_cost_ is never filled automatically 
+        // when moving the tokens back to the host, we only move the { arc_idx, prev_token } part
+        int32 main_q_size = *h_main_q_end_;
+        cudaMemcpyAsync(h_main_q_cost_, 
+                        d_main_q_cost_, 
+                        main_q_size * sizeof(CostType), 
+                        cudaMemcpyDeviceToHost,
+                        compute_st_);
 
         if(isfinal)
-            cudaMemcpy(h_main_q_state_, d_main_q_state_, main_q_size * sizeof(int32), cudaMemcpyDeviceToHost);
+            cudaMemcpyAsync(h_main_q_state_,     
+                            d_main_q_state_, 
+                            main_q_size * sizeof(int32), 
+                            cudaMemcpyDeviceToHost,
+                            compute_st_);
 
-        // TODO add event main q ready once memcpy becomes async
+        // Waiting for data
+        cudaStreamSynchronize(compute_st_);
 
+
+        // Finding best cost
         for(int32 i=0; i < main_q_size; ++i) {
             CostType cost = h_main_q_cost_[i];
 
@@ -455,23 +532,45 @@ namespace kaldi {
 
             if(cost < best_cost) {
                 best_cost = cost;
-                best_cost_idx = i;
+                min_cost_token_index = i;
             }
         }
 
-        //printf("global_offset=%i \n", main_q_global_offset_);
-        best_cost_idx += main_q_global_offset_; 
+        // The main_q always has a main_q_global_offset_
+        min_cost_token_index += main_q_global_offset_; 
 
+        // Saving result
         *min = best_cost;
-        *arg = best_cost_idx;
+        *argmin = min_cost_token_index;
     }
 
 
+    //
+    // ReachedFinal() returns true if the main_q contains a final state 
+    // CPU-only code
+    //
+    // Only called at the end of the computation of one audio file
+    // not optimized
+    //
     bool CudaDecoder::ReachedFinal() const {
+        // we need h_main_q_end_ ready
+        cudaStreamSynchronize(compute_st_);
+
         int32 main_q_size = *h_main_q_end_;
-        cudaMemcpy(h_main_q_state_, d_main_q_state_, main_q_size * sizeof(int32), cudaMemcpyDeviceToHost);
+        
+        // Copying the states from current frame back to host memory
+        // h_main_q_state_ is never filled automatically 
+        // when moving the tokens back to the host, we only move the { arc_idx, prev_token } part
+        cudaMemcpyAsync(h_main_q_state_,     
+                d_main_q_state_, 
+                main_q_size * sizeof(int32), 
+                cudaMemcpyDeviceToHost,
+                compute_st_);
 
+        // Waiting for data
+        cudaStreamSynchronize(compute_st_);
 
+        // Looking for a final state
         for(int32 i=0; i < main_q_size; ++i) {
             if(fst_.h_final[h_main_q_state_[i]] != StdWeight::Zero().Value())
                 return true;
