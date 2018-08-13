@@ -195,7 +195,7 @@ namespace kaldi {
                 int32 *d_main_q_arc_offsets; // offsets, relative to the queue
 
                 IntegerCostType *d_state_best_cost; 
-                BaseFloat *d_cutoff; 
+                IntegerCostType *d_cutoff; 
 
                 int32 *d_main_q_degrees_block_sums_prefix_sum; 
                 int32 *d_n_CTA_done;
@@ -238,7 +238,7 @@ namespace kaldi {
 
                 BaseFloat *arc_weights; 
                 StateId *arc_nextstates; 
-                BaseFloat *d_cutoff;
+                IntegerCostType *d_cutoff;
                 BaseFloat *d_loglikelihoods;
                 BaseFloat beam; 
 
@@ -580,7 +580,7 @@ private:
             // Cutoff for the current frame
             // contains best_cost_in_the_queue + beam_
             // Updated during the ExpandArc operation
-            BaseFloat *d_cutoff;
+            IntegerCostType *d_cutoff_;
 
             int32 max_tokens_;
             int32 max_tokens_per_frame_;

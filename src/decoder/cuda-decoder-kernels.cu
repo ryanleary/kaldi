@@ -28,6 +28,7 @@ typedef CudaDecoder::StateId StateId;
 typedef CudaDecoder::TokenAndArcCount TokenAndArcCount;
 typedef CudaDecoder::TokenAndArcCountUnion TokenAndArcCountUnion;
 typedef CudaDecoder::CostType CostType;
+typedef CudaDecoder::IntegerCostType IntegerCostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
 typedef CudaDecoder::ExpandArcParams ExpandArcParams; 
 
@@ -58,27 +59,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     } 
 
-    // Temporary used for cutoff - will be TODO removed
-    __device__ float fatomicMin(float *addr, float value)
-
-    {
-
-        float old = *addr, assumed;
-        if(old <= value) return old;
-
-        do
-        {
-            assumed = old;
-            old = atomicCAS((uint32_t*)addr,
-                    __float_as_int(assumed),
-                    __float_as_int(value));
-
-        } while(old!=assumed); // TODO <
-
-        return old;
-
-    }
-
     //
     // Kernels
     //
@@ -87,13 +67,19 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     // and look for the corresponding wrapper
     // for instance, for a description of _init_lookup_kernel,
     // look for the description of CudaDecoder::InitStateCostLookup() in cuda-decoder.h
+    // Also resets the cutoff to +inf
 
     // Used before first frame
-    __global__ void _init_state_cost_lookup_kernel(int32 size, int32 *state_cost) {
+    __global__ void _init_state_cost_lookup_kernel(int32 size, IntegerCostType *state_best_cost, IntegerCostType *d_cutoff) {
+        // One thread resets the cutoff
+        if(threadIdx.x == 0 && blockIdx.x == 0) 
+            *d_cutoff = floatToOrderedInt(FLT_MAX);
+
+        // Reset lookup table
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
                 idx < size;
                 idx += blockDim.x*gridDim.x) {
-            state_cost[idx]  = floatToOrderedInt(FLT_MAX);
+            state_best_cost[idx]  = floatToOrderedInt(FLT_MAX);
         }
     }
 
@@ -105,13 +91,19 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        _init_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_);
+        _init_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_, d_cutoff_);
     }
 
     // Used to reset lookup table between frames
     // Using the queue to reset only the values needed
     // Also takes care of resetting cutoff
-    __global__ void _reset_state_cost_lookup_kernel(const StateId *d_main_q_state_, const int32 *d_main_q_end_, int32 *d_state_best_cost, CostType *d_cutoff) {
+    __global__ void _reset_state_cost_lookup_kernel(const StateId *d_main_q_state_, 
+                                                    const int32 *d_main_q_end_, 
+                                                    IntegerCostType *d_state_best_cost, 
+                                                    IntegerCostType *d_cutoff) {
+        if(blockIdx.x == 0 && threadIdx.x == 0)
+            *d_cutoff = floatToOrderedInt(FLT_MAX); // we also reset the cutoff
+
         int32 main_q_end = *d_main_q_end_; 
 
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
@@ -123,9 +115,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             StateId state = d_main_q_state_[idx];
             d_state_best_cost[state]  = floatToOrderedInt(FLT_MAX);
         }
-
-        if(blockIdx.x == 0 && threadIdx.x == 0)
-            *d_cutoff = FLT_MAX; // we also reset the cutoff
     }
 
     void CudaDecoder::ResetStateCostLookup() {
@@ -137,7 +126,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
-        _reset_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_best_cost_, d_cutoff);
+        _reset_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, 
+                                                                      d_main_q_end_,
+                                                                      d_state_best_cost_, 
+                                                                      d_cutoff_);
     }
 
 
@@ -214,7 +206,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         __shared__ TokenAndArcCountUnion sh_main_q_global_block_offset;
 
         // Final cutoff from last ExpandArc execution
-        const BaseFloat cutoff = *params.d_cutoff;
+        const BaseFloat cutoff = orderedIntToFloat(*params.d_cutoff);
 
         const int32 aux_q_end = *params.d_aux_q_end;
 
@@ -457,7 +449,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         const int32 main_q_size = main_q_end - 0; // main_q_offset == 0 in that kernel
 
         // Final cutoff from the expand kernel
-        const BaseFloat cutoff = *params.d_cutoff;
+        const BaseFloat cutoff = orderedIntToFloat(*params.d_cutoff);
 
         // The condition of the for loop is the same for all threads in the CUDA block
         // we want to keep all threads alive at the same time for now
@@ -851,7 +843,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         
         if(threadIdx.x == 0) {
-            sh_cached_cutoff = *params.d_cutoff;
+            sh_cached_cutoff = orderedIntToFloat(*params.d_cutoff);
         }
 
         __syncthreads();
@@ -1055,8 +1047,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                             params.q_capacity);
 
                     sh_cached_cutoff = (cutoff_candidate < sh_cached_cutoff) 
-                        ? fmin(fatomicMin(params.d_cutoff, cutoff_candidate), cutoff_candidate)
-                        : fmin(*params.d_cutoff, sh_cached_cutoff);
+                        ? fmin(orderedIntToFloat(atomicMin(params.d_cutoff, floatToOrderedInt(cutoff_candidate))), cutoff_candidate)
+                        : fmin(orderedIntToFloat(*params.d_cutoff), sh_cached_cutoff);
                 }
             }
 
@@ -1237,7 +1229,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     
             int32 input_q_size = output_q_offset - input_q_offset;  
 
-            sh_cutoff = *params.d_cutoff;
+            sh_cutoff = orderedIntToFloat(*params.d_cutoff);
 
             // We'll switch queue at the beg of the loop
             output_q_offset = input_q_offset;
@@ -1417,7 +1409,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 *params.d_main_q_local_offset = 0; 
                 *params.h_main_q_local_offset = 0; 
 
-                *params.d_cutoff = sh_cutoff;
+                *params.d_cutoff = floatToOrderedInt(sh_cutoff);
             }
 
         }

@@ -68,7 +68,7 @@ namespace kaldi {
         d_main_q_narcs_ = &d_main_q_end_and_narcs_i2_->split.narcs;
         d_main_q_end_ = &d_main_q_end_and_narcs_i2_->split.ntokens;
 
-        cudaMalloc(&d_cutoff, sizeof(BaseFloat));
+        cudaMalloc(&d_cutoff_, sizeof(IntegerCostType));
 
         cudaMallocHost(&h_main_q_end_, sizeof(int32));  
         cudaMallocHost(&h_main_q_narcs_, sizeof(int32));  
@@ -111,7 +111,7 @@ namespace kaldi {
         cudaFree(d_aux_q_end_);
         cudaFree(d_n_CTA_done_);
         cudaFree(d_main_q_end_and_narcs_i2_);
-        cudaFree(d_cutoff);
+        cudaFree(d_cutoff_);
         cudaFree(d_main_q_degrees_prefix_sum_);
         cudaFree(d_main_q_degrees_block_sums_prefix_sum_);
         cudaFree(d_main_q_arc_offsets_);
@@ -131,13 +131,7 @@ namespace kaldi {
 
         // Filling the best state cost lookup table with +INF
         InitStateCostLookup();
-        
-        // The cutoff is the beam search cutoff 
-        // with best_cost = min(token.cost for all token from this frame)
-        // cutoff = best_cost + beam
-        // for now we reset the cutoff
-        CostType cutoff = FLT_MAX;
-        cudaMemcpyAsync(d_cutoff, &cutoff, sizeof(CostType), cudaMemcpyHostToDevice, compute_st_);
+
 
         // Adding the start state to the initial token queue
         StateId first_token_state;
@@ -346,7 +340,7 @@ namespace kaldi {
         preprocess_params.d_arc_offsets = d_arc_offsets;
         preprocess_params.d_main_q_arc_offsets = d_main_q_arc_offsets_;
         preprocess_params.d_state_best_cost = d_state_best_cost_; 
-        preprocess_params.d_cutoff = d_cutoff; 
+        preprocess_params.d_cutoff = d_cutoff_; 
         preprocess_params.d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_; 
         preprocess_params.d_n_CTA_done = d_n_CTA_done_;
 
@@ -418,7 +412,7 @@ namespace kaldi {
         expand_params.is_emitting = is_emitting;
         expand_params.arc_weights = fst_.d_arc_weights; 
         expand_params.arc_nextstates = fst_.d_arc_nextstates; 
-        expand_params.d_cutoff = d_cutoff;
+        expand_params.d_cutoff = d_cutoff_;
         expand_params.beam = beam_;
         expand_params.d_loglikelihoods = d_loglikelihoods_;
         expand_params.d_state_best_cost = d_state_best_cost_;
