@@ -578,39 +578,55 @@ namespace kaldi {
 
         return false;
     }
-    // Outputs an FST corresponding to the single best path
-    // through the lattice.
+
+
+
+    //
+    // GetBestPath is called at the end of the computation
+    // It chooses the best token from the last frame, 
+    // and backtracks all the path to the beginning (StartState)
+    // from there
+    // It then returns that path
+    //
     bool CudaDecoder::GetBestPath(Lattice *fst_out, bool use_final_probs) const {
         nvtxRangePushA("GetBestPath");
 
-        cudaEventSynchronize(can_write_to_main_q_); // We want the copy to the host to be done
+        // We want the copy to host of the last tokens to be done
+        cudaEventSynchronize(can_write_to_main_q_);
 
         bool isfinal = ReachedFinal();
+
+        // Finding the best token from the last frame
+        // ie the token with min cost
         BaseFloat best_cost;
-        int32 arg_best;
-        GetBestCost(isfinal, &best_cost, &arg_best);
+        int32 token_with_best_cost;
+        GetBestCost(isfinal, &best_cost, &token_with_best_cost);
 
-        //printf("is final = %i \n", isfinal);
-        //printf("best cost : %f  with arg = %i \n", best_cost, arg_best);
 
-        int32 token_idx = arg_best;
+        // Backtracking
+        // Going all the way from the token with best cost
+        // to the beginning (StartState)
+        int32 token_idx = token_with_best_cost;
+        int32 last_valid_token_idx;
         std::vector<int32> reversed_path;
 
-        while(token_idx != INT_MIN) {
+        // The first token was inserted at the beginning of the queue
+        // it always has index 0
+        // We backtrack until that first token
+        while(token_idx != 0) {
+            last_valid_token_idx = token_idx;
             int32 arc_idx = h_all_tokens_info_.GetRawPointer()[token_idx].arc_idx;
             reversed_path.push_back(arc_idx);
             token_idx = h_all_tokens_info_.GetRawPointer()[token_idx].prev_token;
         }
 
 
+        // Reset the fst_out
         fst_out->DeleteStates();
 
-        // We can assert first state equals to root
-
+        // Building the output Lattice
         StateId cur_state = fst_out->AddState();
         fst_out->SetStart(cur_state);
-
-        reversed_path.pop_back(); // dummy first arc
 
         for (int32 i = reversed_path.size()-1; i >= 1; i--) {
             int32 arc_idx = reversed_path[i];
@@ -625,6 +641,7 @@ namespace kaldi {
             cur_state = arc.nextstate;
         }
 
+        // Adding final cost to final state
         if (isfinal && use_final_probs)
             fst_out->SetFinal(cur_state,
                     LatticeWeight(fst_.h_final[fst_.h_arc_nextstates[reversed_path[0]]], 0.0));

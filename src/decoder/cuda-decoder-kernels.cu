@@ -103,7 +103,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        _init_state_cost_lookup_kernel<<<grid,block>>>(nstates, d_state_best_cost_);
+        _init_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_);
     }
 
     // Used to reset lookup table between frames
@@ -625,7 +625,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     void CudaDecoder::PreprocessInPlace(const PreprocessParams &params) {
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-        int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
+
+        KALDI_ASSERT(*h_main_q_local_offset_ == 0);
+        int32 main_q_size = *h_main_q_end_ - 0; // 0 = main_q_offset
 
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
