@@ -1,5 +1,7 @@
 // decoder/cuda-decoder-utils.cu
 
+// 2018 - Hugo Braun, Justin Luitjens
+
 // See ../../COPYING for clarification regarding multiple authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");

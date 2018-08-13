@@ -1,5 +1,7 @@
 // decoder/cuda-decoder.cu
 
+// 2018 - Hugo Braun, Justin Luitjens
+
 // See ../../COPYING for clarification regarding multiple authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -424,16 +426,16 @@ namespace kaldi {
     
 
         // If we are non emitting and have a small number of arcs to process,
-        // we use NonEmittingLongTail
+        // we use FinalizeProcessNonemitting
         // it is a persistent kernel which will iterate on Preprocess/ExpandArc
         // internally, using in-block syncs
         // it avoids calling too many kernels during the multiple iterations of NonEmitting
-        // In any cases, we need to call NonEmittingLongTail to finalize ProcessNonemitting
+        // In any cases, we need to call FinalizeProcessNonemitting to finalize ProcessNonemitting
         // it takes care of finalizing our work for the frame (moving offsets, etc.)
         bool done = false;
         if(!is_emitting 
                 && main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) { 
-            NonEmittingLongTail(d_arc_offsets, expand_params); 
+            FinalizeProcessNonemitting(d_arc_offsets, expand_params); 
 
             cudaCheckError();
 

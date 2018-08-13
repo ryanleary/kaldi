@@ -1,5 +1,7 @@
 // decoder/cuda-decoder.h
 
+// 2018 - Hugo Braun, Justin Luitjens
+
 // See ../../COPYING for clarification regarding multiple authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -348,11 +350,11 @@ private:
             void FinalizePreprocessInPlace();
 
             //
-            // NonEmittingLongTail
+            // FinalizeProcessNonemitting
             // This kernel is called at the end of the ProcessNonEmitting computation
             // it is used when ProcessNonEmitting generate a small number of new tokens at each iteration 
             // to avoid calling heavy-lifting kernels such as ExpandArcs too many times, we instead use
-            // NonEmittingLongTail that uses only one CTA 
+            // FinalizeProcessNonemitting that uses only one CTA 
             // By using one CTA, we can sync all threads inside the kernel, and iterate until convergence 
             // without lauching new kernels
             // This meta-kernel performs :
@@ -362,7 +364,7 @@ private:
             // This meta-kernel does not call the PreprocessInPlace or Expand kernels
             // it uses simplified implementations (for one CTA) of those 
             //
-            void NonEmittingLongTail(const uint32_t *d_arc_offsets, const ExpandArcParams &params);
+            void FinalizeProcessNonemitting(const uint32_t *d_arc_offsets, const ExpandArcParams &params);
 
 
             // InitStateCost initializes all costs to +INF in d_state_best_cost at the beginning of the computation

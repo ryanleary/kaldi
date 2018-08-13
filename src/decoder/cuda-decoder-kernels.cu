@@ -1,5 +1,7 @@
 // decoder/cuda-decoder-kernels.cu
 
+// 2018 - Hugo Braun, Justin Luitjens
+
 // See ../../COPYING for clarification regarding multiple authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -127,13 +129,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
     void CudaDecoder::ResetStateCostLookup() {
-        int32 size = *h_main_q_end_;
+        int32 main_q_size = *h_main_q_end_;
 
-        KALDI_ASSERT(size > 0);
+        KALDI_ASSERT(main_q_size > 0);
 
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
-        grid.x = DIV_ROUND_UP(size, block.x);
+        grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         _reset_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, d_main_q_end_, d_state_best_cost_, d_cutoff);
     }
@@ -186,15 +188,15 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         
         // Prefix sum operator
         typedef cub::BlockScan<TokenAndArcCount, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
-        __shared__ typename BlockScan::TempStorage temp_storage;
+        __shared__ typename BlockScan::TempStorage sh_temp_storage;
 
         // This CUDA block (CTA) will count the number of tokens it has to move to the main_q
-        // and store the result in nsurvival_tokens_in_CTA
-        __shared__ int32 nsurvival_tokens_in_CTA;
+        // and store the result in sh_nsurvival_tokens_in_CTA
+        __shared__ int32 sh_nsurvival_tokens_in_CTA;
 
         // We need to move the survival tokens to the main_q
         // 
-        // main_q_global_block_offset has two purposes :
+        // sh_main_q_global_block_offset has two purposes :
         // (1) to know where to store the survival tokens in the main_q
         // (2) to perform the prefix sum degrees of the survival degrees
         //
@@ -203,13 +205,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // (1) We need a spot to store those tokens in the main_q 
         // We will ask the main_q counter where to store those tokens, the answer will be 
         // an offset of the main_q. We will store our tokens in positions :
-        // d_main_q_state[main_q_global_block_offset.ntokens], d_main_q_state[main_q_global_block_offset.ntokens+1]...
+        // d_main_q_state[sh_main_q_global_block_offset.ntokens], d_main_q_state[sh_main_q_global_block_offset.ntokens+1]...
         //
-        // (2) main_q_global_block_offset.narcs contains the number of arcs in the main_q up until index main_q_global_block_offset.ntokens
-        // ie the number of arcs going out of all states in d_main_q_state[0..main_q_global_block_offset.ntokens]
+        // (2) sh_main_q_global_block_offset.narcs contains the number of arcs in the main_q up until index sh_main_q_global_block_offset.ntokens
+        // ie the number of arcs going out of all states in d_main_q_state[0..sh_main_q_global_block_offset.ntokens]
         // it is used to compute the global prefix sum of degrees in one pass
         //
-        __shared__ TokenAndArcCountUnion main_q_global_block_offset;
+        __shared__ TokenAndArcCountUnion sh_main_q_global_block_offset;
 
         // Final cutoff from last ExpandArc execution
         const BaseFloat cutoff = *params.d_cutoff;
@@ -281,7 +283,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             zero_struct.ntokens = zero_struct.narcs = 0;
 
             // Computing the prefix sum (exclusive)
-            BlockScan(temp_storage).ExclusiveScan(block_prefix_sum_token_arc_count, 
+            BlockScan(sh_temp_storage).ExclusiveScan(block_prefix_sum_token_arc_count, 
                                                     block_prefix_sum_token_arc_count, 
                                                     zero_struct,
                                                     TokenAndArcCountSum());
@@ -296,7 +298,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 token_and_arc_count_block_sum.split.ntokens = block_prefix_sum_token_arc_count.ntokens + (is_pruned ? 0 : 1);
                 token_and_arc_count_block_sum.split.narcs = block_prefix_sum_token_arc_count.narcs + degree;
 
-                nsurvival_tokens_in_CTA = token_and_arc_count_block_sum.split.ntokens;
+                sh_nsurvival_tokens_in_CTA = token_and_arc_count_block_sum.split.ntokens;
                 
                 // Doing two things at the same time :
                 // requesting a spot in the main_q to store the survival tokens from this CTA 
@@ -305,17 +307,17 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 //
                 // We then store the return value, which is the global offset on where to store those tokens,
                 // and the total number of arcs up until that global offset
-                main_q_global_block_offset.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, token_and_arc_count_block_sum.both);
+                sh_main_q_global_block_offset.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, token_and_arc_count_block_sum.both);
             }
 
             // Syncing for three reasons :
-            // - Broadcasting main_q_global_block_offset
-            // - Broadcasting nsurvival_tokens_in_CTA
-            // - We may reuse temp_storage (cf CUB doc)
+            // - Broadcasting sh_main_q_global_block_offset
+            // - Broadcasting sh_nsurvival_tokens_in_CTA
+            // - We may reuse sh_temp_storage (cf CUB doc)
             __syncthreads(); 
 
             // Checking if we are overflowing the main_q
-            if((main_q_global_block_offset.split.ntokens + nsurvival_tokens_in_CTA) >= params.q_capacity) {
+            if((sh_main_q_global_block_offset.split.ntokens + sh_nsurvival_tokens_in_CTA) >= params.q_capacity) {
                 if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1)) {
                     // We are overflowing the main_q
                     // We first revert what this CTA has done, ie revert the previous atomicAdd
@@ -340,7 +342,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 // Note : we could remove the branch divergence here 
 
-                int32 main_q_idx = main_q_global_block_offset.split.ntokens + block_prefix_sum_token_arc_count.ntokens;
+                int32 main_q_idx = sh_main_q_global_block_offset.split.ntokens + block_prefix_sum_token_arc_count.ntokens;
 
                 InfoToken token_info = params.d_aux_q_info[aux_q_idx];
 
@@ -351,7 +353,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 // Saving the global prefix sum
                 // = (narcs until now in the main queue) + (narcs until this thread in the CTA)
-                params.d_main_q_degrees_prefix_sum[main_q_idx] = main_q_global_block_offset.split.narcs 
+                params.d_main_q_degrees_prefix_sum[main_q_idx] = sh_main_q_global_block_offset.split.narcs 
                                                                  + block_prefix_sum_token_arc_count.narcs;
 
                 // Saving the CSR arc offset for that token's state
@@ -400,10 +402,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     void CudaDecoder::PreprocessAndContract(const PreprocessParams &params) {
         dim3 grid,block;
-        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-        grid.x = DIV_ROUND_UP(*h_aux_q_end_, block.x);
 
-        KALDI_ASSERT(grid.x > 0);
+        int32 aux_q_size = *h_aux_q_end_;
+        KALDI_ASSERT(aux_q_size > 0);
+
+        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+        grid.x = DIV_ROUND_UP(aux_q_size, block.x);
+
 
         _preprocess_and_contract_kernel<<<grid,block,0,compute_st_>>>(params);
     }
@@ -441,12 +446,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
    
         // Operator for the prefix sum inside the CUDA block
         typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
-        __shared__ typename BlockScan::TempStorage temp_storage;
+        __shared__ typename BlockScan::TempStorage sh_temp_storage;
 
 
         // All threads in the last CUDA block (CTA) alive will have work to do at the end
         // this bool will be needed to broadcast the information from thread0 to all threads in the last CTA 
-        __shared__ bool is_last_CTA;
+        __shared__ bool sh_is_last_CTA;
 
         const int32 main_q_end = *params.d_main_q_end;
         const int32 main_q_size = main_q_end - 0; // main_q_offset == 0 in that kernel
@@ -496,7 +501,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             // Computing a local prefix sum inside that CUDA block
             // A second kernel will take care of adding the necessary offset to those local prefix sums
-            BlockScan(temp_storage).ExclusiveSum(degree, degree_local_prefix_sum);
+            BlockScan(sh_temp_storage).ExclusiveSum(degree, degree_local_prefix_sum);
 
             if(main_q_idx < main_q_end) {
                 // This is not the final global prefix sum
@@ -516,7 +521,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
 
             // Synchronization for two reasons :
-            // - we may need to reuse temp_storage if the for loop iterates (cf CUB's doc)
+            // - we may need to reuse sh_temp_storage if the for loop iterates (cf CUB's doc)
             // - we need all threads to be done before considering the CTA as done (see below)
             __syncthreads(); 
 
@@ -532,15 +537,15 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             int32 old = atomicAdd(params.d_n_CTA_done, 1); 
             
             // If we're the last CTA to exit, detect it
-            is_last_CTA = (old == (gridDim.x -1));
+            sh_is_last_CTA = (old == (gridDim.x -1));
         }
 
         // Synchronization for two reasons :
-        // - Broadcasting is_last_CTA
-        // - reusing temp_storage (cf CUB's doc)
+        // - Broadcasting sh_is_last_CTA
+        // - reusing sh_temp_storage (cf CUB's doc)
         __syncthreads();
         
-        if(is_last_CTA)
+        if(sh_is_last_CTA)
         {
             //
             // Our goal here is to compute the prefix sum of the previous local sums
@@ -594,7 +599,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 int32 prefix_sum_of_local_sums, total_sum_of_local_sums_for_this_iteration;
 
-                BlockScan(temp_storage).ExclusiveSum(local_sum, prefix_sum_of_local_sums, total_sum_of_local_sums_for_this_iteration);
+                BlockScan(sh_temp_storage).ExclusiveSum(local_sum, prefix_sum_of_local_sums, total_sum_of_local_sums_for_this_iteration);
 
                 prefix_sum_of_local_sums += prefix_sum_of_local_sums_offset;
                 prefix_sum_of_local_sums_offset += total_sum_of_local_sums_for_this_iteration;
@@ -603,7 +608,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     params.d_main_q_degrees_block_sums_prefix_sum[local_sum_index] = prefix_sum_of_local_sums;
                 }
 
-                // Sync'ing to be able to reuse temp_storage (cf CUB's doc)
+                // Sync'ing to be able to reuse sh_temp_storage (cf CUB's doc)
                 __syncthreads();
             }
 
@@ -625,12 +630,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
 
+        // Preprocess in place can be used only with offset == 0
         KALDI_ASSERT(*h_main_q_local_offset_ == 0);
+
         int32 main_q_size = *h_main_q_end_ - 0; // 0 = main_q_offset
 
+        KALDI_ASSERT(main_q_size > 0);
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
-
-        KALDI_ASSERT(grid.x > 0);
 
         _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
     }
@@ -663,18 +669,16 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     // d_main_q_degrees_prefix is both an input and an output
     __global__ void _finalize_degrees_scan_kernel(const int32 *d_local_sums_prefix_sum, 
-                                                  const int32 *d_main_q_local_offset, 
                                                   const int32 *d_main_q_end, 
                                                   int32 *d_main_q_degrees_prefix_sum) {
 
-        const int32 main_q_offset = *d_main_q_local_offset;
         const int32 main_q_end = *d_main_q_end;
 
-        for(int32 main_q_idx = main_q_offset + blockDim.x*blockIdx.x + threadIdx.x;
+        for(int32 main_q_idx = blockDim.x*blockIdx.x + threadIdx.x;
                   main_q_idx < main_q_end;
                   main_q_idx += blockDim.x*gridDim.x) {
 
-            int32 local_sum_idx = (main_q_idx - main_q_offset) / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+            int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
             int32 local_sum_offset = d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
 
             d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
@@ -691,13 +695,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         KALDI_ASSERT(*h_main_q_local_offset_ == 0);
 
         int32 main_q_size = *h_main_q_end_;
+        KALDI_ASSERT(main_q_size > 0);
+
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
-        // If the main_q is empty, we will not be able to continue
-        KALDI_ASSERT(grid.x > 0);
 
         _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_block_sums_prefix_sum_, 
-                                                            d_main_q_local_offset_,
                                                             d_main_q_end_, 
                                                             d_main_q_degrees_prefix_sum_);
     }
@@ -735,7 +738,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     };
 
     //
-    // GetCutoffCandidate is used by ExpandArc and NonEmittingLongTail
+    // GetCutoffCandidate is used by ExpandArc and FinalizeProcessNonemitting
     // It computes a candidate for a new cutoff. It will not necessarily be the new cutoff,
     // we'll apply an atomicMin(d_cutoff, cutoff_candidate)
     //
@@ -819,7 +822,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     //
     //
     // Note : ExpandArc is not the only kernel able to traverse arcs. 
-    // NonEmittingLongTail contains a simplified version of expand for only one CUDA block
+    // FinalizeProcessNonemitting contains a simplified version of expand for only one CUDA block
     //
 
     void __global__ _expand_arcs_kernel(ExpandArcParams params) {
@@ -827,20 +830,20 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // BlockScan that we will use to compute token indexes in the output queue, 
         // and to find the min cost in the block
         typedef cub::BlockScan<CostTypeAndInt, KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX> BlockScan;
-        __shared__ typename BlockScan::TempStorage temp_storage_scan;
+        __shared__ typename BlockScan::TempStorage sh_temp_storage_scan;
 
         // This kernel writes the new token to the output queue aux_q
         // We will request a spot to store all the new tokens created by threads in this CUDA block
-        // aux_q_index_block_offset indicates where to store them in the aux_q
+        // sh_aux_q_index_block_offset indicates where to store them in the aux_q
         // tokens created in this CUDA block will be store in :
-        // aux_q[aux_q_index_block_offset], aux_q[aux_q_index_block_offset + 1], ...
-        __shared__ int32 aux_q_index_block_offset;
+        // aux_q[sh_aux_q_index_block_offset], aux_q[sh_aux_q_index_block_offset + 1], ...
+        __shared__ int32 sh_aux_q_index_block_offset;
 
         //
         // Cutoff, stored in shared for caching purposes
         // TODO rely on cache ?
         //
-        __shared__ CostType cached_cutoff;
+        __shared__ CostType sh_cached_cutoff;
 
         const int32 total_narcs = *params.d_main_q_narcs;
         const int32 main_q_offset = *params.d_main_q_local_offset;
@@ -848,7 +851,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         
         if(threadIdx.x == 0) {
-            cached_cutoff = *params.d_cutoff;
+            sh_cached_cutoff = *params.d_cutoff;
         }
 
         __syncthreads();
@@ -964,7 +967,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 // If the total_cost is too large compared to our cutoff (beam search)
                 // then let's drop it
-                if(total_cost >= cached_cutoff)
+                if(total_cost >= sh_cached_cutoff)
                     total_cost = FLT_MAX;
                 else {
                     // We need to check if we already have a token going to that next_state,
@@ -1003,26 +1006,26 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             cost_and_index.i = has_successor;
 
             // This is an /inclusive/ scan
-            BlockScan(temp_storage_scan).InclusiveScan(cost_and_index, cost_and_index, MinCostPlusInt());
+            BlockScan(sh_temp_storage_scan).InclusiveScan(cost_and_index, cost_and_index, MinCostPlusInt());
 
             if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
                 // This is the last thread. The last value of the inclusive scan is the total
                 int32 total_successors_in_block = cost_and_index.i;
                 
                 // Requesting a spot of size total_successors_in_block in the aux_q
-                aux_q_index_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
+                sh_aux_q_index_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
 
                 //
                 // Here we detect an overflow of the aux_q
                 // we detect it before actually using the aux_q
                 // We try to prevent an overflow from happening using an adaptive beam (cf GetCutoffCandidate)
                 //
-                if((aux_q_index_block_offset + total_successors_in_block) >= params.q_capacity) {
-                    // aux_q_index_block_offset is in shared memory
+                if((sh_aux_q_index_block_offset + total_successors_in_block) >= params.q_capacity) {
+                    // sh_aux_q_index_block_offset is in shared memory
                     // its value is currently invalid (overflow)
                     // we set it to a special value and use it as a flag to broadcast
                     // the fact that we have an overflow and that all threads should exit
-                    aux_q_index_block_offset = params.q_capacity;
+                    sh_aux_q_index_block_offset = params.q_capacity;
 
                     // We revert the last operation. All threads that detected the overflow 
                     // will revert what they've done. It means that at the end of the kernel,
@@ -1045,28 +1048,28 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                      */
 
-                    CostType cutoff_candidate = GetCutoffCandidate(cached_cutoff,
+                    CostType cutoff_candidate = GetCutoffCandidate(sh_cached_cutoff,
                             cost_and_index.cost,
                             params.beam,
-                            aux_q_index_block_offset + total_successors_in_block,
+                            sh_aux_q_index_block_offset + total_successors_in_block,
                             params.q_capacity);
 
-                    cached_cutoff = (cutoff_candidate < cached_cutoff) 
+                    sh_cached_cutoff = (cutoff_candidate < sh_cached_cutoff) 
                         ? fmin(fatomicMin(params.d_cutoff, cutoff_candidate), cutoff_candidate)
-                        : fmin(*params.d_cutoff, cached_cutoff);
+                        : fmin(*params.d_cutoff, sh_cached_cutoff);
                 }
             }
 
             // Sync'ing for two reasons :
-            // - Broadcasting aux_q_index_block_offset
-            // - reusing temp_storage (cf CUB's doc)
+            // - Broadcasting sh_aux_q_index_block_offset
+            // - reusing sh_temp_storage (cf CUB's doc)
             __syncthreads(); 
 
 
             // The only case where we can have that condition met,
             // if we detected an overflow if the previous lines
             // we need to finalize our work and quit 
-            if(aux_q_index_block_offset == params.q_capacity) 
+            if(sh_aux_q_index_block_offset == params.q_capacity) 
                 goto finalize_kernel; // keeping things clean before aborting
 
             //
@@ -1077,7 +1080,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             cost_and_index.i -= has_successor; // we want the exclusive sum now
 
             int32 aux_q_block_index = cost_and_index.i;
-            int32 aux_q_index = aux_q_index_block_offset + aux_q_block_index;
+            int32 aux_q_index = sh_aux_q_index_block_offset + aux_q_block_index;
 
             if(has_successor) {
                 // We save the new token to the aux_q
@@ -1090,12 +1093,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         floatToOrderedInt(total_cost)
                         );
 
-                // We've updated the cached_cutoff since created the new token
+                // We've updated the sh_cached_cutoff since created the new token
                 // there's a chance that we no longer need to use that token
                 // we've saved the cost and the state to be able to ignore it in the following prune operation
                 // but there's no need to write out the infos
 
-                if(total_cost < cached_cutoff) { 
+                if(total_cost < sh_cached_cutoff) { 
                     InfoToken new_tok_info;
                     // Index of the parent token
                     // the parent is the token used as input 
@@ -1148,10 +1151,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     void CudaDecoder::ExpandArcs(const ExpandArcParams &params, int32 nthreads) {
         dim3 grid,block;
-        block.x = 256;
+
+        KALDI_ASSERT(nthreads > 0);
+
+        block.x = KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX;
         grid.x = DIV_ROUND_UP(nthreads, block.x);
 
-        KALDI_ASSERT(grid.x > 0);
 
         _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
     }
@@ -1160,7 +1165,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     /*
         
-       NonEmittingLongTail
+       FinalizeProcessNonemitting
        Meta-kernel (merging preprocess and expand) but only works with 1 CUDA block
 
        Used to avoid calling multiple "heavy lifting" kernels for the tail of non emitting
@@ -1174,7 +1179,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
        The preprocess stage is not done on the first iteration, because it was
        already done by the ProcessAndContract kernel. We always call ProcessAndContract
-       before calling NonEmittingLongTail 
+       before calling FinalizeProcessNonemitting 
 
        At the end, this kernel finalize the computation for current frame,
        so that it's ready for next ProcessEmitting
@@ -1195,21 +1200,21 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
 
     __launch_bounds__(KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX, 1)
-        __global__ void _process_nonem_longtail(const uint32_t *d_arc_offsets, 
+        __global__ void _finalize_process_non_emitting(const uint32_t *d_arc_offsets, 
                 ExpandArcParams params) {
             
             // Used to find the minimum cost in the CUDA block
             typedef cub::BlockReduce<float, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockReduce;
-            __shared__ typename BlockReduce::TempStorage temp_storage_reduce;
+            __shared__ typename BlockReduce::TempStorage sh_temp_storage_reduce;
 
             // Used to compute the index in the output queue
             typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockScan;
-            __shared__ typename BlockScan::TempStorage temp_storage_scan;
+            __shared__ typename BlockScan::TempStorage sh_temp_storage_scan;
 
             // Cutoff for the beam search. 
             // during the execution of the kernel, it will not be necessary to update params.d_cutoff
             // (from the global memory). We're the only CUDA block executing 
-            __shared__ BaseFloat cutoff;
+            __shared__ BaseFloat sh_cutoff;
 
             //
             // main_q is both input and output
@@ -1232,7 +1237,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     
             int32 input_q_size = output_q_offset - input_q_offset;  
 
-            cutoff = *params.d_cutoff;
+            sh_cutoff = *params.d_cutoff;
 
             // We'll switch queue at the beg of the loop
             output_q_offset = input_q_offset;
@@ -1264,7 +1269,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         BaseFloat token_cost = params.d_main_q_cost[q_idx];
 
                         int32 degree = 0;
-                        if(token_cost < cutoff) {
+                        if(token_cost < sh_cutoff) {
                             BaseFloat best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
 
                             if(token_cost == best_cost) {
@@ -1294,14 +1299,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                         int32 degree_prefix_sum;
                         int32 degree_sum_for_this_iteration;
-                        BlockScan(temp_storage_scan).ExclusiveSum(degree, degree_prefix_sum, degree_sum_for_this_iteration);
+                        BlockScan(sh_temp_storage_scan).ExclusiveSum(degree, degree_prefix_sum, degree_sum_for_this_iteration);
                         int32 scan = degree_prefix_sum + total_narcs;
                         total_narcs += degree_sum_for_this_iteration;
 
                         if(q_idx < output_q_offset)
                             params.d_main_q_degrees_prefix_sum[q_idx] = scan;
 
-                         __syncthreads(); // reusing temp_storage_scan + degrees ready
+                         __syncthreads(); // reusing sh_temp_storage_scan + degrees ready
                     }
 
 
@@ -1350,10 +1355,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         } 
                     }
 
-                    BaseFloat min_cost = BlockReduce(temp_storage_reduce).Reduce(total_cost, cub::Min());
+                    BaseFloat min_cost = BlockReduce(sh_temp_storage_reduce).Reduce(total_cost, cub::Min());
 
                     if(threadIdx.x == 0) {
-                        cutoff = GetCutoffCandidate(cutoff,
+                        sh_cutoff = GetCutoffCandidate(sh_cutoff,
                                 min_cost,
                                 params.beam,
                                 output_q_end,
@@ -1362,14 +1367,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                     __syncthreads();
 
-                    int32 has_successor = (total_cost < cutoff && valid_input) ? 1 : 0;
+                    int32 has_successor = (total_cost < sh_cutoff && valid_input) ? 1 : 0;
 
                     if(has_successor) 
                         atomicMin(&params.d_state_best_cost[arc_next_state], floatToOrderedInt(total_cost));
 
                     int32 new_q_idx_block = has_successor;
                     int32 total_in_blk;
-                    BlockScan(temp_storage_scan).ExclusiveSum(new_q_idx_block, new_q_idx_block, total_in_blk);
+                    BlockScan(sh_temp_storage_scan).ExclusiveSum(new_q_idx_block, new_q_idx_block, total_in_blk);
 
                     if((output_q_end + total_in_blk) >= params.q_capacity) {
                         *params.h_q_overflow = 1;
@@ -1412,18 +1417,18 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 *params.d_main_q_local_offset = 0; 
                 *params.h_main_q_local_offset = 0; 
 
-                *params.d_cutoff = cutoff;
+                *params.d_cutoff = sh_cutoff;
             }
 
         }
 
-    void CudaDecoder::NonEmittingLongTail(const uint32_t *d_arc_offsets, 
+    void CudaDecoder::FinalizeProcessNonemitting(const uint32_t *d_arc_offsets, 
             const ExpandArcParams &params) {
 
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX;
         grid.x = 1; // it is designed for the long tail
-        _process_nonem_longtail<<<grid,block,0,compute_st_>>>(d_arc_offsets, params);
+        _finalize_process_non_emitting<<<grid,block,0,compute_st_>>>(d_arc_offsets, params);
     }
 
 
