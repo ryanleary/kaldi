@@ -448,9 +448,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // this bool will be needed to broadcast the information from thread0 to all threads in the last CTA 
         __shared__ bool is_last_CTA;
 
-        const int32 main_q_offset = *params.d_main_q_local_offset; // TODO ASSERT offset == 0
         const int32 main_q_end = *params.d_main_q_end;
-        const int32 main_q_size = main_q_end - main_q_offset;
+        const int32 main_q_size = main_q_end - 0; // main_q_offset == 0 in that kernel
 
         // Final cutoff from the expand kernel
         const BaseFloat cutoff = *params.d_cutoff;
@@ -463,7 +462,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 block_offset += gridDim.x*blockDim.x) {
 
             // Position of considered token in the main_q
-            int32 main_q_idx = main_q_offset + block_offset + threadIdx.x; 
+            int32 main_q_idx = block_offset + threadIdx.x; 
 
             // Total number of arcs from that token's state
             int32 degree = 0; 
@@ -691,8 +690,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // during that phase, the main_q_offset must be zero
         KALDI_ASSERT(*h_main_q_local_offset_ == 0);
 
-        // TODO remove code related to offset in that code
-        int32 main_q_size = *h_main_q_end_ - *h_main_q_local_offset_;
+        int32 main_q_size = *h_main_q_end_;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         // If the main_q is empty, we will not be able to continue
@@ -927,24 +925,42 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 // ie the arc at index (4-3) = 1, the second arc of the second token in main_q
                 //
 
+                // Searching for the source of the arc that we will process (main_q_arc_index)
                 main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, main_q_offset, main_q_end-1); 
 
-                int32 lower_bound = params.d_main_q_degrees_prefix_sum[main_q_idx];
+                // state_first_arc_idx_in_main_q
+                // d_main_q_degrees_prefix_sum contains the prefix sum of the 
+                // degrees of all tokens in the main_q
+                // d_main_q_degrees_prefix_sum[main_q_idx] contains the number of arc
+                // in the main_q until that token
+                int32 state_first_arc_idx_in_main_q = params.d_main_q_degrees_prefix_sum[main_q_idx];
 
-                // TODO add comment
+                // arc_offset_start is the offset in the CSR, to find the arcs 
+                // related to the state main_q_state_[main_q_idx]
+                // it was set by the preprocess kernel
                 int32 arc_offset_start = params.d_q_arc_offsets[main_q_idx];
 
-                arc_idx = arc_offset_start + (main_q_arc_index - lower_bound); // TODO add variable
+                // local_arc_index is the arc index for that state
+                // if local_arc_index == 2, we will process the second arc
+                // of state main_q_state_[main_q_idx]
+                int32 local_arc_index = main_q_arc_index - state_first_arc_idx_in_main_q;
 
+                // corresponding arc_idx in the FST
+                arc_idx = arc_offset_start + local_arc_index; 
+
+                // Destination of that arc
                 arc_next_state = params.arc_nextstates[arc_idx];
 
                 // Building the total cost incrementally 
                 // we'll add the acoustic cost and the old token's cost
-                total_cost = params.arc_weights[arc_idx];
+                CostType arc_fixed_cost = params.arc_weights[arc_idx];
 
                 int32 arc_ilabel = params.is_emitting ? params.arc_ilabels[arc_idx] : 0;
-                total_cost += (arc_ilabel != 0) ? -params.d_loglikelihoods[arc_ilabel] : 0.0; 
-                total_cost += params.d_main_q_cost[main_q_idx];
+                
+                CostType acoustic_cost = (arc_ilabel != 0) ? -params.d_loglikelihoods[arc_ilabel] : 0.0; 
+                CostType prev_token_cost  = params.d_main_q_cost[main_q_idx];
+
+                total_cost = prev_token_cost + arc_fixed_cost + acoustic_cost;
 
                 // If the total_cost is too large compared to our cutoff (beam search)
                 // then let's drop it
@@ -1115,9 +1131,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 *params.d_n_CTA_done = 0; 
 
                 if(params.is_emitting) {
-                    *params.d_main_q_local_offset = 0; // TODO not needed
-                    *params.h_main_q_local_offset = 0; // TODO not needed
-
                     // It was the last time that we were using tokens in the main_q
                     // flushing it now
                     *params.d_main_q_end = 0;
@@ -1319,10 +1332,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     if(valid_input) {
                         q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, input_q_offset, output_q_offset-1); 
 
-                        int32 lower_bound = params.d_main_q_degrees_prefix_sum[q_idx];
+                        int32 state_first_arc_idx_in_main_q = params.d_main_q_degrees_prefix_sum[q_idx];
                         int32 arc_offset_start = params.d_q_arc_offsets[q_idx];
 
-                        arc_idx = arc_offset_start + (main_q_arc_index - lower_bound);
+                        arc_idx = arc_offset_start + (main_q_arc_index - state_first_arc_idx_in_main_q);
 
                         arc_next_state = params.arc_nextstates[arc_idx];
                         BaseFloat arc_weight = params.arc_weights[arc_idx];
