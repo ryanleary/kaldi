@@ -1,6 +1,6 @@
 // decoder/cuda-decoder-kernels.cu
 
-// 2018 - Hugo Braun, Justin Luitjens
+// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -32,9 +32,9 @@ typedef CudaDecoder::IntegerCostType IntegerCostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
 typedef CudaDecoder::ExpandArcParams ExpandArcParams; 
 
-//
-// Utils device function
-//
+    //
+    // Utils device function
+    //
 
 
     //
@@ -94,42 +94,81 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         _init_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_, d_cutoff_);
     }
 
-    // Used to reset lookup table between frames
-    // Using the queue to reset only the values needed
-    // Also takes care of resetting cutoff
-    __global__ void _reset_state_cost_lookup_kernel(const StateId *d_main_q_state_, 
+        
+     /*
+     
+     ResetStateCostLookupAndFinalizePreprocessInPlace
+     Does two things :
+     (1) Reset the lookup between frames :
+         Using the queue to reset only the values needed
+         Also takes care of resetting cutoff
+    
+     (2) Finalize PreprocessInPlace :
+       Part 2 of the prefix sum for "PreprocessInPlace" 
+       
+       For PreprocessAndContract we were able to do the global prefix sum of degrees in one pass, so we should not call
+       this kernel
+
+       Our final goal is to have the prefix sum of the degrees of the token's state of the main_q
+       and store that prefix sum in d_main_q_degrees_prefix_sum
+
+       In PreprocessInPlace we've computed two things :
+       
+       - "local prefix sums" of the degree. Each CUDA block has computed the local prefix sum of its degrees. We've
+       stored each of the local prefix sums in d_main_q_degrees_prefix_sum
+       - the prefix sum of the local sums (local sum = sum of all degrees in a CUDA block). This gives us the offset
+       to add to each local prefix sum to end up with a global prefix sum
+
+       Note : If we want to speed up expand, we can compute lower and upper bound to restrain 
+       the binary search in expand
+       This can be done on the fly here, and removes main bottleneck of expand
+
+     */
+
+    __global__ void _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place(const StateId *d_main_q_state_, 
                                                     const int32 *d_main_q_end_, 
+                                                    const int32 *d_local_sums_prefix_sum,  
                                                     IntegerCostType *d_state_best_cost, 
-                                                    IntegerCostType *d_cutoff) {
+                                                    IntegerCostType *d_cutoff,
+                                                    int32 *d_main_q_degrees_prefix_sum) {
         if(blockIdx.x == 0 && threadIdx.x == 0)
             *d_cutoff = floatToOrderedInt(FLT_MAX); // we also reset the cutoff
 
         int32 main_q_end = *d_main_q_end_; 
 
-        for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
-                idx < main_q_end;
-                idx += blockDim.x*gridDim.x) {
+        for(int32 main_q_idx = blockIdx.x*blockDim.x + threadIdx.x;
+                main_q_idx < main_q_end;
+                main_q_idx += blockDim.x*gridDim.x) {
             // d_main_q_state_ contains the list of states that we've considered in the last frame
             // it corresponds to the list of indexes i such as d_state_best_cost[i] < +INF
             // faster than init_state_cost_lookup_kernel by a factor of ~10
-            StateId state = d_main_q_state_[idx];
+            StateId state = d_main_q_state_[main_q_idx];
+
+
+            int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+            int32 local_sum_offset = d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
+
             d_state_best_cost[state]  = floatToOrderedInt(FLT_MAX);
+            d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
         }
     }
 
-    void CudaDecoder::ResetStateCostLookup() {
+    void CudaDecoder::ResetStateCostLookupAndFinalizePreprocessInPlace() {
         int32 main_q_size = *h_main_q_end_;
 
         KALDI_ASSERT(main_q_size > 0);
+        KALDI_ASSERT(*h_main_q_local_offset_ == 0);
 
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
-        _reset_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(d_main_q_state_, 
+        _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place<<<grid,block,0,compute_st_>>>(d_main_q_state_, 
                                                                       d_main_q_end_,
+                                                                      d_main_q_degrees_block_sums_prefix_sum_,   
                                                                       d_state_best_cost_, 
-                                                                      d_cutoff_);
+                                                                      d_cutoff_,
+                                                                      d_main_q_degrees_prefix_sum_);
     }
 
 
@@ -631,70 +670,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         grid.x = DIV_ROUND_UP(main_q_size, block.x);
 
         _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
-    }
-
-
-
-    /*
-
-       Part 2 of the prefix sum for "PreprocessInPlace" 
-       
-       For PreprocessAndContract we were able to do the global prefix sum of degrees in one pass, so we should not call
-       this kernel
-
-       Our final goal is to have the prefix sum of the degrees of the token's state of the main_q
-       and store that prefix sum in d_main_q_degrees_prefix_sum
-
-       In PreprocessInPlace we've computed two things :
-       
-       - "local prefix sums" of the degree. Each CUDA block has computed the local prefix sum of its degrees. We've
-       stored each of the local prefix sums in d_main_q_degrees_prefix_sum
-       - the prefix sum of the local sums (local sum = sum of all degrees in a CUDA block). This gives us the offset
-       to add to each local prefix sum to end up with a global prefix sum
-
-       Note : If we want to speed up expand, we can compute lower and upper bound to restrain 
-       the binary search in expand
-       This can be done on the fly here, and removes main bottleneck of expand
-
-       TODO merge with ResetStateCostLookup
-     */
-
-    // d_main_q_degrees_prefix is both an input and an output
-    __global__ void _finalize_degrees_scan_kernel(const int32 *d_local_sums_prefix_sum, 
-                                                  const int32 *d_main_q_end, 
-                                                  int32 *d_main_q_degrees_prefix_sum) {
-
-        const int32 main_q_end = *d_main_q_end;
-
-        for(int32 main_q_idx = blockDim.x*blockIdx.x + threadIdx.x;
-                  main_q_idx < main_q_end;
-                  main_q_idx += blockDim.x*gridDim.x) {
-
-            int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-            int32 local_sum_offset = d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
-
-            d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
-        }
-
-    }
-
-    void CudaDecoder::FinalizePreprocessInPlace() {
-        dim3 grid,block;
-        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-
-        // Should be called only at Emitting phase
-        // during that phase, the main_q_offset must be zero
-        KALDI_ASSERT(*h_main_q_local_offset_ == 0);
-
-        int32 main_q_size = *h_main_q_end_;
-        KALDI_ASSERT(main_q_size > 0);
-
-        grid.x = DIV_ROUND_UP(main_q_size, block.x);
-
-
-        _finalize_degrees_scan_kernel<<<grid,block,0,compute_st_>>>(d_main_q_degrees_block_sums_prefix_sum_, 
-                                                            d_main_q_end_, 
-                                                            d_main_q_degrees_prefix_sum_);
     }
 
 

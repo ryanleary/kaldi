@@ -1,6 +1,6 @@
 // decoder/cuda-decoder.cu
 
-// 2018 - Hugo Braun, Justin Luitjens
+// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -357,10 +357,7 @@ namespace kaldi {
             cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
 
             // Resetting the lookup table for the new frame
-            ResetStateCostLookup();
-
-            // Finalizing the prefix sum from Preprocess kernel
-            FinalizePreprocessInPlace();
+            ResetStateCostLookupAndFinalizePreprocessInPlace();
         } else {
             PreprocessAndContract(preprocess_params);
             

@@ -1,6 +1,6 @@
 // decoder/cuda-decoder-utils.cu
 
-// 2018 - Hugo Braun, Justin Luitjens
+// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -27,7 +27,7 @@ namespace kaldi {
 
     void CudaFst::initialize(const fst::Fst<StdArc> &fst) {
         nvtxRangePushA("CudaFst constructor");
-        bytes_cudaMalloc=0;
+
         //count states since Fst doesn't provide this functionality
         numStates=0;
         for( fst::StateIterator<fst::Fst<StdArc> > iter(fst); !iter.Done(); iter.Next()) {
@@ -37,23 +37,25 @@ namespace kaldi {
         cudaMallocHost(&h_final,sizeof(float)*numStates);
 
         //allocate and initialize offset arrays
-        h_e_offsets=(unsigned int *)malloc(sizeof(unsigned int)*(numStates+1));
-        h_ne_offsets=(unsigned int *)malloc(sizeof(unsigned int)*(numStates+1));
+        cudaMallocHost(&h_e_offsets, (numStates+1)*sizeof(unsigned int));
+        cudaMallocHost(&h_ne_offsets, (numStates+1)*sizeof(unsigned int));
 
-        cudaMalloc((void**)&d_e_offsets,sizeof(unsigned int)*(numStates+1)); bytes_cudaMalloc+=sizeof(unsigned int)*(numStates+1);
-        cudaMalloc((void**)&d_ne_offsets,sizeof(unsigned int)*(numStates+1)); bytes_cudaMalloc+=sizeof(unsigned int)*(numStates+1);
-
-        memset(h_e_offsets,0,sizeof(unsigned int)*(numStates+1));
-        memset(h_ne_offsets,0,sizeof(unsigned int)*(numStates+1));
-
-        //iterate through states and arcs and count number of arcs per state
+        cudaMalloc((void**)&d_e_offsets,sizeof(unsigned int)*(numStates+1));
+        cudaMalloc((void**)&d_ne_offsets,sizeof(unsigned int)*(numStates+1));
+ 
+       //iterate through states and arcs and count number of arcs per state
         e_count=0;
         ne_count=0;
         max_ilabel=0;
+       
+        // Init first offsets
+        h_ne_offsets[0] = 0; 
+        h_e_offsets[0] = 0; 
 
         for(int i=0;i<numStates;i++) {
             h_final[i]=fst.Final(i).Value();
-            //count emmiting and non_emitting arcs
+
+            //count emiting and non_emitting arcs
             for (fst::ArcIterator<fst::Fst<StdArc> > aiter(fst, i); !aiter.Done(); aiter.Next()) {
                 StdArc arc = aiter.Value();
                 int32 ilabel = arc.ilabel;
@@ -73,42 +75,34 @@ namespace kaldi {
             h_e_offsets[i+1]=e_count;
         }
 
-        //offset ne_offsets by the number of emitting arcs
-        for(int i=0;i<numStates+1;i++) {
-            h_e_offsets[i]+=1;          //add dummy arc at the beginingg.
-            h_ne_offsets[i]+=e_count+1;   //add dummy arc and put e_arcs before
-        }
+        // We put the emitting arcs before the nonemitting arcs in the arc list
+        // adding offset to the non emitting arcs
+        // we go to numStates+1 to take into account the last offset
+        for(int i=0;i<numStates+1;i++) 
+            h_ne_offsets[i]+=e_count;   //e_arcs before
 
-        arc_count=e_count+ne_count+1;
+        arc_count=e_count+ne_count;
 
         cudaMemcpy(d_e_offsets,h_e_offsets,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice);
         cudaMemcpy(d_ne_offsets,h_ne_offsets,sizeof(unsigned int)*(numStates+1),cudaMemcpyHostToDevice);
 
-
-        //Allocate non-zero arrays
         cudaMallocHost(&h_arc_weights,arc_count*sizeof(BaseFloat));
         cudaMallocHost(&h_arc_nextstates,arc_count*sizeof(StateId));
         cudaMallocHost(&h_arc_ilabels,arc_count*sizeof(int32));
         cudaMallocHost(&h_arc_olabels,arc_count*sizeof(int32));
 
-        cudaMalloc((void**)&d_arc_weights,arc_count*sizeof(BaseFloat));
-        cudaMalloc((void**)&d_arc_nextstates,arc_count*sizeof(StateId));
+        cudaMalloc(&d_arc_weights,arc_count*sizeof(BaseFloat));
+        cudaMalloc(&d_arc_nextstates,arc_count*sizeof(StateId));
+
         // Only the ilabels for the e_arc are needed on the device
-        cudaMalloc((void**)&d_arc_ilabels,e_count*sizeof(int32)); 
+        cudaMalloc(&d_arc_ilabels,e_count*sizeof(int32)); 
+        // We do not need the olabels on the device - GetBestPath is on CPU
 
         //now populate arc data
-        int e_idx=1;          //save room for dummy arc (so start at 1)
-        int ne_idx=e_count+1; //starts where e_offsets ends
-
-        //create dummy arc
-        h_arc_weights[0]=StdWeight::One().Value();
-        h_arc_nextstates[0]=fst.Start();
-        h_arc_ilabels[0]=0;
-        h_arc_olabels[0]=0;
+        int e_idx=0;
+        int ne_idx=e_count; //starts where e_offsets ends
 
         for(int i=0;i<numStates;i++) {
-            //count emiting and non_emitting arcs
-
             for (fst::ArcIterator<fst::Fst<StdArc> > aiter(fst, i); !aiter.Done(); aiter.Next()) {
                 StdArc arc = aiter.Value();
                 int idx;
@@ -127,8 +121,7 @@ namespace kaldi {
         cudaMemcpy(d_arc_weights,h_arc_weights,arc_count*sizeof(BaseFloat),cudaMemcpyHostToDevice);
         cudaMemcpy(d_arc_nextstates,h_arc_nextstates,arc_count*sizeof(StateId),cudaMemcpyHostToDevice);
         cudaMemcpy(d_arc_ilabels,h_arc_ilabels, e_count*sizeof(int32),cudaMemcpyHostToDevice);
-
-        cudaDeviceSynchronize();
+        
         cudaCheckError();
 
         nvtxRangePop();
@@ -137,8 +130,8 @@ namespace kaldi {
     void CudaFst::finalize() {
         nvtxRangePushA("CudaFst destructor");
         cudaFreeHost(h_final);
-        free(h_e_offsets);
-        free(h_ne_offsets);
+        cudaFreeHost(h_e_offsets);
+        cudaFreeHost(h_ne_offsets);
 
         cudaFree(d_e_offsets);
         cudaFree(d_ne_offsets);
@@ -158,11 +151,12 @@ namespace kaldi {
     /***************************************End CudaFst****************************************************/
 
 
-    
-
+    // Constructor always takes an initial capacity for the vector
+    // even if the vector can grow if necessary, it damages performance
+    // we need to have an appropriate initial capacity (is set using a parameter in CudaDecoderConfig)
     InfoTokenVector::InfoTokenVector(int capacity, cudaStream_t st) {
         capacity_ = capacity;
-        KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_;
+        KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_ << " tokens";
         cudaMallocHost(&h_data_, capacity_ * sizeof(InfoToken)); 
         SetCudaStream(st);
         Reset();

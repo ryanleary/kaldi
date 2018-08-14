@@ -1,6 +1,6 @@
 // decoder/cuda-decoder.h
 
-// 2018 - Hugo Braun, Justin Luitjens
+// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
 
 // See ../../COPYING for clarification regarding multiple authors
 //
@@ -372,9 +372,9 @@ private:
 
             // We need to reset d_state_best_cost between frames. We could use InitStateCost
             // but a large portion of the lookup table has not been used
-            // ResetStateCostLookup resets only the costs that are not +INF, using the d_main_q_state to do it
+            // ResetStateCostLookupAndFinalizePreprocessInPlace resets only the costs that are not +INF, using the d_main_q_state to do it
             // d_main_q_state contains the list of states that have been considered and have a best cost < +INF
-            void ResetStateCostLookup();
+            void ResetStateCostLookupAndFinalizePreprocessInPlace();
 
             // Pre-computes log likelihoods for the current frame 
             void ComputeLogLikelihoods(DecodableInterface *decodable);

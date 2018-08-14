@@ -1,6 +1,6 @@
 // decoder/cuda-decoder-utils.h
 
-// 2018 - Hugo Braun, Justin Luitjens
+// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
 
 // See ../../COPYING for clarification regarding multiple authors
 //
