@@ -38,6 +38,11 @@
 // Below that value, we launch the persistent kernel for NonEmitting
 #define KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS 4096
 
+// Moves data back to the CPU during computation and looks if everything looks ok
+// Three levels 0 (no debugging), and 1 to 3, depending on how much we want to check things
+// (performance will decrease)
+#define KALDI_CUDA_DECODER_DEBUG_LEVEL 0
+
 namespace kaldi {
 
    class CudaDecoder;
@@ -581,6 +586,10 @@ private:
             // contains best_cost_in_the_queue + beam_
             // Updated during the ExpandArc operation
             IntegerCostType *d_cutoff_;
+
+            // Used for debugging purposes
+            // only malloc'ed if necessary
+            int32 *h_debug_buf1, *h_debug_buf2;
 
             int32 max_tokens_;
             int32 max_tokens_per_frame_;

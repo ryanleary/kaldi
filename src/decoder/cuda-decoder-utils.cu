@@ -122,6 +122,9 @@ namespace kaldi {
         cudaMemcpy(d_arc_nextstates,h_arc_nextstates,arc_count*sizeof(StateId),cudaMemcpyHostToDevice);
         cudaMemcpy(d_arc_ilabels,h_arc_ilabels, e_count*sizeof(int32),cudaMemcpyHostToDevice);
         
+        // Making sure the graph is ready
+        cudaDeviceSynchronize();
+
         cudaCheckError();
 
         nvtxRangePop();
@@ -154,11 +157,11 @@ namespace kaldi {
     // Constructor always takes an initial capacity for the vector
     // even if the vector can grow if necessary, it damages performance
     // we need to have an appropriate initial capacity (is set using a parameter in CudaDecoderConfig)
-    InfoTokenVector::InfoTokenVector(int capacity, cudaStream_t st) {
+    InfoTokenVector::InfoTokenVector(int capacity) {
         capacity_ = capacity;
         KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_ << " tokens";
         cudaMallocHost(&h_data_, capacity_ * sizeof(InfoToken)); 
-        SetCudaStream(st);
+        SetCudaStream(0); // using default stream
         Reset();
     }
 

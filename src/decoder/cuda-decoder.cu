@@ -37,14 +37,14 @@ namespace kaldi {
                      bytes_cudaMalloc(0), 
                      max_tokens_(config.max_tokens), 
                      max_tokens_per_frame_(config.max_tokens_per_frame),
-                     h_all_tokens_info_(config.max_tokens, copy_st_) {
+                     h_all_tokens_info_(config.max_tokens) {
 
         //
         // For a description of the class members, please refer to the cuda-decoder.h file
         //
 
         cudaStreamCreate(&compute_st_);
-        cudaStreamCreate(&copy_st_);
+        cudaStreamCreate(&copy_st_); // TODO COPY IS NOT INIT in h_all_tokens_info
 
         cudaEventCreate(&can_read_h_main_q_narcs_);
         cudaEventCreate(&can_write_to_main_q_);
@@ -90,6 +90,8 @@ namespace kaldi {
         cudaMalloc(&d_loglikelihoods_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
 
         cudaMalloc(&d_state_best_cost_, sizeof(IntegerCostType)*fst_.numStates);
+
+        h_all_tokens_info_.SetCudaStream(copy_st_);
 
         cudaCheckError();
     }

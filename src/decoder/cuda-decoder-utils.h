@@ -100,7 +100,7 @@ namespace kaldi {
         InfoToken *h_data_;
 
         public:
-        InfoTokenVector(int initial_capacity, cudaStream_t st);
+        InfoTokenVector(int initial_capacity);
         void Reset();
         void SetCudaStream(cudaStream_t st);
         void CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count);    

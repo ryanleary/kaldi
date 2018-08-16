@@ -415,9 +415,15 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 // d_main_q_end was modified
                 // we update h_main_q_end to keep it consistent
                 // the h_* pointers are in the pinned host memory, we can access them from the device
-                *params.h_main_q_end = *params.d_main_q_end;
-                *params.h_main_q_narcs = *params.d_main_q_narcs;
 
+                int main_q_end = *params.d_main_q_end;
+                int main_q_narcs = *params.d_main_q_narcs;
+
+                *params.h_main_q_end = main_q_end;
+                *params.h_main_q_narcs = main_q_narcs;
+
+                params.d_main_q_degrees_prefix_sum[main_q_end] = main_q_narcs;
+                
                 // We moved what we had to move from the aux q to the main q
                 // We now empty the aux q 
                 *params.d_aux_q_end = 0;
@@ -647,9 +653,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             {
                 // Final offset is the overall total
                 int total_sum_of_local_sums = prefix_sum_of_local_sums_offset;
-                *params.d_main_q_narcs = total_sum_of_local_sums; 
+                int main_q_narcs = total_sum_of_local_sums;
+
+                *params.d_main_q_narcs = main_q_narcs; 
                 // h_main_q_narcs is in pinned memory, we can write to it from the device
-                *params.h_main_q_narcs = total_sum_of_local_sums; 
+                *params.h_main_q_narcs = main_q_narcs; 
+
+                params.d_main_q_degrees_prefix_sum[main_q_end] = main_q_narcs;
+
                 // reset for next time
                 *params.d_n_CTA_done = 0;
             }
