@@ -10,7 +10,7 @@ OBJFILES = training-graph-compiler.o lattice-simple-decoder.o lattice-faster-dec
    decoder-wrappers.o
 
 ifeq ($(CUDA), true)
-    OBJFILES += cuda-decoder.o
+    OBJFILES += cuda-decoder.o cuda-decoder-kernels.o cuda-decoder-utils.o
 endif
 
 LIBNAME = kaldi-decoder

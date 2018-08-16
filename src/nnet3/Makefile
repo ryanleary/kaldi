@@ -31,7 +31,7 @@ OBJFILES = nnet-common.o nnet-compile.o nnet-component-itf.o \
   nnet-compile-looped.o decodable-simple-looped.o \
   decodable-online-looped.o decodable-online-looped-cuda.o convolution.o \
   nnet-convolutional-component.o attention.o \
-  nnet-attention-component.o
+  nnet-attention-component.o nnet-tdnn-component.o
 
 ifeq ($(CUDA), true)
   OBJFILES += decodable-online-looped-cuda.o
