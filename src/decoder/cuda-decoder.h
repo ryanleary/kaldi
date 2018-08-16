@@ -41,7 +41,7 @@
 // Moves data back to the CPU during computation and looks if everything looks ok
 // Three levels 0 (no debugging), and 1 to 3, depending on how much we want to check things
 // (performance will decrease)
-#define KALDI_CUDA_DECODER_DEBUG_LEVEL 0
+#define KALDI_CUDA_DECODER_DEBUG_LEVEL 1
 
 namespace kaldi {
 
@@ -92,9 +92,6 @@ namespace kaldi {
 
             CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config);  
             ~CudaDecoder();
-
-            inline size_t getCudaMallocBytes() const { return bytes_cudaMalloc; } 
-            inline size_t getCudaMallocManagedBytes() const { return bytes_cudaMallocManaged;  }
 
             // Decode this utterance.
             /// Returns true if any tokens reached the end of the file (regardless of
@@ -410,6 +407,13 @@ private:
             // if a kernel sets the flag h_q_overflow, we send a warning to stderr 
             void PrintOverflowWarning();
 
+            //
+            // Debug functions
+            // Called only if necessary
+            // depends on the value of KALDI_CUDA_DECODER_DEBUG_LEVEL
+            //
+            void DebugAssertsNewFrame();
+            void DebugAssertsBeforeExpand(bool is_emitting);
 
             //
             // Data members
@@ -587,21 +591,20 @@ private:
             // Updated during the ExpandArc operation
             IntegerCostType *d_cutoff_;
 
-            // Used for debugging purposes
-            // only malloc'ed if necessary
-            int32 *h_debug_buf1, *h_debug_buf2;
-
             int32 max_tokens_;
             int32 max_tokens_per_frame_;
 
             // Keep track of the number of frames decoded in the current file.
             int32 num_frames_decoded_;
 
-            size_t bytes_cudaMalloc, bytes_cudaMallocManaged;
+            // Used for debugging purposes
+            // only malloc'ed if necessary
+            int32 *h_debug_buf1_, *h_debug_buf2_;
 
             KALDI_DISALLOW_COPY_AND_ASSIGN(CudaDecoder);
     };
 
+    
 
 } // end namespace kaldi.
 

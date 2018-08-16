@@ -34,7 +34,6 @@ namespace kaldi {
 
     CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), 
                      beam_(config.beam),
-                     bytes_cudaMalloc(0), 
                      max_tokens_(config.max_tokens), 
                      max_tokens_per_frame_(config.max_tokens_per_frame),
                      h_all_tokens_info_(config.max_tokens) {
@@ -44,7 +43,7 @@ namespace kaldi {
         //
 
         cudaStreamCreate(&compute_st_);
-        cudaStreamCreate(&copy_st_); // TODO COPY IS NOT INIT in h_all_tokens_info
+        cudaStreamCreate(&copy_st_); 
 
         cudaEventCreate(&can_read_h_main_q_narcs_);
         cudaEventCreate(&can_write_to_main_q_);
@@ -85,13 +84,20 @@ namespace kaldi {
         cudaMalloc(&d_main_q_degrees_block_sums_prefix_sum_, 
                 (DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)* sizeof(int32));
 
-        cudaMalloc(&d_main_q_arc_offsets_, max_tokens_per_frame_ * sizeof(int32));
+        cudaMalloc(&d_main_q_arc_offsets_, (max_tokens_per_frame_+1) * sizeof(int32));
 
         cudaMalloc(&d_loglikelihoods_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
 
         cudaMalloc(&d_state_best_cost_, sizeof(IntegerCostType)*fst_.numStates);
 
         h_all_tokens_info_.SetCudaStream(copy_st_);
+
+        if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
+            KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
+                     
+            cudaMallocHost(&h_debug_buf1_, (fst_.numStates) * sizeof(int32));
+            cudaMallocHost(&h_debug_buf2_, (max_tokens_per_frame_+1) * sizeof(int32));
+        }
 
         cudaCheckError();
     }
@@ -126,6 +132,12 @@ namespace kaldi {
         cudaFreeHost(h_aux_q_end_);
         cudaFreeHost(h_main_q_cost_);
         cudaFreeHost(h_main_q_state_);
+
+        if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
+            cudaFreeHost(h_debug_buf1_);
+            cudaFreeHost(h_debug_buf2_);
+        }
+        cudaCheckError();
     }
 
     void CudaDecoder::InitDecoding() {
@@ -133,7 +145,6 @@ namespace kaldi {
 
         // Filling the best state cost lookup table with +INF
         InitStateCostLookup();
-
 
         // Adding the start state to the initial token queue
         StateId first_token_state;
@@ -360,6 +371,10 @@ namespace kaldi {
 
             // Resetting the lookup table for the new frame
             ResetStateCostLookupAndFinalizePreprocessInPlace();
+
+            if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 1)
+                DebugAssertsNewFrame();
+
         } else {
             PreprocessAndContract(preprocess_params);
             
@@ -373,6 +388,9 @@ namespace kaldi {
         // We need h_main_q_narcs to be ready
         cudaEventSynchronize(can_read_h_main_q_narcs_);
         cudaCheckError();
+
+        if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
+            DebugAssertsBeforeExpand(is_emitting);
 
         int32 main_q_narcs = *h_main_q_narcs_;
         int32 q_overflow = *h_q_overflow_;
@@ -649,5 +667,94 @@ namespace kaldi {
         return true;
     }
 
+    //
+    // Debug functions
+    // Called to verify that intermediate values are valid 
+    //
+
+    void CudaDecoder::DebugAssertsBeforeExpand(bool is_emitting) {
+        cudaStreamSynchronize(compute_st_);
+
+        int32 main_q_end = *h_main_q_end_;
+        int32 main_q_offset = *h_main_q_local_offset_;
+
+        cudaMemcpyAsync(h_main_q_state_,     
+                d_main_q_state_,
+                main_q_end * sizeof(int32), 
+                cudaMemcpyDeviceToHost,
+                compute_st_);
+
+        unsigned int *h_arc_offsets = is_emitting ? fst_.h_e_offsets : fst_.h_ne_offsets;
+
+        int32 * h_prefix_sum = h_debug_buf1_;
+        cudaMemcpyAsync(h_prefix_sum,     
+                d_main_q_degrees_prefix_sum_, 
+                (main_q_end+1) * sizeof(int32), 
+                cudaMemcpyDeviceToHost,
+                compute_st_);
+
+        int32 * h_q_arc_offsets = h_debug_buf2_;
+        cudaMemcpyAsync(h_q_arc_offsets,     
+                d_main_q_arc_offsets_,
+                main_q_end * sizeof(int32), 
+                cudaMemcpyDeviceToHost,
+                compute_st_);
+
+        // Waiting for the copies
+        cudaStreamSynchronize(compute_st_);
+
+        for(int32 i = main_q_offset; i < main_q_end; ++i) {
+            int32 state = h_main_q_state_[i];
+            KALDI_ASSERT(state >= 0);
+            KALDI_ASSERT(state < fst_.numStates);
+
+
+            KALDI_ASSERT(h_prefix_sum[i] >= 0);
+            KALDI_ASSERT(h_prefix_sum[i] <= h_prefix_sum[i+1]); 
+            int32 degree_in_prefix_sum = h_prefix_sum[i+1] - h_prefix_sum[i];
+            int32 degree_in_fst = h_arc_offsets[state+1] - h_arc_offsets[state];
+
+            // Testing for degree == 0, which is possible in preprocessinplace
+            // only possible if is_emitting, nonemitting uses contractandpreprocess
+            if(is_emitting) {
+                KALDI_ASSERT(degree_in_prefix_sum == 0 || degree_in_prefix_sum == degree_in_fst);
+                // if degree == 0 arc_offsets may not be valid, but we won't use it
+                KALDI_ASSERT(degree_in_prefix_sum == 0 || h_arc_offsets[state] == h_q_arc_offsets[i]); 
+            } else {
+                KALDI_ASSERT(degree_in_prefix_sum == degree_in_fst);
+                KALDI_ASSERT(h_arc_offsets[state] == h_q_arc_offsets[i]); 
+            }
+        }
+    }
+    
+    void CudaDecoder::DebugAssertsNewFrame() {
+        cudaStreamSynchronize(compute_st_);
+
+        int32 float_inf_as_int = 2139095039; // TODO 
+
+        int32 nstates = fst_.numStates;
+
+        int *h_state_best_cost = h_debug_buf1_;
+        cudaMemcpyAsync(h_state_best_cost,     
+                d_state_best_cost_,
+                nstates * sizeof(int32), 
+                cudaMemcpyDeviceToHost,
+                compute_st_);
+
+        int cutoff;
+
+        cudaMemcpyAsync(&cutoff,     
+                d_cutoff_,
+                sizeof(int32), 
+                cudaMemcpyDeviceToHost,
+                compute_st_);
+
+        cudaStreamSynchronize(compute_st_);
+
+        KALDI_ASSERT(cutoff == float_inf_as_int);
+
+        for(int i=0; i<nstates; ++i)
+            KALDI_ASSERT(h_state_best_cost[i] == float_inf_as_int);
+    }
 
 } // end namespace kaldi.
