@@ -86,20 +86,20 @@ namespace kaldi {
 
         cudaMalloc(&d_main_q_arc_offsets_, (max_tokens_per_frame_+1) * sizeof(int32));
 
-        cudaMalloc(&d_loglikelihoods_, sizeof(BaseFloat)*(fst_.max_ilabel+1));  
+        cudaMalloc(&d_loglikelihoods_, sizeof(BaseFloat)*(fst_.max_ilabel_+1));  
 
-        cudaMalloc(&d_state_best_cost_, sizeof(IntegerCostType)*fst_.numStates);
+        cudaMalloc(&d_state_best_cost_, sizeof(IntegerCostType)*fst_.num_states_);
 
         h_all_tokens_info_.SetCudaStream(copy_st_);
 
         if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
             KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
                      
-            cudaMallocHost(&h_debug_buf1_, (fst_.numStates) * sizeof(int32));
+            cudaMallocHost(&h_debug_buf1_, (fst_.num_states_) * sizeof(int32));
             cudaMallocHost(&h_debug_buf2_, (max_tokens_per_frame_+1) * sizeof(int32));
         }
 
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
     }
 
     CudaDecoder::~CudaDecoder() {
@@ -137,7 +137,7 @@ namespace kaldi {
             cudaFreeHost(h_debug_buf1_);
             cudaFreeHost(h_debug_buf2_);
         }
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
     }
 
     void CudaDecoder::InitDecoding() {
@@ -198,7 +198,7 @@ namespace kaldi {
         cudaMemsetAsync(d_n_CTA_done_, 0, sizeof(int32), compute_st_);
 
         cudaStreamSynchronize(compute_st_);
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
 
         num_frames_decoded_ = 0;
 
@@ -306,7 +306,7 @@ namespace kaldi {
 
         int32 frame = num_frames_decoded_;
 
-        decodable->ComputeLogLikelihoods(d_loglikelihoods_,frame,fst_.max_ilabel+1, compute_st_);
+        decodable->ComputeLogLikelihoods(d_loglikelihoods_,frame,fst_.max_ilabel_+1, compute_st_);
     }
 
     void CudaDecoder::PrintOverflowWarning() {
@@ -329,7 +329,7 @@ namespace kaldi {
     bool CudaDecoder::ProcessToken(bool is_emitting) {
 
         // Traversing either emitting or nonemitting arcs of the FST
-        unsigned int *d_arc_offsets = is_emitting ? fst_.d_e_offsets : fst_.d_ne_offsets;
+        unsigned int *d_arc_offsets = is_emitting ? fst_.d_e_offsets_ : fst_.d_ne_offsets_;
 
         PreprocessParams preprocess_params;
         preprocess_params.d_aux_q_state = d_aux_q_state_; 
@@ -387,7 +387,7 @@ namespace kaldi {
 
         // We need h_main_q_narcs to be ready
         cudaEventSynchronize(can_read_h_main_q_narcs_);
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
 
         if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
             DebugAssertsBeforeExpand(is_emitting);
@@ -425,10 +425,10 @@ namespace kaldi {
         expand_params.h_q_overflow = h_q_overflow_;
         expand_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
         expand_params.d_q_arc_offsets = d_main_q_arc_offsets_;
-        expand_params.arc_ilabels = fst_.d_arc_ilabels;
+        expand_params.arc_ilabels = fst_.d_arc_ilabels_;
         expand_params.is_emitting = is_emitting;
-        expand_params.arc_weights = fst_.d_arc_weights; 
-        expand_params.arc_nextstates = fst_.d_arc_nextstates; 
+        expand_params.arc_weights = fst_.d_arc_weights_; 
+        expand_params.arc_nextstates = fst_.d_arc_nextstates_; 
         expand_params.d_cutoff = d_cutoff_;
         expand_params.beam = beam_;
         expand_params.d_loglikelihoods = d_loglikelihoods_;
@@ -448,7 +448,7 @@ namespace kaldi {
                 && main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) { 
             FinalizeProcessNonemitting(d_arc_offsets, expand_params); 
 
-            cudaCheckError();
+            KALDI_DECODER_CUDA_CHECK_ERROR();
 
             // Persistent kernel finishes the job
             done = true;
@@ -458,7 +458,7 @@ namespace kaldi {
         }
 
         cudaStreamSynchronize(compute_st_); 
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
 
         q_overflow = *h_q_overflow_;
 
@@ -482,7 +482,7 @@ namespace kaldi {
         // true => use emitting arcs
         ProcessToken(true); 
 
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
         nvtxRangePop();
     }
 
@@ -495,7 +495,7 @@ namespace kaldi {
         // false => use non emitting arcs
         while(!ProcessToken(false));
 
-        cudaCheckError();
+        KALDI_DECODER_CUDA_CHECK_ERROR();
         nvtxRangePop();
     }
 
@@ -541,7 +541,7 @@ namespace kaldi {
             CostType cost = h_main_q_cost_[i];
 
             if(isfinal) 
-                cost += fst_.h_final[h_main_q_state_[i]];
+                cost += fst_.h_final_[h_main_q_state_[i]];
 
             if(cost < best_cost) {
                 best_cost = cost;
@@ -585,7 +585,7 @@ namespace kaldi {
 
         // Looking for a final state
         for(int32 i=0; i < main_q_size; ++i) {
-            if(fst_.h_final[h_main_q_state_[i]] != StdWeight::Zero().Value())
+            if(fst_.h_final_[h_main_q_state_[i]] != StdWeight::Zero().Value())
                 return true;
         }
 
@@ -644,10 +644,10 @@ namespace kaldi {
         for (int32 i = reversed_path.size()-1; i >= 1; i--) {
             int32 arc_idx = reversed_path[i];
 
-            LatticeArc arc(fst_.h_arc_ilabels[arc_idx], 
-                           fst_.h_arc_olabels[arc_idx],
-                           LatticeWeight(fst_.h_arc_weights[arc_idx], 0), 
-                           fst_.h_arc_nextstates[arc_idx]);
+            LatticeArc arc(fst_.h_arc_ilabels_[arc_idx], 
+                           fst_.h_arc_olabels_[arc_idx],
+                           LatticeWeight(fst_.h_arc_weights_[arc_idx], 0), 
+                           fst_.h_arc_nextstates_[arc_idx]);
 
             arc.nextstate = fst_out->AddState();
             fst_out->AddArc(cur_state, arc);
@@ -657,7 +657,7 @@ namespace kaldi {
         // Adding final cost to final state
         if (isfinal && use_final_probs)
             fst_out->SetFinal(cur_state,
-                    LatticeWeight(fst_.h_final[fst_.h_arc_nextstates[reversed_path[0]]], 0.0));
+                    LatticeWeight(fst_.h_final_[fst_.h_arc_nextstates_[reversed_path[0]]], 0.0));
         else
             fst_out->SetFinal(cur_state, LatticeWeight::One());
 
@@ -684,7 +684,7 @@ namespace kaldi {
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 
-        unsigned int *h_arc_offsets = is_emitting ? fst_.h_e_offsets : fst_.h_ne_offsets;
+        unsigned int *h_arc_offsets = is_emitting ? fst_.h_e_offsets_ : fst_.h_ne_offsets_;
 
         int32 * h_prefix_sum = h_debug_buf1_;
         cudaMemcpyAsync(h_prefix_sum,     
@@ -706,7 +706,7 @@ namespace kaldi {
         for(int32 i = main_q_offset; i < main_q_end; ++i) {
             int32 state = h_main_q_state_[i];
             KALDI_ASSERT(state >= 0);
-            KALDI_ASSERT(state < fst_.numStates);
+            KALDI_ASSERT(state < fst_.num_states_);
 
 
             KALDI_ASSERT(h_prefix_sum[i] >= 0);
@@ -732,7 +732,7 @@ namespace kaldi {
 
         int32 float_inf_as_int = 2139095039; // TODO 
 
-        int32 nstates = fst_.numStates;
+        int32 nstates = fst_.num_states_;
 
         int *h_state_best_cost = h_debug_buf1_;
         cudaMemcpyAsync(h_state_best_cost,     

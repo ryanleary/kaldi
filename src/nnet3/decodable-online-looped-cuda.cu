@@ -23,22 +23,12 @@
 namespace kaldi {
 namespace nnet3 {
 
-#if 0
-//call cuda kernel...
-computeLogLikelihoodsKernel<<<blocks,threads>>>(out,count,current_log_post_.Data()+(subsampled_frame-current_log_post_subsampled_offset_)*current_log_post_.Stride());
-//Copy trans_model_ to device...
-//current_log_post_.Data();
-//current_log_post_.Stride();
-//simple kernel
-//out[i]=data[row,trans_model_.TransitionIdToPdf(i)];
-
-#endif
-
-__global__ void computeLogLikelihoodsKernel( BaseFloat *out, int32 count, BaseFloat *data, int32 *trans) {
+__global__ void compute_loglikelihoogs_kernel_( BaseFloat *out, int32 count, BaseFloat *data, int32 *trans) {
   for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<count;i+=blockDim.x*gridDim.x) {
     out[i]=data[trans[i]];
   }
 }
+
 DecodableAmNnetLoopedOnlineCuda::DecodableAmNnetLoopedOnlineCuda(
       const TransitionModel &trans_model,
       const DecodableNnetSimpleLoopedInfo &info,
@@ -61,15 +51,7 @@ void DecodableAmNnetLoopedOnlineCuda::ComputeLogLikelihoods(BaseFloat *out, int3
   cudaStreamSynchronize(cudaStreamPerThread);      
   int threads=128;
   int blocks=(count+threads-1)/threads;
-  computeLogLikelihoodsKernel<<<blocks,threads,0,stream>>>(out,count,current_log_post_.Data()+(subsampled_frame-current_log_post_subsampled_offset_)*current_log_post_.Stride(),trans_d_);
-#if 0
-  for(int i=0;i<count;i++) {
-    BaseFloat val = current_log_post_(
-      subsampled_frame - current_log_post_subsampled_offset_,
-      trans_model_.TransitionIdToPdf(i));
-    out[i]=val;
-  }
-#endif
+  compute_loglikelihoogs_kernel_<<<blocks,threads,0,stream>>>(out,count,current_log_post_.Data()+(subsampled_frame-current_log_post_subsampled_offset_)*current_log_post_.Stride(),trans_d_);
 }
 
 } // namespace nnet3

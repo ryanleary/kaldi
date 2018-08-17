@@ -212,7 +212,7 @@ int main(int argc, char *argv[]) {
 
 
       fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
-      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].initialize(*decode_fst);
+      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].Initialize(*decode_fst);
 #pragma omp barrier
       CudaDecoder cuda_decoder(cuda_fst[device],decoder_opts);
 #pragma omp barrier
@@ -395,7 +395,7 @@ int main(int argc, char *argv[]) {
       delete decode_fst;
       delete word_syms; // will delete if non-NULL.
 #pragma omp barrier
-      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].finalize();
+      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].Finalize();
       } //end parallel
   
       total_time/=omp_get_max_threads();

@@ -21,13 +21,12 @@
 #define KALDI_DECODER_CUDA_DECODER_UTILS_H_
 
 //Macro for checking cuda errors following a cuda launch or api call
-#define cudaCheckError() {                                          \
-        cudaError_t e=cudaGetLastError();                                 \
-        if(e!=cudaSuccess) {                                              \
-            printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(e));           \
-            exit(EXIT_FAILURE);                                           \
-        }                                                                 \
-    }
+#define KALDI_DECODER_CUDA_CHECK_ERROR() do {                        \
+    cudaError_t e=cudaGetLastError();                                 \
+    if(e!=cudaSuccess) {                                              \
+        KALDI_ERR << "Cuda failure " << __FILE__ << ":" << __LINE__ << ": '" << cudaGetErrorString(e); \
+    }                                                                 \
+} while(0);
 
 #include "util/stl-utils.h"
 #include "fst/fstlib.h"
@@ -42,41 +41,51 @@ namespace kaldi {
             typedef StdArc::StateId StateId;
 
             CudaFst() {};
-            void initialize(const fst::Fst<StdArc> &fst);
-            void finalize();
+            // Creates a CSR representation of the FST,
+            // then copies it to the GPU
+            void Initialize(const fst::Fst<StdArc> &fst);
+            void Finalize();
 
-            inline uint32_t NumStates() const {  return numStates; }
-            inline StateId Start() const { return start; }    
-            size_t getCudaMallocBytes() const { return bytes_cudaMalloc; }
+            inline uint32_t NumStates() const {  return num_states_; }
+            inline StateId Start() const { return start_; }    
         private:
             friend class CudaDecoder;
 
-            unsigned int numStates;               //total number of states
-            StateId  start;
+            // Total number of states
+            unsigned int num_states_; 
 
-            unsigned int max_ilabel;              //the largest ilabel
-            unsigned int e_count, ne_count, arc_count;       //number of emitting and non-emitting states
+            // Starting state of the FST
+            // Computation should start from state start_
+            StateId  start_;
 
-            //This data structure is similar to a CSR matrix format 
-            //where I have 2 matrices (one emitting one non-emitting).
+            // We have all ilabel <= max_ilabel_
+            unsigned int max_ilabel_;              
+            
+            // Number of emitting, non-emitting, and total number of arcs
+            unsigned int e_count_, ne_count_, arc_count_;       
 
-            //Offset arrays are numStates+1 in size. 
-            //Arc values for state i are stored in the range of [i,i+1)
-            //size numStates+1
-            unsigned int *h_e_offsets,*d_e_offsets;               //Emitting offset arrays 
-            unsigned int *h_ne_offsets, *d_ne_offsets;            //Non-emitting offset arrays
+            // This data structure is similar to a CSR matrix format 
+            // with 2 offsets matrices (one emitting one non-emitting).
 
-            //These are the values for each arc. Arcs belonging to state i are found in the range of [offsets[i], offsets[i+1]) 
-            //non-zeros (Size arc_count+1)
-            BaseFloat *h_arc_weights, *d_arc_weights;
-            StateId *h_arc_nextstates, *d_arc_nextstates;
-            int32 *h_arc_ilabels, *d_arc_ilabels;
-            int32 *h_arc_olabels;
+            // Offset arrays are num_states_+1 in size (last state needs 
+            // its +1 arc_offset)
+            // Arc values for state i are stored in the range of [offset[i],offset[i+1][
+            unsigned int *h_e_offsets_,*d_e_offsets_;               //Emitting offset arrays 
+            unsigned int *h_ne_offsets_, *d_ne_offsets_;            //Non-emitting offset arrays
 
-            //final costs
-            float *h_final;
-            //allocation size
-            size_t bytes_cudaMalloc;
+            // These are the values for each arc. 
+            // Arcs belonging to state i are found in the range of [offsets[i], offsets[i+1][
+            // Use e_offsets or ne_offsets depending on what you need (emitting/nonemitting)
+            // The ilabels arrays are of size e_count_, not arc_count_
+
+            BaseFloat *h_arc_weights_, *d_arc_weights_;
+            StateId *h_arc_nextstates_, *d_arc_nextstates_;
+            int32 *h_arc_ilabels_, *d_arc_ilabels_;
+            int32 *h_arc_olabels_;
+
+            // Final costs
+            // final cost of state i is h_final_[i]
+            float *h_final_;
     };
 
     // InfoToken contains data that needs to be saved for the backtrack
