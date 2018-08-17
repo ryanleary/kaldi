@@ -1,3 +1,0 @@
-./benchmark_decoder.sh /work/models/aspire/ /work/datasets/librispeech/ /tmp/ls-results /tmp/ls-data
-./benchmark_decoder.sh /work/models/libri/ /work/datasets/librispeech/ /tmp/ls-results /tmp/ls-data
-

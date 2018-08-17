@@ -386,7 +386,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 // = (narcs until now in the main queue) + (narcs until this thread in the CTA)
                 params.d_main_q_degrees_prefix_sum[main_q_idx] = sh_main_q_global_block_offset.split.narcs 
                                                                  + block_prefix_sum_token_arc_count.narcs;
-
                 // Saving the CSR arc offset for that token's state
                 // it will be used by the expand kernel, and avoid doing a new random memory access in the expand kernel
                 params.d_main_q_arc_offsets[main_q_idx] = arc_start;
