@@ -63,11 +63,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     // For description of what each kernel is doing, please refer to cuda-decoder.h
     // and look for the corresponding wrapper
     // for instance, for a description of _init_lookup_kernel,
-    // look for the description of CudaDecoder::InitStateCostLookup() in cuda-decoder.h
+    // look for the description of CudaDecoder::InitStateBestCostLookup() in cuda-decoder.h
     // Also resets the cutoff to +inf
 
     // Used before first frame
-    __global__ void _init_state_cost_lookup_kernel(int32 size, IntegerCostType *state_best_cost, IntegerCostType *d_cutoff) {
+    __global__ void _init_state_best_cost_lookup_kernel(int32 size, IntegerCostType *state_best_cost, IntegerCostType *d_cutoff) {
         // One thread resets the cutoff
         if(threadIdx.x == 0 && blockIdx.x == 0) 
             *d_cutoff = floatToOrderedInt(FLT_MAX);
@@ -80,7 +80,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         }
     }
 
-    void CudaDecoder::InitStateCostLookup() {
+    void CudaDecoder::InitStateBestCostLookup() {
         int32 nstates = fst_.NumStates();
         KALDI_ASSERT(nstates > 0);
 
@@ -88,13 +88,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
         grid.x = DIV_ROUND_UP(nstates, block.x);
 
-        _init_state_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_, d_cutoff_);
+        _init_state_best_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_, d_cutoff_);
     }
 
         
      /*
      
-     ResetStateCostLookupAndFinalizePreprocessInPlace
+     ResetStateBestCostLookupAndFinalizePreprocessInPlace
      Does two things :
      (1) Reset the lookup between frames :
          Using the queue to reset only the values needed
@@ -150,7 +150,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         }
     }
 
-    void CudaDecoder::ResetStateCostLookupAndFinalizePreprocessInPlace() {
+    void CudaDecoder::ResetStateBestCostLookupAndFinalizePreprocessInPlace() {
         int32 main_q_size = *h_main_q_end_;
 
         KALDI_ASSERT(main_q_size > 0);

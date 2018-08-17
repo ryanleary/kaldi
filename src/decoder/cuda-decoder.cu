@@ -144,7 +144,7 @@ namespace kaldi {
         cudaStreamSynchronize(compute_st_);
 
         // Filling the best state cost lookup table with +INF
-        InitStateCostLookup();
+        InitStateBestCostLookup();
 
         // Adding the start state to the initial token queue
         StateId first_token_state;
@@ -211,6 +211,7 @@ namespace kaldi {
 
     void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
             int32 max_num_frames) {
+        nvtxRangePushA("AdvanceDecoding");
         KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                 "You must call InitDecoding() before AdvanceDecoding()");
         int32 num_frames_ready = decodable->NumFramesReady();
@@ -366,7 +367,7 @@ namespace kaldi {
             cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
 
             // Resetting the lookup table for the new frame
-            ResetStateCostLookupAndFinalizePreprocessInPlace();
+            ResetStateBestCostLookupAndFinalizePreprocessInPlace();
 
             if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 1)
                 DebugAssertsNewFrame();
