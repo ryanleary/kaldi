@@ -338,18 +338,11 @@ private:
             // The "active" main_q[local_offset, end[ range stays the same.
             //
             // Note : Only the first pass of the prefix sum is computed in that kernel. We then need to call
-            // FinalizePreprocessInPlace
+            // ResetStateCostLookupAndFinalizePreprocessInPlace after PreprocessInPlace 
             //
 
             void PreprocessInPlace(const PreprocessParams &params);
 
-            //
-            // FinalizePreprocessInPlace()
-            // This kernel is responsible to compute the second pass of the
-            // prefix sum. Must be called between PreprocessInPlace and ExpandArcs
-            // TODO merge with ResetLookupTable
-            //
-            void FinalizePreprocessInPlace();
 
             //
             // FinalizeProcessNonemitting
@@ -372,11 +365,22 @@ private:
             // InitStateCost initializes all costs to +INF in d_state_best_cost at the beginning of the computation
             void InitStateCostLookup();
 
+            //
+            // This kernel contains both ResetStateCostLookup and FinalizePreprocess in place.
+            //
+            // ResetStateCostLookup :
+            //
             // We need to reset d_state_best_cost between frames. We could use InitStateCost
             // but a large portion of the lookup table has not been used
             // ResetStateCostLookupAndFinalizePreprocessInPlace resets only the costs that are not +INF, using the d_main_q_state to do it
             // d_main_q_state contains the list of states that have been considered and have a best cost < +INF
-            void ResetStateCostLookupAndFinalizePreprocessInPlace();
+            //
+            // FinalizePreprocessInPlace :
+            //
+            // This kernel is responsible to compute the second pass of the
+            // prefix sum. Must be called between PreprocessInPlace and ExpandArcs
+            //
+             void ResetStateCostLookupAndFinalizePreprocessInPlace();
 
             // Pre-computes log likelihoods for the current frame 
             void ComputeLogLikelihoods(DecodableInterface *decodable);

@@ -40,7 +40,6 @@ namespace kaldi {
         //
         // For a description of the class members, please refer to the cuda-decoder.h file
         //
-
         cudaStreamCreate(&compute_st_);
         cudaStreamCreate(&copy_st_); 
 
@@ -212,7 +211,6 @@ namespace kaldi {
 
     void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
             int32 max_num_frames) {
-
         KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                 "You must call InitDecoding() before AdvanceDecoding()");
         int32 num_frames_ready = decodable->NumFramesReady();
@@ -304,14 +302,12 @@ namespace kaldi {
 
 
     void CudaDecoder::ComputeLogLikelihoods(DecodableInterface *decodable) {
-
         int32 frame = num_frames_decoded_;
 
         decodable->ComputeLogLikelihoods(d_loglikelihoods_,frame,fst_.max_ilabel_+1, compute_st_);
     }
 
     void CudaDecoder::PrintOverflowWarning() {
-
         KALDI_WARN << "Preventing overflow of the frame tokens. Pursuing "
             << "execution but the quality of the output may be decreased. "
             << "To prevent this from happening, please increase the parameter --max-tokens-per-frame"
@@ -328,7 +324,6 @@ namespace kaldi {
     // and then ExpandArc to traverse the arcs
     //
     bool CudaDecoder::ProcessToken(bool is_emitting) {
-
         // Traversing either emitting or nonemitting arcs of the FST
         unsigned int *d_arc_offsets = is_emitting ? fst_.d_e_offsets_ : fst_.d_ne_offsets_;
 
@@ -509,7 +504,6 @@ namespace kaldi {
     // not optimized
     //
     void CudaDecoder::GetBestCost(bool isfinal, BaseFloat *min, int32 *argmin) const {
-        
         CostType best_cost = std::numeric_limits<CostType>::max();
         int32 min_cost_token_index;
 

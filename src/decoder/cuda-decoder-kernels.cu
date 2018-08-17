@@ -45,7 +45,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     //
 
     __device__ int32 floatToOrderedInt(float floatVal) {
-
         int32 intVal = __float_as_int( floatVal );
 
         return (intVal >= 0 ) ? intVal : intVal ^ 0x7FFFFFFF;
@@ -54,9 +53,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
 
     __device__ float orderedIntToFloat(int32 intVal) {
-
         return __int_as_float( (intVal >= 0) ? intVal : intVal ^ 0x7FFFFFFF );
-
     } 
 
     //
@@ -216,7 +213,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     // Important : pass the struct PreprocessParams by copy - passing it using a ref will not work (CPU -> GPU)
     __global__ void _preprocess_and_contract_kernel(PreprocessParams params) {
-        
         // Prefix sum operator
         typedef cub::BlockScan<TokenAndArcCount, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage sh_temp_storage;
@@ -479,7 +475,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 */
 
     __global__ void _preprocess_in_place_kernel(PreprocessParams params) {
-   
         // Operator for the prefix sum inside the CUDA block
         typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage sh_temp_storage;
@@ -803,7 +798,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     //
 
     void __global__ _expand_arcs_kernel(ExpandArcParams params) {
-
         // BlockScan that we will use to compute token indexes in the output queue, 
         // and to find the min cost in the block
         typedef cub::BlockScan<CostTypeAndInt, KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX> BlockScan;
@@ -818,7 +812,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         //
         // Cutoff, stored in shared for caching purposes
-        // TODO rely on cache ?
+        // maybe we could rely on cache ?
         //
         __shared__ CostType sh_cached_cutoff;
 
@@ -906,6 +900,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 //
 
                 // Searching for the source of the arc that we will process (main_q_arc_index)
+                // we could preprocess the search in the preprocess kernels - for now this kernel is fast enough
                 main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum, main_q_arc_index, main_q_offset, main_q_end-1); 
 
                 // state_first_arc_idx_in_main_q
@@ -1401,7 +1396,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     void CudaDecoder::FinalizeProcessNonemitting(const uint32_t *d_arc_offsets, 
             const ExpandArcParams &params) {
-
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX;
         grid.x = 1; // it is designed for the long tail
