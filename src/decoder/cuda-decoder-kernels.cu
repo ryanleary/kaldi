@@ -84,7 +84,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
     void CudaDecoder::InitStateCostLookup() {
-        int32 nstates = fst_.numStates;
+        int32 nstates = fst_.NumStates();
         KALDI_ASSERT(nstates > 0);
 
         dim3 grid,block;
