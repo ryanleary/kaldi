@@ -42,7 +42,7 @@
 
 # This should be incremented after any significant change to the configure
 # script, i.e. any change affecting kaldi.mk or the build system as a whole.
-CONFIGURE_VERSION=8
+CONFIGURE_VERSION=9
 
 if ! [ -x "$PWD/configure" ]; then
   echo 'You must run "configure" from the src/ directory.'
@@ -852,6 +852,7 @@ android=false
 MATHLIB='ATLAS'
 ATLASROOT=`rel2abs ../tools/ATLAS_headers/`
 FSTROOT=`rel2abs ../tools/openfst`
+CUBROOT=`rel2abs ../tools/cub`
 
 # Save the command line to include in kaldi.mk
 cmd_line="$0 $@"
@@ -943,6 +944,9 @@ do
     shift ;;
   --fst-root=*)
     FSTROOT=`read_dirname $1`;
+    shift ;;
+  --cub-root=*)
+    CUBROOT=`read_dirname $1`;
     shift ;;
   --clapack-root=*)
     CLAPACKROOT=`read_dirname $1`;
@@ -1077,6 +1081,13 @@ if $double_precision; then
   echo "DOUBLE_PRECISION = 1" >> kaldi.mk
 else
   echo "DOUBLE_PRECISION = 0" >> kaldi.mk
+fi
+$use_cuda && echo "Checking cub library in $CUBROOT ..."
+if [[ $use_cuda && ! -f $CUBROOT/cub/cub.cuh ]]; then
+  failure "Could not find file $CUBROOT/cub/cub.cuh:
+  you may not have installed cub. See ../tools/INSTALL"
+else
+  echo "CUBROOT = $CUBROOT" >> kaldi.mk
 fi
 echo "Checking OpenFst library in $FSTROOT ..."
 if [ ! -f $FSTROOT/include/fst/fst.h  ]; then
