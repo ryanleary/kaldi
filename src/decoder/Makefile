@@ -11,6 +11,8 @@ OBJFILES = training-graph-compiler.o lattice-simple-decoder.o lattice-faster-dec
 
 ifeq ($(CUDA), true)
     OBJFILES += cuda-decoder.o cuda-decoder-kernels.o cuda-decoder-utils.o
+    LDFLAGS += $(CUDA_LDFLAGS)
+    LDLIBS += $(CUDA_LDLIBS)
 endif
 
 LIBNAME = kaldi-decoder
