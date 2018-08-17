@@ -270,8 +270,8 @@ void CuDevice::FinalizeActiveGpu() {
     // Initialize the cuSPARSE library
     CUSPARSE_SAFE_CALL(cusparseCreate(&cusparse_handle_));
 
+    // Using the CUDA stream associated with the CPU thread owning this CuDevice
     cublasSetStream(cublas_handle_, cudaStreamPerThread);
-
     cusparseSetStream(cusparse_handle_,cudaStreamPerThread);
 
     // Notify user which GPU is finally used
