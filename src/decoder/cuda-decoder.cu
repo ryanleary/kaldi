@@ -177,16 +177,16 @@ namespace kaldi {
                         cudaMemcpyHostToDevice, compute_st_);
 
         // We have one token is the aux_q
-        int32 one = 1;
-        cudaMemcpyAsync(d_aux_q_end_, &one, sizeof(int32), cudaMemcpyHostToDevice, compute_st_);
-        *h_aux_q_end_ = 1;
+        int32 aux_q_end = 1;
+        cudaMemcpyAsync(d_aux_q_end_, &aux_q_end, sizeof(*d_aux_q_end_), cudaMemcpyHostToDevice, compute_st_);
+        *h_aux_q_end_ = aux_q_end;
 
         // The main_q is empty
-        cudaMemsetAsync(d_main_q_end_, 0, sizeof(int32), compute_st_);
+        cudaMemsetAsync(d_main_q_end_, 0, sizeof(*d_main_q_end_), compute_st_);
         *h_main_q_end_ = 0;
-        cudaMemsetAsync(d_main_q_narcs_, 0, sizeof(int32), compute_st_);
+        cudaMemsetAsync(d_main_q_narcs_, 0, sizeof(*d_main_q_narcs_), compute_st_);
         *h_main_q_narcs_ = 0;
-        cudaMemsetAsync(d_main_q_local_offset_, 0, sizeof(int32), compute_st_);
+        cudaMemsetAsync(d_main_q_local_offset_, 0, sizeof(*d_main_q_local_offset_), compute_st_);
         *h_main_q_local_offset_ = 0;
         
         // Resetting the TokenInfoVector in the CPU host
@@ -196,7 +196,7 @@ namespace kaldi {
         // Initializing flag
         *h_q_overflow_ = 0;
 
-        cudaMemsetAsync(d_n_CTA_done_, 0, sizeof(int32), compute_st_);
+        cudaMemsetAsync(d_n_CTA_done_, 0, sizeof(*d_n_CTA_done_), compute_st_);
 
         cudaStreamSynchronize(compute_st_);
         KALDI_DECODER_CUDA_CHECK_ERROR();
@@ -522,14 +522,14 @@ namespace kaldi {
         int32 main_q_size = *h_main_q_end_;
         cudaMemcpyAsync(h_main_q_cost_, 
                         d_main_q_cost_, 
-                        main_q_size * sizeof(CostType), 
+                        main_q_size * sizeof(*d_main_q_cost_), 
                         cudaMemcpyDeviceToHost,
                         compute_st_);
 
         if(isfinal)
             cudaMemcpyAsync(h_main_q_state_,     
                             d_main_q_state_, 
-                            main_q_size * sizeof(int32), 
+                            main_q_size * sizeof(*d_main_q_state_), 
                             cudaMemcpyDeviceToHost,
                             compute_st_);
 
@@ -577,7 +577,7 @@ namespace kaldi {
         // when moving the tokens back to the host, we only move the { arc_idx, prev_token } part
         cudaMemcpyAsync(h_main_q_state_,     
                 d_main_q_state_, 
-                main_q_size * sizeof(int32), 
+                main_q_size * sizeof(*d_main_q_state_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 
@@ -681,7 +681,7 @@ namespace kaldi {
 
         cudaMemcpyAsync(h_main_q_state_,     
                 d_main_q_state_,
-                main_q_end * sizeof(int32), 
+                main_q_end * sizeof(*d_main_q_state_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 
@@ -690,14 +690,14 @@ namespace kaldi {
         int32 * h_prefix_sum = h_debug_buf1_;
         cudaMemcpyAsync(h_prefix_sum,     
                 d_main_q_degrees_prefix_sum_, 
-                (main_q_end+1) * sizeof(int32), 
+                (main_q_end+1) * sizeof(*d_main_q_degrees_prefix_sum_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 
         int32 * h_q_arc_offsets = h_debug_buf2_;
         cudaMemcpyAsync(h_q_arc_offsets,     
                 d_main_q_arc_offsets_,
-                main_q_end * sizeof(int32), 
+                main_q_end * sizeof(*d_main_q_arc_offsets_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 
@@ -738,7 +738,7 @@ namespace kaldi {
         int *h_state_best_cost = h_debug_buf1_;
         cudaMemcpyAsync(h_state_best_cost,     
                 d_state_best_cost_,
-                nstates * sizeof(int32), 
+                nstates * sizeof(*d_state_best_cost_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 
@@ -746,7 +746,7 @@ namespace kaldi {
 
         cudaMemcpyAsync(&cutoff,     
                 d_cutoff_,
-                sizeof(int32), 
+                sizeof(*d_cutoff_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
 

@@ -34,14 +34,14 @@ namespace kaldi {
             num_states_++;
         }
         start_=fst.Start();
-        cudaMallocHost(&h_final_,sizeof(float)*num_states_);
+        cudaMallocHost(&h_final_,sizeof(*h_final_)*num_states_);
 
         //allocate and initialize offset arrays
-        cudaMallocHost(&h_e_offsets_, (num_states_+1)*sizeof(unsigned int));
-        cudaMallocHost(&h_ne_offsets_, (num_states_+1)*sizeof(unsigned int));
+        cudaMallocHost(&h_e_offsets_, (num_states_+1)*sizeof(*h_e_offsets_));
+        cudaMallocHost(&h_ne_offsets_, (num_states_+1)*sizeof(*h_ne_offsets_));
 
-        cudaMalloc((void**)&d_e_offsets_,sizeof(unsigned int)*(num_states_+1));
-        cudaMalloc((void**)&d_ne_offsets_,sizeof(unsigned int)*(num_states_+1));
+        cudaMalloc((void**)&d_e_offsets_,(num_states_+1)*sizeof(*d_e_offsets_));
+        cudaMalloc((void**)&d_ne_offsets_,(num_states_+1)*sizeof(*d_ne_offsets_));
  
        //iterate through states and arcs and count number of arcs per state
         e_count_=0;
@@ -83,19 +83,19 @@ namespace kaldi {
 
         arc_count_=e_count_+ne_count_;
 
-        cudaMemcpy(d_e_offsets_,h_e_offsets_,sizeof(unsigned int)*(num_states_+1),cudaMemcpyHostToDevice);
-        cudaMemcpy(d_ne_offsets_,h_ne_offsets_,sizeof(unsigned int)*(num_states_+1),cudaMemcpyHostToDevice);
+        cudaMemcpy(d_e_offsets_,h_e_offsets_,(num_states_+1)*sizeof(*d_e_offsets_),cudaMemcpyHostToDevice);
+        cudaMemcpy(d_ne_offsets_,h_ne_offsets_,(num_states_+1)*sizeof(*d_ne_offsets_),cudaMemcpyHostToDevice);
 
-        cudaMallocHost(&h_arc_weights_,arc_count_*sizeof(BaseFloat));
-        cudaMallocHost(&h_arc_nextstates_,arc_count_*sizeof(StateId));
-        cudaMallocHost(&h_arc_ilabels_,arc_count_*sizeof(int32));
-        cudaMallocHost(&h_arc_olabels_,arc_count_*sizeof(int32));
+        cudaMallocHost(&h_arc_weights_,arc_count_*sizeof(*h_arc_weights_));
+        cudaMallocHost(&h_arc_nextstates_,arc_count_*sizeof(*h_arc_nextstates_));
+        cudaMallocHost(&h_arc_ilabels_,arc_count_*sizeof(*h_arc_ilabels_));
+        cudaMallocHost(&h_arc_olabels_,arc_count_*sizeof(*h_arc_olabels_));
 
-        cudaMalloc(&d_arc_weights_,arc_count_*sizeof(BaseFloat));
-        cudaMalloc(&d_arc_nextstates_,arc_count_*sizeof(StateId));
+        cudaMalloc(&d_arc_weights_,arc_count_*sizeof(*d_arc_weights_));
+        cudaMalloc(&d_arc_nextstates_,arc_count_*sizeof(*d_arc_nextstates_));
 
         // Only the ilabels for the e_arc are needed on the device
-        cudaMalloc(&d_arc_ilabels_,e_count_*sizeof(int32)); 
+        cudaMalloc(&d_arc_ilabels_,e_count_*sizeof(*d_arc_ilabels_)); 
         // We do not need the olabels on the device - GetBestPath is on CPU
 
         //now populate arc data
@@ -118,9 +118,9 @@ namespace kaldi {
             }
         }
 
-        cudaMemcpy(d_arc_weights_,h_arc_weights_,arc_count_*sizeof(BaseFloat),cudaMemcpyHostToDevice);
-        cudaMemcpy(d_arc_nextstates_,h_arc_nextstates_,arc_count_*sizeof(StateId),cudaMemcpyHostToDevice);
-        cudaMemcpy(d_arc_ilabels_,h_arc_ilabels_, e_count_*sizeof(int32),cudaMemcpyHostToDevice);
+        cudaMemcpy(d_arc_weights_,h_arc_weights_,arc_count_*sizeof(*d_arc_weights_),cudaMemcpyHostToDevice);
+        cudaMemcpy(d_arc_nextstates_,h_arc_nextstates_,arc_count_*sizeof(*d_arc_nextstates_),cudaMemcpyHostToDevice);
+        cudaMemcpy(d_arc_ilabels_,h_arc_ilabels_, e_count_*sizeof(*d_arc_ilabels_),cudaMemcpyHostToDevice);
         
         // Making sure the graph is ready
         cudaDeviceSynchronize();
@@ -160,7 +160,7 @@ namespace kaldi {
     InfoTokenVector::InfoTokenVector(int capacity) {
         capacity_ = capacity;
         KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_ << " tokens";
-        cudaMallocHost(&h_data_, capacity_ * sizeof(InfoToken)); 
+        cudaMallocHost(&h_data_, capacity_ * sizeof(*h_data_)); 
         SetCudaStream(0); // using default stream
         Reset();
     }
@@ -176,7 +176,7 @@ namespace kaldi {
     void InfoTokenVector::CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count) {
         Reserve(size_+count); // making sure we have the space
 
-        cudaMemcpyAsync(&h_data_[offset], d_ptr, count*sizeof(InfoToken), cudaMemcpyDeviceToHost, copy_st_);
+        cudaMemcpyAsync(&h_data_[offset], d_ptr, count*sizeof(*h_data_), cudaMemcpyDeviceToHost, copy_st_);
         size_ += count;
     }
 
@@ -191,13 +191,13 @@ namespace kaldi {
 
         cudaStreamSynchronize(copy_st_);
         InfoToken *h_old_data = h_data_;
-        cudaMallocHost(&h_data_, capacity_ * sizeof(InfoToken)); 
+        cudaMallocHost(&h_data_, capacity_ * sizeof(*h_data_)); 
 
         if(!h_data_)
             KALDI_ERR << "Host ran out of memory to store tokens. Exiting.";
 
         if(size_ > 0)
-            cudaMemcpyAsync(h_data_, h_old_data, size_ * sizeof(InfoToken), cudaMemcpyHostToHost, copy_st_);
+            cudaMemcpyAsync(h_data_, h_old_data, size_ * sizeof(*h_data_), cudaMemcpyHostToHost, copy_st_);
 
         cudaStreamSynchronize(copy_st_);
         cudaFreeHost(h_old_data);
