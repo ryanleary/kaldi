@@ -8,8 +8,7 @@ endif
 CUDA_INCLUDE= -I$(CUDATKDIR)/include
 CUDA_FLAGS = -g -Xcompiler -fPIC --verbose --machine 64 -DHAVE_CUDA \
              -ccbin $(CXX) -DKALDI_DOUBLEPRECISION=$(DOUBLE_PRECISION) \
-             -std=c++11 \ 
-             -DCUDA_API_PER_THREAD_DEFAULT_STREAM
+             -std=c++11 -DCUDA_API_PER_THREAD_DEFAULT_STREAM
 
 CXXFLAGS += -DHAVE_CUDA -I$(CUDATKDIR)/include
 CUDA_LDFLAGS += -L$(CUDATKDIR)/lib64 -Wl,-rpath,$(CUDATKDIR)/lib64
