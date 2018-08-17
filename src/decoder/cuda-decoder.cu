@@ -22,7 +22,7 @@
 #include <nvToolsExt.h>
 #include <cuda_runtime_api.h>
 #include <float.h>
-#include <math.h>
+#include <algorithm>
 #include <cub/cub.cuh>
 
 
@@ -37,7 +37,6 @@ namespace kaldi {
                      max_tokens_(config.max_tokens), 
                      max_tokens_per_frame_(config.max_tokens_per_frame),
                      h_all_tokens_info_(config.max_tokens) {
-
         //
         // For a description of the class members, please refer to the cuda-decoder.h file
         //
@@ -48,55 +47,57 @@ namespace kaldi {
         cudaEventCreate(&can_read_h_main_q_narcs_);
         cudaEventCreate(&can_write_to_main_q_);
 
-        cudaMalloc(&d_main_q_state_, max_tokens_per_frame_ * sizeof(int32));
-        cudaMallocHost(&h_main_q_state_, max_tokens_per_frame_ * sizeof(int32));
-        cudaMalloc(&d_aux_q_state_, max_tokens_per_frame_ * sizeof(int32));
+        cudaMalloc(&d_main_q_state_, max_tokens_per_frame_ * sizeof(*d_main_q_state_));
+        cudaMallocHost(&h_main_q_state_, max_tokens_per_frame_ * sizeof(*h_main_q_state_));
+        cudaMalloc(&d_aux_q_state_, max_tokens_per_frame_ * sizeof(*d_aux_q_state_));
 
-        cudaMalloc(&d_main_q_cost_, max_tokens_per_frame_ * sizeof(CostType));
-        cudaMallocHost(&h_main_q_cost_, max_tokens_per_frame_ * sizeof(CostType));
-        cudaMalloc(&d_aux_q_cost_, max_tokens_per_frame_ * sizeof(CostType));
+        cudaMalloc(&d_main_q_cost_, max_tokens_per_frame_ * sizeof(*d_main_q_cost_));
+        cudaMallocHost(&h_main_q_cost_, max_tokens_per_frame_ * sizeof(*h_main_q_cost_));
+        cudaMalloc(&d_aux_q_cost_, max_tokens_per_frame_ * sizeof(*d_aux_q_cost_));
 
-        cudaMalloc(&d_main_q_info_, max_tokens_per_frame_ * sizeof(InfoToken));
-        cudaMalloc(&d_aux_q_info_, max_tokens_per_frame_ * sizeof(InfoToken));
+        cudaMalloc(&d_main_q_info_, max_tokens_per_frame_ * sizeof(*d_main_q_info_));
+        cudaMalloc(&d_aux_q_info_, max_tokens_per_frame_ * sizeof(*d_aux_q_info_));
 
-        cudaMalloc(&d_main_q_local_offset_, sizeof(int32));
-        cudaMalloc(&d_aux_q_end_, sizeof(int32));
-        cudaMalloc(&d_n_CTA_done_, sizeof(int32));
+        cudaMalloc(&d_main_q_local_offset_, sizeof(*d_main_q_local_offset_));
+        cudaMalloc(&d_aux_q_end_, sizeof(*d_aux_q_end_));
+        cudaMalloc(&d_n_CTA_done_, sizeof(*d_n_CTA_done_));
 
-        cudaMalloc(&d_main_q_end_and_narcs_i2_, sizeof(TokenAndArcCountUnion));
+        cudaMalloc(&d_main_q_end_and_narcs_i2_, sizeof(*d_main_q_end_and_narcs_i2_));
         d_main_q_narcs_ = &d_main_q_end_and_narcs_i2_->split.narcs;
         d_main_q_end_ = &d_main_q_end_and_narcs_i2_->split.ntokens;
 
-        cudaMalloc(&d_cutoff_, sizeof(IntegerCostType));
+        cudaMalloc(&d_cutoff_, sizeof(*d_cutoff_));
 
-        cudaMallocHost(&h_main_q_end_, sizeof(int32));  
-        cudaMallocHost(&h_main_q_narcs_, sizeof(int32));  
-        cudaMallocHost(&h_main_q_local_offset_, sizeof(int32));  
-        cudaMallocHost(&h_aux_q_end_, sizeof(int32));  
+        cudaMallocHost(&h_main_q_end_, sizeof(*h_main_q_end_));  
+        cudaMallocHost(&h_main_q_narcs_, sizeof(*h_main_q_narcs_));  
+        cudaMallocHost(&h_main_q_local_offset_, sizeof(*h_main_q_local_offset_));  
+        cudaMallocHost(&h_aux_q_end_, sizeof(*h_aux_q_end_));  
 
-        cudaMallocHost(&h_q_overflow_, sizeof(int32));  
+        cudaMallocHost(&h_q_overflow_, sizeof(h_q_overflow_));  
 
-        cudaMalloc(&d_main_q_degrees_prefix_sum_, max_tokens_per_frame_ * sizeof(int32));
+        cudaMalloc(&d_main_q_degrees_prefix_sum_, max_tokens_per_frame_ * sizeof(*d_main_q_degrees_prefix_sum_));
 
         // d_main_q_degrees_block_sums_prefix_sum_ is the prefix sum of the "block sums"
         // a block sum is, for each CUDA block, the sum of the arc degrees of all tokens associated to that CUDA block
         // we add +1 because we want the last element of the prefix sum (a prefix sum of n elements generates (n+1) values)
         cudaMalloc(&d_main_q_degrees_block_sums_prefix_sum_, 
-                (DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)* sizeof(int32));
+                (DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)
+                 * sizeof(*d_main_q_degrees_block_sums_prefix_sum_));
 
-        cudaMalloc(&d_main_q_arc_offsets_, (max_tokens_per_frame_+1) * sizeof(int32));
+        cudaMalloc(&d_main_q_arc_offsets_, (max_tokens_per_frame_+1) * sizeof(*d_main_q_arc_offsets_));
 
-        cudaMalloc(&d_loglikelihoods_, sizeof(BaseFloat)*(fst_.max_ilabel_+1));  
+        cudaMalloc(&d_loglikelihoods_, (fst_.max_ilabel_+1)*sizeof(*d_loglikelihoods_));  
 
-        cudaMalloc(&d_state_best_cost_, sizeof(IntegerCostType)*fst_.num_states_);
+        cudaMalloc(&d_state_best_cost_, fst_.num_states_*sizeof(*d_state_best_cost_));
 
         h_all_tokens_info_.SetCudaStream(copy_st_);
 
         if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
             KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
                      
-            cudaMallocHost(&h_debug_buf1_, (fst_.num_states_) * sizeof(int32));
-            cudaMallocHost(&h_debug_buf2_, (max_tokens_per_frame_+1) * sizeof(int32));
+            uint32_t debug_buffer_queue_size = max_tokens_per_frame_ + 1;
+            cudaMallocHost(&h_debug_buf1_, std::max(fst_.num_states_, debug_buffer_queue_size) * sizeof(h_debug_buf1_));
+            cudaMallocHost(&h_debug_buf2_, debug_buffer_queue_size * sizeof(h_debug_buf2_));
         }
 
         KALDI_DECODER_CUDA_CHECK_ERROR();
