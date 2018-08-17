@@ -41,7 +41,7 @@
 // Moves data back to the CPU during computation and looks if everything looks ok
 // Three levels 0 (no debugging), and 1 to 3, depending on how much we want to check things
 // (performance will decrease)
-#define KALDI_CUDA_DECODER_DEBUG_LEVEL 1
+#define KALDI_CUDA_DECODER_DEBUG_LEVEL 0
 
 namespace kaldi {
 
