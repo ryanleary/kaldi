@@ -297,7 +297,6 @@ namespace kaldi {
             num_frames_decoded_++; 
         }   
 
-
         nvtxRangePop();
     }
 
@@ -616,14 +615,12 @@ namespace kaldi {
         // Going all the way from the token with best cost
         // to the beginning (StartState)
         int32 token_idx = token_with_best_cost;
-        int32 last_valid_token_idx;
         std::vector<int32> reversed_path;
 
         // The first token was inserted at the beginning of the queue
         // it always has index 0
         // We backtrack until that first token
         while(token_idx != 0) {
-            last_valid_token_idx = token_idx;
             int32 arc_idx = h_all_tokens_info_.GetRawPointer()[token_idx].arc_idx;
             reversed_path.push_back(arc_idx);
             token_idx = h_all_tokens_info_.GetRawPointer()[token_idx].prev_token;
