@@ -1,8 +1,0 @@
-module purge
-module load  CUDA/9.2.88
-module load Subversion/1.8.14-GCC-5.4.0-2.26
-module load ATLAS/3.10.2-GCC-5.4.0-2.26-LAPACK-3.6.1  
-module load SoX/14.4.2-GCC-5.4.0-2.26
-module load FLAC/1.3.1-GCC-5.4.0-2.26
-export CXXFLAGS=-fopenmp 
-export LDFLAGS=-fopenmp
