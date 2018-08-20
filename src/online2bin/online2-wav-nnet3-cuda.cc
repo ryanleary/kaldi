@@ -234,14 +234,11 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
       } else {
         chunk_length = std::numeric_limits<int32>::max();
       }
-      printf("Chunk_length: %d\n", chunk_length);
-      printf("Chunk_length_secs: %f\n", params.chunk_length_secs);
 
       int32 samp_offset = 0;
       std::vector<std::pair<int32, BaseFloat> > delta_weights;
       
       while (samp_offset < data.Dim()) {
-        printf("samp_offset: %d, data.Dim(): %d\n", samp_offset,data.Dim());
         int32 samp_remaining = data.Dim() - samp_offset;
         int32 num_samp = chunk_length < samp_remaining ? chunk_length
           : samp_remaining;
