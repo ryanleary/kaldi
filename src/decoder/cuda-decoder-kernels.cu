@@ -150,15 +150,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         }
     }
 
-    void CudaDecoder::ResetStateBestCostLookupAndFinalizePreprocessInPlace() {
-        int32 main_q_size = *h_main_q_end_;
-
-        KALDI_ASSERT(main_q_size > 0);
-        KALDI_ASSERT(*h_main_q_local_offset_ == 0);
+    void CudaDecoder::ResetStateBestCostLookupAndFinalizePreprocessInPlace(int32 main_q_size_estimate) {
+        KALDI_ASSERT(main_q_size_estimate > 0);
 
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
-        grid.x = DIV_ROUND_UP(main_q_size, block.x);
+        grid.x = DIV_ROUND_UP(main_q_size_estimate, block.x);
 
         _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place<<<grid,block,0,compute_st_>>>(d_main_q_state_, 
                                                                       d_main_q_end_,
@@ -432,17 +429,18 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::PreprocessAndContract(const PreprocessParams &params) {
+    void CudaDecoder::PreprocessAndContract(int32 aux_q_size_estimate) {
         dim3 grid,block;
 
-        int32 aux_q_size = *h_aux_q_end_;
-        KALDI_ASSERT(aux_q_size > 0);
+        KALDI_ASSERT(aux_q_size_estimate > 0);
 
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-        grid.x = DIV_ROUND_UP(aux_q_size, block.x);
+        grid.x = DIV_ROUND_UP(aux_q_size_estimate, block.x);
 
-
-        _preprocess_and_contract_kernel<<<grid,block,0,compute_st_>>>(params);
+        // PreprocessAndContract is called when non emitting
+        // using non emitting offsets
+        preprocess_params_.d_arc_offsets = fst_.d_ne_offsets_;
+        _preprocess_and_contract_kernel<<<grid,block,0,compute_st_>>>(preprocess_params_);
     }
 
 
@@ -662,19 +660,17 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::PreprocessInPlace(const PreprocessParams &params) {
+    void CudaDecoder::PreprocessInPlace(int32 main_q_size_estimate) {
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
 
-        // Preprocess in place can be used only with offset == 0
-        KALDI_ASSERT(*h_main_q_local_offset_ == 0);
+        KALDI_ASSERT(main_q_size_estimate > 0);
+        grid.x = DIV_ROUND_UP(main_q_size_estimate, block.x);
 
-        int32 main_q_size = *h_main_q_end_ - 0; // 0 = main_q_offset
-
-        KALDI_ASSERT(main_q_size > 0);
-        grid.x = DIV_ROUND_UP(main_q_size, block.x);
-
-        _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(params);
+        // PreprocessInPlace is called when emitting
+        // using emitting arc offsets
+        preprocess_params_.d_arc_offsets = fst_.d_e_offsets_;
+        _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(preprocess_params_);
     }
 
 
@@ -1121,13 +1117,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     }
 
-    void CudaDecoder::ExpandArcs(int32 nthreads, bool is_emitting) {
+    void CudaDecoder::ExpandArcs(bool is_emitting, int32 main_q_narcs_estimate) {
         dim3 grid,block;
 
-        KALDI_ASSERT(nthreads > 0);
+        KALDI_ASSERT(main_q_narcs_estimate > 0);
 
         block.x = KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX;
-        grid.x = DIV_ROUND_UP(nthreads, block.x);
+        grid.x = DIV_ROUND_UP(main_q_narcs_estimate, block.x);
 
         // The two members of params we need to update
         expand_params_.main_q_global_offset = main_q_global_offset_;

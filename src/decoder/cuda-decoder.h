@@ -265,8 +265,11 @@ private:
             // For more information on the condition for the creation of a new token,
             // please refer to http://kaldi-asr.org/doc/decoders.html
             //
+            // main_q_narcs_estimate is used to decide how many threads to launch
+            // it is not used inside the kernel, where the exact value will be used
+            //
 
-            void ExpandArcs(int32 nthreads, bool is_emitting);
+            void ExpandArcs(bool is_emitting, int32 main_q_narcs_estimate);
 
             //
             // PreprocessAndContract kernel
@@ -297,8 +300,11 @@ private:
             // using only one kernel (without global syncs)
             // We don't need to call FinalizePreprocessInPlace() after PreprocessAndContract
             //
+            // aux_q_size_estimate is used to decide how many threads to launch
+            // it is not used inside the kernel, where the exact value will be used
+            //
 
-            void PreprocessAndContract(const PreprocessParams &params);
+            void PreprocessAndContract(int32 aux_q_size_estimate);
 
             
             //
@@ -340,8 +346,11 @@ private:
             // Note : Only the first pass of the prefix sum is computed in that kernel. We then need to call
             // ResetStateBestCostLookupAndFinalizePreprocessInPlace after PreprocessInPlace 
             //
+            // main_q_size_estimate is used to decide how many threads to launch
+            // it is not used inside the kernel, where the exact value will be used
+            //
 
-            void PreprocessInPlace(const PreprocessParams &params);
+            void PreprocessInPlace(int32 main_q_size_estimate);
 
 
             //
@@ -380,26 +389,15 @@ private:
             // This kernel is responsible to compute the second pass of the
             // prefix sum. Must be called between PreprocessInPlace and ExpandArcs
             //
-             void ResetStateBestCostLookupAndFinalizePreprocessInPlace();
+            //
+            // main_q_size_estimate is used to decide how many threads to launch
+            // it is not used inside the kernel, where the exact value will be used
+            //
+
+            void ResetStateBestCostLookupAndFinalizePreprocessInPlace(int main_q_size_estimate);
 
             // Pre-computes log likelihoods for the current frame 
             void ComputeLogLikelihoods(DecodableInterface *decodable);
-
-
-            // ProcessNonEmitting
-            // Same thing than for ProcessNonemitting, except that we use non-emitting arcs
-            void ProcessNonemitting();
-
-
-            // ProcessToken is called by both ProcessEmitting and ProcessNonemitting 
-            // It creates new tokens using an old token queue and the associated FST
-            // It only does one iteration [old token queue ---Arcs---> new token queue]
-            // In the Non-emitting computation, we may need multiple iteration to compute all the non-emitting paths
-            // ProcessToken returns false if we need to call it again, because the new token queue still contains tokens
-            // with non-emitting arcs
-            // It returns true if we are done
-            bool ProcessToken(bool is_emitting);
-
 
             // CheckOverflow
             // If a kernel sets the flag h_q_overflow, we send a warning to stderr 
@@ -584,6 +582,10 @@ private:
             // At the end of Preprocess kernels we set h_main_q_narcs (pinned memory)
             // this event is set in the pipeline after Preprocess kernels to inform that data is ready to be read
             cudaEvent_t can_read_h_main_q_narcs_;
+
+            // h_main_q_end is final for this frame
+            // triggered at the end of a frame computation
+            cudaEvent_t can_read_final_h_main_q_end_;
 
             // When we generate a new tokens list we only keep candidates 
             // that have a cost < best_cost_in_the_queue + beam_
