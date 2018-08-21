@@ -237,15 +237,25 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         //
         __shared__ TokenAndArcCountUnion sh_main_q_global_block_offset;
 
+        // This CTA will start working in aux_q on indexes >= first_block_offset
+        // If we have nothing to do, stop here
+        int32 first_block_offset = blockDim.x*blockIdx.x;
+        const int32 aux_q_end = *params.d_aux_q_end;
+
+        // Early exit if all threads in the CTA have nothing to do
+        // it does break the finalize_kernel: code below, 
+        // we take those early exists into account
+        if(first_block_offset >= aux_q_end)
+            return;
+
         // Final cutoff from last ExpandArc execution
         const BaseFloat cutoff = orderedIntToFloat(*params.d_cutoff);
 
-        const int32 aux_q_end = *params.d_aux_q_end;
 
         // The condition of the for loop is the same for all threads in the CUDA block
         // we want to keep all threads alive at the same time for now
         // otherwise __syncthreads() would fail
-        for(int32 block_offset = blockDim.x*blockIdx.x;
+        for(int32 block_offset = first_block_offset;
                 block_offset < aux_q_end;
                 block_offset += gridDim.x*blockDim.x) {
 
@@ -396,9 +406,10 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         if(threadIdx.x == 0) {
             // Declaring the CTA as done
             int32 old = atomicAdd(params.d_n_CTA_done, 1);
-
+            // Taking into account the CTAs that have early exited at the begining of this kernel
+            int32 total_active_CTAs = min(DIV_ROUND_UP(aux_q_end, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX), gridDim.x);
             // If we're the last CTA to exit, detect it
-            bool is_last_CTA = (old == (gridDim.x -1));
+            bool is_last_CTA = (old == (total_active_CTAs -1));
 
             if(is_last_CTA) {
                 __threadfence();
@@ -410,8 +421,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 int main_q_end = *params.d_main_q_end;
                 int main_q_narcs = *params.d_main_q_narcs;
-
                 *params.h_main_q_end = main_q_end;
+                *params.h_main_q_end_before_finalize_nonemitting_kernel = main_q_end;
                 *params.h_main_q_narcs = main_q_narcs;
 
                 params.d_main_q_degrees_prefix_sum[main_q_end] = main_q_narcs;
@@ -812,7 +823,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         //
         __shared__ CostType sh_cached_cutoff;
 
+        const int32 first_main_q_arc_index_block_offset = blockDim.x*blockIdx.x;
         const int32 total_narcs = *params.d_main_q_narcs;
+
+        // Early exit ASAP if nothing to do
+        // does not break the finalize_kernel: code,
+        if(first_main_q_arc_index_block_offset >= total_narcs)
+            return;
+
         const int32 main_q_offset = *params.d_main_q_local_offset;
         const int32 main_q_end = *params.d_main_q_end;
 
@@ -828,7 +846,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // We'll have syncs inside the for loop, and we need to have all threads alive during
         // those syncs
         // in the future we may rely on coop groups
-        for(int32 main_q_arc_index_block_offset = blockDim.x*blockIdx.x;
+        for(int32 main_q_arc_index_block_offset = first_main_q_arc_index_block_offset;
                   main_q_arc_index_block_offset < total_narcs;
                   main_q_arc_index_block_offset += gridDim.x*blockDim.x) {
 
@@ -1091,8 +1109,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // Declaring this CTA as done
             int32 old = atomicAdd(params.d_n_CTA_done, 1);
 
+            // Taking into account the CTAs that have early exited at the begining of this kernel
+            int32 total_active_CTAs = min(DIV_ROUND_UP(total_narcs, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX), gridDim.x);
+
             // If we're the last CTA to exit - detect it
-            if(old == (gridDim.x -1)) {
+            if(old == (total_active_CTAs -1)) {
                 __threadfence(); // we want last value of d_aux_q_end
 
                 // h_* pointers are in pinned memory, we can update them from the GPU
@@ -1181,14 +1202,20 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             typedef cub::BlockScan<int, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> BlockScanInt;
             __shared__ typename BlockScanInt::TempStorage sh_temp_storage_scan_int;
 
+            int32 total_narcs = *params.d_main_q_narcs;
+
+            // We launch the kernel before knowing the value of total_narcs
+            // if it was too early, we exit and the host will relaunch heavy load
+            // non emitting kernels (using Preprocess and ExpandArc kernels)
+            if(total_narcs >= KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) 
+                return;
+
             int32 main_q_offset = *params.d_main_q_local_offset;
             int32 main_q_end = *params.d_main_q_end;
             
             // aux_q is empty when this kernel is called
             int32 aux_q_end = 0;
 
-            int32 total_narcs = *params.d_main_q_narcs;
-    
             CostType cutoff = orderedIntToFloat(*params.d_cutoff);
 
             while(total_narcs > 0) {
@@ -1350,10 +1377,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             if(threadIdx.x == 0) {
                 // Next step is ProcessEmitting of next frame, from is currToken_offset
                 *params.d_main_q_end = main_q_end; 
-                *params.d_main_q_narcs = 0;
-
                 *params.h_main_q_end = main_q_end; 
-                *params.h_main_q_narcs = 0; 
 
                 *params.d_main_q_local_offset = 0; 
                 *params.h_main_q_local_offset = 0; 

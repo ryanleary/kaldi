@@ -38,6 +38,11 @@
 // Below that value, we launch the persistent kernel for NonEmitting
 #define KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS 4096
 
+// How many "heavy load" non emitting kernels to launch before attemping to start the persistent one
+#define KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_FIRST 0
+// How many "heavy load" non emitting kernels to launch if previous attempt was not enough
+#define KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_RELAUNCH 1
+
 // Moves data back to the CPU during computation and looks if everything looks ok
 // Three levels 0 (no debugging), and 1 to 3, depending on how much we want to check things
 // (performance will decrease)
@@ -181,6 +186,7 @@ namespace kaldi {
                 TokenAndArcCountUnion *d_main_q_end_and_narcs_i2; 
                 int32 *d_main_q_narcs; 
                 int32 *h_main_q_end;
+                int32 *h_main_q_end_before_finalize_nonemitting_kernel;
                 int32 *h_main_q_narcs; 
 
                 int32 *h_q_overflow; 
@@ -465,6 +471,10 @@ private:
             // are valid tokens
             int32 *d_main_q_end_;
             int32 *h_main_q_end_; // pinned memory
+            // This value is only set by PreprocessAndContracts kernels,
+            // not the FinalizeNonEmitting. Allows us to read from it during
+            // execution of FinalizeNonEmitting
+            int32 *h_main_q_end_before_finalize_nonemitting_kernel_; // pinned memory
 
             // Same thing for the aux queue
             int32 *d_aux_q_end_;
@@ -582,6 +592,11 @@ private:
             // At the end of Preprocess kernels we set h_main_q_narcs (pinned memory)
             // this event is set in the pipeline after Preprocess kernels to inform that data is ready to be read
             cudaEvent_t can_read_h_main_q_narcs_;
+
+            //
+            // This kernel is triggered when finalize non emitting is about to start
+            //
+            cudaEvent_t before_finalize_nonemitting_kernel_;
 
             // h_main_q_end is final for this frame
             // triggered at the end of a frame computation
