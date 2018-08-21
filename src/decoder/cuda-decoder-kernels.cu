@@ -1121,7 +1121,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
     }
 
-    void CudaDecoder::ExpandArcs(const ExpandArcParams &params, int32 nthreads) {
+    void CudaDecoder::ExpandArcs(int32 nthreads, bool is_emitting) {
         dim3 grid,block;
 
         KALDI_ASSERT(nthreads > 0);
@@ -1129,8 +1129,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX;
         grid.x = DIV_ROUND_UP(nthreads, block.x);
 
-
-        _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(params);
+        // The two members of params we need to update
+        expand_params_.main_q_global_offset = main_q_global_offset_;
+        expand_params_.is_emitting = is_emitting;
+            
+        _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(expand_params_);
     }
 
 
@@ -1365,12 +1368,15 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         }
 
-    void CudaDecoder::FinalizeProcessNonemitting(const uint32_t *d_arc_offsets, 
-            const ExpandArcParams &params) {
+    void CudaDecoder::FinalizeProcessNonemitting() {
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX;
-        grid.x = 1; // it is designed for the long tail
-        _finalize_process_non_emitting<<<grid,block,0,compute_st_>>>(d_arc_offsets, params);
+        grid.x = 1; // this kernel is designed for one CTA 
+
+        expand_params_.main_q_global_offset = main_q_global_offset_;
+        expand_params_.is_emitting = false;
+
+        _finalize_process_non_emitting<<<grid,block,0,compute_st_>>>(fst_.d_ne_offsets_, expand_params_);
     }
 
 

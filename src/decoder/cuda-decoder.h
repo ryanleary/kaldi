@@ -266,7 +266,7 @@ private:
             // please refer to http://kaldi-asr.org/doc/decoders.html
             //
 
-            void ExpandArcs(const ExpandArcParams &params, int32 nthreads);
+            void ExpandArcs(int32 nthreads, bool is_emitting);
 
             //
             // PreprocessAndContract kernel
@@ -354,12 +354,12 @@ private:
             // without lauching new kernels
             // This meta-kernel performs :
             // while we have non-emitting arcs to traverse:
-            //      (1) Preprocess in place
+            //      (1) Preprocess and contract 
             //      (2) Expand
-            // This meta-kernel does not call the PreprocessInPlace or Expand kernels
+            // This meta-kernel does not call the PreprocessAndContract or Expand kernels
             // it uses simplified implementations (for one CTA) of those 
             //
-            void FinalizeProcessNonemitting(const uint32_t *d_arc_offsets, const ExpandArcParams &params);
+            void FinalizeProcessNonemitting();
 
 
             // InitStateCost initializes all costs to +INF in d_state_best_cost at the beginning of the computation
@@ -385,12 +385,6 @@ private:
             // Pre-computes log likelihoods for the current frame 
             void ComputeLogLikelihoods(DecodableInterface *decodable);
 
-                       // ProcessEmitting generates tokens associated with the new frame i
-            // When we call ProcessEmitting, the main_q contains the tokens associated
-            // with the previous frame (i-1). Using d_main_q_state and the emitting arcs from the FST graph,
-            // we create a new tokens queue, which will be stored in the aux_q
-            void ProcessEmitting();
-
 
             // ProcessNonEmitting
             // Same thing than for ProcessNonemitting, except that we use non-emitting arcs
@@ -407,9 +401,9 @@ private:
             bool ProcessToken(bool is_emitting);
 
 
-            // PrintOverflowWarning
-            // if a kernel sets the flag h_q_overflow, we send a warning to stderr 
-            void PrintOverflowWarning();
+            // CheckOverflow
+            // If a kernel sets the flag h_q_overflow, we send a warning to stderr 
+            void CheckOverflow();
 
             //
             // Debug functions
@@ -575,6 +569,11 @@ private:
             // we synchronize the two using events
             cudaStream_t compute_st_, copy_st_;
 
+            // Parameters used to launch Expand and Preprocess kernels
+            // We reuse most of the parameters, saving the data structures as class members
+            PreprocessParams preprocess_params_;
+            ExpandArcParams expand_params_;
+            
             // CUDA events
 
             // We need to synchronize the streams copy_st and compute_st
