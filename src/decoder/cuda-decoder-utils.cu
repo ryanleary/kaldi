@@ -59,10 +59,9 @@ namespace kaldi {
             for (fst::ArcIterator<fst::Fst<StdArc> > aiter(fst, i); !aiter.Done(); aiter.Next()) {
                 StdArc arc = aiter.Value();
                 int32 ilabel = arc.ilabel;
-                int32 olabel = arc.olabel;
 
                 if(ilabel>max_ilabel_) {
-                    max_ilabel_=ilabel;
+                    max_ilabel_ = ilabel;
                 }
 
                 if(ilabel!=0) { //emitting
@@ -71,8 +70,8 @@ namespace kaldi {
                     ne_count_++;
                 }
             }
-            h_ne_offsets_[i+1]=ne_count_;
-            h_e_offsets_[i+1]=e_count_;
+            h_ne_offsets_[i+1] = ne_count_;
+            h_e_offsets_[i+1] = e_count_;
         }
 
         // We put the emitting arcs before the nonemitting arcs in the arc list

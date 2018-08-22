@@ -39,9 +39,9 @@
 #define KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS 4096
 
 // How many "heavy load" non emitting kernels to launch before attemping to start the persistent one
-#define KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_FIRST 0
+#define KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_FIRST 2
 // How many "heavy load" non emitting kernels to launch if previous attempt was not enough
-#define KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_RELAUNCH 1
+#define KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_RELAUNCH 2
 
 // Moves data back to the CPU during computation and looks if everything looks ok
 // Three levels 0 (no debugging), and 1 to 3, depending on how much we want to check things
@@ -53,22 +53,24 @@ namespace kaldi {
    class CudaDecoder;
 
    struct CudaDecoderConfig {
-       BaseFloat beam;
+       BaseFloat default_beam;
        uint32_t max_tokens;
        uint32_t max_tokens_per_frame;
 
 
-       CudaDecoderConfig(): beam(16.0),
-       max_tokens(300000000),
+       CudaDecoderConfig(): default_beam(15.0),
+       max_tokens(50000000),
        max_tokens_per_frame(1000000) {}
 
        void Register(OptionsItf *opts) {
-           opts->Register("beam", &beam, "Decoding beam.  Larger->slower, more accurate.");
+           opts->Register("beam", &default_beam, "Decoding beam.  Larger->slower, more accurate. The beam may be"
+                                                          "decreased if we are generating too many tokens compared to "
+                                                          "what the queue can hold (max_tokens_per_frame)");
            opts->Register("max-tokens-pre-allocated", &max_tokens, "Total number of tokens pre-allocated (equivalent to reserve in a std vector).  If actual usaged exceeds this performance will be degraded");
            opts->Register("max-tokens-per-frame", &max_tokens_per_frame, "Number of tokens allocated per frame. If actual usaged exceeds this the results are undefined.");
        }
        void Check() const {
-           KALDI_ASSERT(beam > 0.0 && max_tokens > 0 && max_tokens_per_frame > 0);
+           KALDI_ASSERT(default_beam > 0.0 && max_tokens > 0 && max_tokens_per_frame > 0);
        }
    };
 
@@ -137,14 +139,14 @@ namespace kaldi {
             // GetBestCost sets in *min the token's best cost in the main_q
             // it also sets in *arg the index of that token (argmin)
             // is isfinal is true, we take into account the final costs
-            void GetBestCost(bool isfinal, BaseFloat *best_cost, int32 *best_cost_arg) const;
+            void GetBestCost(bool isfinal, CostType *best_cost, int32 *best_cost_arg) const;
 
             /// FinalRelativeCost() serves the same function as ReachedFinal(), but gives
             /// more information.  It returns the difference between the best (final-cost plus
             /// cost) of any token on the final frame, and the best cost of any token
             /// on the final frame.  If it is infinity it means no final-states were present
             /// on the final frame.  It will usually be nonnegative.
-            BaseFloat FinalRelativeCost() const;
+            CostType FinalRelativeCost() const;
 
 
             //
@@ -167,6 +169,28 @@ namespace kaldi {
             union TokenAndArcCountUnion {
                 TokenAndArcCount split;
                 unsigned long long both;
+            };
+
+
+            //
+            // Used for the cutoff
+            // cutoff = min_cost + beam
+            // We store both separatly because we have an adaptive beam
+            // We may change the beam after discovering min_cost
+            // we need to keep track of min_cost to apply the new beam
+            // (we don't know what the old beam was)
+            //
+            // Native float and Integers version
+            //
+
+            struct MinCostAndBeam {
+                CostType min_cost;
+                CostType beam;
+            };
+
+            struct MinCostAndBeamIntegers {
+                IntegerCostType min_cost;
+                IntegerCostType beam;
             };
 
             // Parameters used by the Preprocess kernels
@@ -203,10 +227,12 @@ namespace kaldi {
                 int32 *d_main_q_arc_offsets; // offsets, relative to the queue
 
                 IntegerCostType *d_state_best_cost; 
-                IntegerCostType *d_cutoff; 
+                MinCostAndBeamIntegers *d_global_min_cost_and_beam;
 
                 int32 *d_main_q_degrees_block_sums_prefix_sum; 
                 int32 *d_n_CTA_done;
+
+                CostType infinite_cost;
             };
 
             // Parameters used by the Expand kernel
@@ -244,11 +270,11 @@ namespace kaldi {
                 int32 *d_q_arc_offsets; 
                 int32 *arc_ilabels; 
 
-                BaseFloat *arc_weights; 
+                CostType *arc_weights; 
                 StateId *arc_nextstates; 
-                IntegerCostType *d_cutoff;
-                BaseFloat *d_loglikelihoods;
-                BaseFloat beam; 
+                CostType *d_loglikelihoods;
+                CostType default_beam;
+                MinCostAndBeamIntegers *d_global_min_cost_and_beam;
 
                 int32 *d_state_best_cost;
                 bool is_emitting;
@@ -279,8 +305,6 @@ private:
 
             //
             // PreprocessAndContract kernel
-            // Input  : aux_q, FST, d_state_best_costs, d_cutoff
-            // Output : main_q, d_main_q_degrees_prefix_sum
             //
             // The Preprocess* kernels are used before executing Expand 
             // Computing data members needed by Expand (preprocess) and prune tokens on the fly (contract) 
@@ -315,8 +339,6 @@ private:
             
             //
             // PreprocessInPlace kernel
-            // Input  : main_q, main_q_local_offset, FST, d_state_best_costs, d_cutoff
-            // Output : main_q, d_main_q_degrees_prefix_sum
             //
             // The Preprocess* kernels are used before executing Expand 
             // Computing data members needed by Expand (preprocess) in place, without modifying queues
@@ -568,7 +590,7 @@ private:
 
             // loglikelihoods computed by the acoustic model
             // we need it to compute the cost of emitting edges
-            BaseFloat *d_loglikelihoods_;
+            CostType *d_loglikelihoods_;
 
             // CUDA streams
             // kernels are launched in compute_st
@@ -603,19 +625,27 @@ private:
             cudaEvent_t can_read_final_h_main_q_end_;
 
             // When we generate a new tokens list we only keep candidates 
-            // that have a cost < best_cost_in_the_queue + beam_
-            BaseFloat beam_;
+            // that have a cost < best_cost_in_the_queue + beam
+            // At first beam = default_beam_
+            // We may decrease that beam if we are generating too many tokens
+            // (adaptive beam)
+            CostType default_beam_;
 
             // Cutoff for the current frame
-            // contains best_cost_in_the_queue + beam_
-            // Updated during the ExpandArc operation
-            IntegerCostType *d_cutoff_;
+            // Contains both the global min cost (min cost for that frame)
+            // And the current beam
+            // We use an adaptive beam, so the beam might change during computation
+            MinCostAndBeamIntegers *d_global_min_cost_and_beam_;
 
             int32 max_tokens_;
             int32 max_tokens_per_frame_;
 
             // Keep track of the number of frames decoded in the current file.
             int32 num_frames_decoded_;
+
+            // Max possible cost
+            // used to init the min_cost and d_state_best_cost_
+            CostType infinite_cost_;
 
             // Used for debugging purposes
             // only malloc'ed if necessary

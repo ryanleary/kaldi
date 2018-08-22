@@ -28,12 +28,12 @@
 
 #define MEMADVISE
 
-#define DIV_ROUND_UP(a,b) ((a+b-1)/b)
+#define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 namespace kaldi {
 
     CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), 
-                     beam_(config.beam),
+                     default_beam_(config.default_beam),
                      max_tokens_(config.max_tokens), 
                      max_tokens_per_frame_(config.max_tokens_per_frame),
                      h_all_tokens_info_(config.max_tokens) {
@@ -67,7 +67,7 @@ namespace kaldi {
         d_main_q_narcs_ = &d_main_q_end_and_narcs_i2_->split.narcs;
         d_main_q_end_ = &d_main_q_end_and_narcs_i2_->split.ntokens;
 
-        cudaMalloc(&d_cutoff_, sizeof(*d_cutoff_));
+        cudaMalloc(&d_global_min_cost_and_beam_, sizeof(*d_global_min_cost_and_beam_));
 
         // TODO alloc once, for all small vals, better data locality
         cudaMallocHost(&h_main_q_end_, sizeof(*h_main_q_end_));  
@@ -84,7 +84,7 @@ namespace kaldi {
         // a block sum is, for each CUDA block, the sum of the arc degrees of all tokens associated to that CUDA block
         // we add +1 because we want the last element of the prefix sum (a prefix sum of n elements generates (n+1) values)
         cudaMalloc(&d_main_q_degrees_block_sums_prefix_sum_, 
-                (DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)
+                (KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)
                  * sizeof(*d_main_q_degrees_block_sums_prefix_sum_));
 
         cudaMalloc(&d_main_q_arc_offsets_, (max_tokens_per_frame_+1) * sizeof(*d_main_q_arc_offsets_));
@@ -106,6 +106,12 @@ namespace kaldi {
         KALDI_DECODER_CUDA_CHECK_ERROR();
 
 
+        // Used as +INF for min_cost and d_state_cost
+        // we will compute min_cost + beam during computation
+        // if min_cost == FLT_MAX, we have an overflow
+        // avoiding that by removing the beam from infinite
+        // (2* the beam in case of rounding error)
+        infinite_cost_ = FLT_MAX - 2*config.default_beam;
         // Building the parameters structs
         // Used to launch the ExpandArc and Preprocess kernels
 
@@ -130,9 +136,10 @@ namespace kaldi {
         preprocess_params_.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
         preprocess_params_.d_main_q_arc_offsets = d_main_q_arc_offsets_;
         preprocess_params_.d_state_best_cost = d_state_best_cost_; 
-        preprocess_params_.d_cutoff = d_cutoff_; 
+        preprocess_params_.d_global_min_cost_and_beam = d_global_min_cost_and_beam_; 
         preprocess_params_.d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_; 
         preprocess_params_.d_n_CTA_done = d_n_CTA_done_;
+        preprocess_params_.infinite_cost = infinite_cost_;
 
         expand_params_.d_main_q_state = d_main_q_state_;
         expand_params_.d_main_q_cost = d_main_q_cost_;
@@ -155,11 +162,12 @@ namespace kaldi {
         expand_params_.arc_ilabels = fst_.d_arc_ilabels_;
         expand_params_.arc_weights = fst_.d_arc_weights_; 
         expand_params_.arc_nextstates = fst_.d_arc_nextstates_; 
-        expand_params_.d_cutoff = d_cutoff_;
-        expand_params_.beam = beam_;
+        expand_params_.d_global_min_cost_and_beam = d_global_min_cost_and_beam_; 
+        expand_params_.default_beam = default_beam_;
         expand_params_.d_loglikelihoods = d_loglikelihoods_;
         expand_params_.d_state_best_cost = d_state_best_cost_;
         expand_params_.d_n_CTA_done = d_n_CTA_done_;
+
     }
 
     CudaDecoder::~CudaDecoder() {
@@ -181,12 +189,12 @@ namespace kaldi {
         cudaFree(d_aux_q_end_);
         cudaFree(d_n_CTA_done_);
         cudaFree(d_main_q_end_and_narcs_i2_);
-        cudaFree(d_cutoff_);
         cudaFree(d_main_q_degrees_prefix_sum_);
         cudaFree(d_main_q_degrees_block_sums_prefix_sum_);
         cudaFree(d_main_q_arc_offsets_);
         cudaFree(d_loglikelihoods_);
         cudaFree(d_state_best_cost_);
+        cudaFree(d_global_min_cost_and_beam_);
 
         cudaFreeHost(h_main_q_end_);
         cudaFreeHost(h_main_q_narcs_);
@@ -508,7 +516,7 @@ namespace kaldi {
     // Only called at the end of the computation of one audio file
     // not optimized
     //
-    void CudaDecoder::GetBestCost(bool isfinal, BaseFloat *min, int32 *argmin) const {
+    void CudaDecoder::GetBestCost(bool isfinal, CostType *min, int32 *argmin) const {
         CostType best_cost = std::numeric_limits<CostType>::max();
         int32 min_cost_token_index;
 
@@ -611,7 +619,7 @@ namespace kaldi {
 
         // Finding the best token from the last frame
         // ie the token with min cost
-        BaseFloat best_cost;
+        CostType best_cost;
         int32 token_with_best_cost;
         GetBestCost(isfinal, &best_cost, &token_with_best_cost);
 
@@ -738,18 +746,7 @@ namespace kaldi {
                 nstates * sizeof(*d_state_best_cost_), 
                 cudaMemcpyDeviceToHost,
                 compute_st_);
-
-        int cutoff;
-
-        cudaMemcpyAsync(&cutoff,     
-                d_cutoff_,
-                sizeof(*d_cutoff_), 
-                cudaMemcpyDeviceToHost,
-                compute_st_);
-
         cudaStreamSynchronize(compute_st_);
-
-        KALDI_ASSERT(cutoff == float_inf_as_int);
 
         for(int i=0; i<nstates; ++i)
             KALDI_ASSERT(h_state_best_cost[i] == float_inf_as_int);
