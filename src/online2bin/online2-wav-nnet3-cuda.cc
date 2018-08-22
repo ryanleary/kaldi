@@ -167,7 +167,7 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
   while(!spk2utt_reader.Done())
   {
 
-    nvtxRangePushA("Select Work");
+    nvtxRangePushA("Main While Loop");
     //grab next utterance
 
     if(params.replicate) {
@@ -195,7 +195,6 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
     }
     last_idx=my_idx;
     num_processed++;
-    nvtxRangePop();
 
     std::string spk = spk2utt_reader.Key();
     //printf("THREAD: %d, utt: %s\n", th_idx, spk.c_str());
@@ -260,9 +259,7 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
               &delta_weights);
           feature_pipeline.IvectorFeature()->UpdateFrameWeights(delta_weights);
         }
-        nvtxRangePushA("AdvanceDecoding");
         decoder.AdvanceDecoding();
-        nvtxRangePop();
       }
       Lattice lat;
       if(num_processed>0) {
@@ -301,9 +298,10 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
 
         num_done++;
       }
-//      break;
+      //break;
     } //end for
-//    break;
+    nvtxRangePop();
+    //break;
   } //end while
   if(num_processed > 0 ) {
     //timing_stats.Print(online);
@@ -397,6 +395,7 @@ int main(int argc, char *argv[]) {
     }
      
 
+    nvtxRangePush("Global Timer");
     auto start = std::chrono::high_resolution_clock::now();
 
     int threads_per_gpu = (num_threads+num_gpus-1)/num_gpus;
@@ -463,6 +462,7 @@ int main(int argc, char *argv[]) {
     cudaDeviceSynchronize();
 
     auto finish = std::chrono::high_resolution_clock::now();
+    nvtxRangePop();
     double total_audio=0;
     for(int i=0;i<num_threads;i++) {
         total_audio+=params.total_audio[i];
