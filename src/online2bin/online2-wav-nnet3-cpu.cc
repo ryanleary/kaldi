@@ -385,7 +385,6 @@ int main(int argc, char *argv[]) {
       clat_wspecifier = po.GetArg(5);
     CompactLatticeWriter clat_writer(clat_wspecifier);
 
-    //read in fst and put into cuda data structure (one per device)
     fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
 
     if(!online) chunk_length_secs = -1.0;
@@ -424,8 +423,6 @@ int main(int argc, char *argv[]) {
     clat_writer.Close();
     delete decode_fst;
     
-    cudaDeviceSynchronize();
-
     auto finish = std::chrono::high_resolution_clock::now();
     double total_audio=0;
     for(int i=0;i<num_threads;i++) {

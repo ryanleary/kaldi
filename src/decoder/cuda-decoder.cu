@@ -45,6 +45,8 @@ namespace kaldi {
 
         cudaEventCreate(&can_read_h_main_q_narcs_);
         cudaEventCreate(&can_write_to_main_q_);
+        cudaEventCreate(&can_read_final_h_main_q_end_);
+        cudaEventCreate(&before_finalize_nonemitting_kernel_);
 
         cudaMalloc(&d_main_q_state_, max_tokens_per_frame_ * sizeof(*d_main_q_state_));
         cudaMallocHost(&h_main_q_state_, max_tokens_per_frame_ * sizeof(*h_main_q_state_));
@@ -67,10 +69,12 @@ namespace kaldi {
 
         cudaMalloc(&d_cutoff_, sizeof(*d_cutoff_));
 
+        // TODO alloc once, for all small vals, better data locality
         cudaMallocHost(&h_main_q_end_, sizeof(*h_main_q_end_));  
         cudaMallocHost(&h_main_q_narcs_, sizeof(*h_main_q_narcs_));  
         cudaMallocHost(&h_main_q_local_offset_, sizeof(*h_main_q_local_offset_));  
         cudaMallocHost(&h_aux_q_end_, sizeof(*h_aux_q_end_));  
+        cudaMallocHost(&h_main_q_end_before_finalize_nonemitting_kernel_, sizeof(*h_main_q_end_before_finalize_nonemitting_kernel_));  
 
         cudaMallocHost(&h_q_overflow_, sizeof(h_q_overflow_));  
 
@@ -100,6 +104,62 @@ namespace kaldi {
         }
 
         KALDI_DECODER_CUDA_CHECK_ERROR();
+
+
+        // Building the parameters structs
+        // Used to launch the ExpandArc and Preprocess kernels
+
+        preprocess_params_.d_aux_q_state = d_aux_q_state_; 
+        preprocess_params_.d_aux_q_cost = d_aux_q_cost_;
+        preprocess_params_.d_aux_q_info = d_aux_q_info_; 
+        preprocess_params_.d_aux_q_end = d_aux_q_end_;
+        preprocess_params_.h_aux_q_end = h_aux_q_end_;
+        preprocess_params_.d_main_q_state = d_main_q_state_; 
+        preprocess_params_.d_main_q_cost = d_main_q_cost_;
+        preprocess_params_.d_main_q_info = d_main_q_info_; 
+        preprocess_params_.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2_; 
+        preprocess_params_.d_main_q_narcs = d_main_q_narcs_;
+        preprocess_params_.d_main_q_end = d_main_q_end_;
+        preprocess_params_.h_main_q_end = h_main_q_end_;
+        preprocess_params_.h_main_q_end_before_finalize_nonemitting_kernel = h_main_q_end_before_finalize_nonemitting_kernel_;
+        preprocess_params_.d_main_q_local_offset = d_main_q_local_offset_;
+        preprocess_params_.h_main_q_local_offset = h_main_q_local_offset_;
+        preprocess_params_.h_main_q_narcs = h_main_q_narcs_;
+        preprocess_params_.q_capacity = max_tokens_per_frame_;
+        preprocess_params_.h_q_overflow = h_q_overflow_;
+        preprocess_params_.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
+        preprocess_params_.d_main_q_arc_offsets = d_main_q_arc_offsets_;
+        preprocess_params_.d_state_best_cost = d_state_best_cost_; 
+        preprocess_params_.d_cutoff = d_cutoff_; 
+        preprocess_params_.d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_; 
+        preprocess_params_.d_n_CTA_done = d_n_CTA_done_;
+
+        expand_params_.d_main_q_state = d_main_q_state_;
+        expand_params_.d_main_q_cost = d_main_q_cost_;
+        expand_params_.d_main_q_info= d_main_q_info_;
+        expand_params_.d_main_q_local_offset = d_main_q_local_offset_;
+        expand_params_.h_main_q_local_offset = h_main_q_local_offset_;
+        expand_params_.d_main_q_end = d_main_q_end_;
+        expand_params_.d_main_q_narcs = d_main_q_narcs_;
+        expand_params_.h_main_q_end = h_main_q_end_;
+        expand_params_.h_main_q_narcs = h_main_q_narcs_;
+        expand_params_.d_aux_q_state = d_aux_q_state_; 
+        expand_params_.d_aux_q_cost = d_aux_q_cost_; 
+        expand_params_.d_aux_q_info = d_aux_q_info_;
+        expand_params_.d_aux_q_end = d_aux_q_end_;
+        expand_params_.h_aux_q_end = h_aux_q_end_;
+        expand_params_.q_capacity = max_tokens_per_frame_;
+        expand_params_.h_q_overflow = h_q_overflow_;
+        expand_params_.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
+        expand_params_.d_q_arc_offsets = d_main_q_arc_offsets_;
+        expand_params_.arc_ilabels = fst_.d_arc_ilabels_;
+        expand_params_.arc_weights = fst_.d_arc_weights_; 
+        expand_params_.arc_nextstates = fst_.d_arc_nextstates_; 
+        expand_params_.d_cutoff = d_cutoff_;
+        expand_params_.beam = beam_;
+        expand_params_.d_loglikelihoods = d_loglikelihoods_;
+        expand_params_.d_state_best_cost = d_state_best_cost_;
+        expand_params_.d_n_CTA_done = d_n_CTA_done_;
     }
 
     CudaDecoder::~CudaDecoder() {
@@ -108,6 +168,8 @@ namespace kaldi {
 
         cudaEventDestroy(can_read_h_main_q_narcs_);
         cudaEventDestroy(can_write_to_main_q_);
+        cudaEventDestroy(can_read_final_h_main_q_end_);
+        cudaEventDestroy(before_finalize_nonemitting_kernel_);
 
         cudaFree(d_main_q_state_);
         cudaFree(d_aux_q_state_);
@@ -172,8 +234,11 @@ namespace kaldi {
         cudaMemcpyAsync(d_aux_q_info_, &first_token_info, sizeof(InfoToken), cudaMemcpyHostToDevice, compute_st_);
 
         // Updating the best state cost lookup table for the initial token state
-        cudaMemcpyAsync(&d_state_best_cost_[first_token_state], &first_token_cost, sizeof(IntegerCostType),
-                        cudaMemcpyHostToDevice, compute_st_);
+        cudaMemcpyAsync(&d_state_best_cost_[first_token_state], 
+                        &first_token_cost, 
+                        sizeof(IntegerCostType),
+                        cudaMemcpyHostToDevice, 
+                        compute_st_);
 
         // We have one token is the aux_q
         int32 aux_q_end = 1;
@@ -188,7 +253,7 @@ namespace kaldi {
         cudaMemsetAsync(d_main_q_local_offset_, 0, sizeof(*d_main_q_local_offset_), compute_st_);
         *h_main_q_local_offset_ = 0;
         
-        // Resetting the TokenInfoVector in the CPU host
+        // Resetting the TokenInfoVector on host
         h_all_tokens_info_.Reset();
         main_q_global_offset_ = 0;
 
@@ -197,21 +262,40 @@ namespace kaldi {
 
         cudaMemsetAsync(d_n_CTA_done_, 0, sizeof(*d_n_CTA_done_), compute_st_);
 
-        cudaStreamSynchronize(compute_st_);
         KALDI_DECODER_CUDA_CHECK_ERROR();
 
         num_frames_decoded_ = 0;
 
-        ProcessNonemitting();
+        // Initial ProcessNonEmitting
+        PreprocessAndContract(aux_q_end);
+        cudaStreamSynchronize(compute_st_);
+        int main_q_narcs = *h_main_q_narcs_;
+        
+        while(main_q_narcs > KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX) {
+            ExpandArcs(false, main_q_narcs);
+            PreprocessAndContract(main_q_narcs);
 
+            cudaStreamSynchronize(compute_st_);
+            main_q_narcs = *h_main_q_narcs_;
+        }
+
+        FinalizeProcessNonemitting(); 
+    
+        cudaStreamSynchronize(compute_st_);
+        PreprocessInPlace(*h_main_q_end_);
+        cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
+        // Resetting the lookup table for the new frame
+        ResetStateBestCostLookupAndFinalizePreprocessInPlace(*h_main_q_end_);
+
+        // Saving initial queue to host
         int32 main_q_size = *h_main_q_end_;
         h_all_tokens_info_.CopyFromDevice(main_q_global_offset_, d_main_q_info_, main_q_size);
+        cudaEventRecord(can_write_to_main_q_, copy_st_);
     }
 
 
     void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
             int32 max_num_frames) {
-        nvtxRangePushA("AdvanceDecoding");
         KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                 "You must call InitDecoding() before AdvanceDecoding()");
         int32 num_frames_ready = decodable->NumFramesReady();
@@ -227,14 +311,14 @@ namespace kaldi {
             target_frames_decoded = std::min(target_frames_decoded,
                     num_frames_decoded_ + max_num_frames);
 
+        // Loglikelihoods from the acoustic model
+        ComputeLogLikelihoods(decodable);
+
         int32 prev_main_q_size = *h_main_q_end_;
+        nvtxRangePushA("Decoding");
         while (num_frames_decoded_ < target_frames_decoded) {
-            
             // Computing a new frame
-
-            // Loglikelihoods from the acoustic model
-            ComputeLogLikelihoods(decodable);
-
+        
             // ProcessEmitting 
             // 
             // Before executing ProcessEmitting, we have :
@@ -252,7 +336,31 @@ namespace kaldi {
             // We don't need can_write_to_main_q_
             // because we won't write to the main_q
             // The output tokens will go to aux_q
-            ProcessEmitting();
+
+            // ProcessEmitting generates tokens associated with the new frame i
+            // When we call ProcessEmitting, the main_q contains the tokens associated
+            // with the previous frame (i-1). Using d_main_q_state and the emitting arcs from the FST graph,
+            // we create a new tokens queue, which will be stored in the aux_q
+
+            cudaEventSynchronize(can_read_h_main_q_narcs_);
+            int32 main_q_n_e_arcs = *h_main_q_narcs_;
+
+            if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 1)
+                DebugAssertsNewFrame();
+
+            if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
+                DebugAssertsBeforeExpand(true);
+
+            ExpandArcs(true, main_q_n_e_arcs);
+
+            // Loglikelihoods from the acoustic model
+            // We are done using loglikelihoods for current frame
+            // Launching kernel for next frame now if there is one
+            
+            nvtxRangePop();
+            if ((num_frames_decoded_+1) < target_frames_decoded) 
+                ComputeLogLikelihoods(decodable);
+            nvtxRangePushA("Decoding");
 
             // After ProcessEmitting we won't need the token
             // associated with the previous frame anymore
@@ -272,19 +380,85 @@ namespace kaldi {
             //
             // The operation is :
             //
+            // PreprocessAndContract:
             // read input tokens from aux_q 
             //     ---contract (prune)--->
             // write non-pruned input tokens to main_q (append at the end of the queue)
+            //
+            // ExpandArc:
             // read input tokens from main_q 
             //     ---FST--->
             // create new tokens in the aux_q
             //
             // We then iterate those operations until no new tokens are created 
+            //
 
             // We will write to main_q. We need it to be ready
-            cudaEventSynchronize(can_write_to_main_q_);
-            ProcessNonemitting(); 
+            // for next kernels on compute_st_ 
+            cudaStreamWaitEvent(compute_st_, can_write_to_main_q_, 0);
+
+            // Using that value as estimate for how many threads to launch
+            int main_q_size_narcs_estimate = main_q_n_e_arcs;
+
+            bool finalize_nonemitting_was_executed = false;
+            PreprocessAndContract(main_q_size_narcs_estimate);
+            bool first_attempt = true;
+            while(!finalize_nonemitting_was_executed) {
+                // We push to the pipeline a fixed number of NonEmitting iterations
+                // If that's not enough, we'll detect it and push some more
+                int32 to_launch = first_attempt 
+                                  ? KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_FIRST
+                                  : KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_RELAUNCH;
+
+                for(int32 i=0; i<to_launch; ++i) {
+                    if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
+                        DebugAssertsBeforeExpand(false);
+
+                    ExpandArcs(false, main_q_size_narcs_estimate);
+                    PreprocessAndContract(main_q_size_narcs_estimate);
+                }
+
+                cudaEventRecord(before_finalize_nonemitting_kernel_, compute_st_);
+                // Try to compute the final iterations of NonEmitting
+                // if too many arcs still need to be processed,
+                // this kernel stops and we'll run more "heavy load" iterations
+                FinalizeProcessNonemitting(); 
+               
+                cudaEventSynchronize(before_finalize_nonemitting_kernel_);
+
+                // If the number of arcs was above that value, 
+                // the finalize nonemitting kernel killed itself 
+                // and we must relaunch heavy load kernels (ExpandArcs)
+                int main_q_narcs = *h_main_q_narcs_;
+                finalize_nonemitting_was_executed = (main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS);
+                first_attempt = false;
+            }
+
+            // The final h_main_q_end_ for this frame is written in finalize nonemitting
+            cudaEventRecord(can_read_final_h_main_q_end_, compute_st_);
+
+
+            // Before FinalizeProcessNonEmitting most of the main_q has been built
+            // We use value of main_q_end before this kernel as an estimate,
+            // Note : This is not an upper bound, FinalizeProcessNonEmitting can generates
+            // more than KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS tokens
+            int main_q_size_estimate = *h_main_q_end_before_finalize_nonemitting_kernel_
+                                        + KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS;
             
+            // PreprocessInPlace for next ProcessEmitting
+            // We do it here (and not at the beginning of the loop) for two reasons :
+            // - We can pipeline it in the CUDA queue
+            // - The lookup table is back to its original state (full of +INF) at 
+            //   the end of each frame. We can possibly share it between decoders
+            //   (not implemented yet)
+            PreprocessInPlace(main_q_size_estimate);
+            cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
+
+            // Resetting the lookup table for the next frame + FinalizePreprocessInPlace
+            ResetStateBestCostLookupAndFinalizePreprocessInPlace(main_q_size_estimate);
+ 
+            // We need the exact value of h_main_q_end_ for the copy to host
+            cudaEventSynchronize(can_read_final_h_main_q_end_);
             prev_main_q_size = *h_main_q_end_;
             
             // We are done with the current frame
@@ -294,9 +468,11 @@ namespace kaldi {
             h_all_tokens_info_.CopyFromDevice(main_q_global_offset_, d_main_q_info_, prev_main_q_size);
             cudaEventRecord(can_write_to_main_q_, copy_st_);
             
+            CheckOverflow();
+            KALDI_DECODER_CUDA_CHECK_ERROR();
             num_frames_decoded_++; 
         }   
-
+    
         nvtxRangePop();
     }
 
@@ -307,193 +483,22 @@ namespace kaldi {
         decodable->ComputeLogLikelihoods(d_loglikelihoods_,frame,fst_.max_ilabel_+1, compute_st_);
     }
 
-    void CudaDecoder::PrintOverflowWarning() {
-        KALDI_WARN << "Preventing overflow of the frame tokens. Pursuing "
-            << "execution but the quality of the output may be decreased. "
-            << "To prevent this from happening, please increase the parameter --max-tokens-per-frame"
-            << " and/or decrease --beam";
+    void CudaDecoder::CheckOverflow() {
+            int32 q_overflow = *h_q_overflow_;
+            if(q_overflow) {
+                // An overflow was prevented in a kernel
+                // The algorithm can still go on but quality of the result can be reduced
+                // (less tokens were generated)
+                KALDI_WARN << "Preventing overflow of the frame tokens. Pursuing "
+                    << "execution but the quality of the output may be decreased. "
+                    << "To prevent this from happening, please increase the parameter --max-tokens-per-frame"
+                    << " and/or decrease --beam";
+
+                *h_q_overflow_ = 0;
+            }
+
     }
 
-
-    //
-    // ProcessToken does the heavy work of ProcessEmitting and ProcessNonemitting
-    // The only differences between emitting and non emitting case are the CSR offsets
-    // and the boolean params.is_emitting
-    //
-    // It first calls the appropriate Preprocess kernel
-    // and then ExpandArc to traverse the arcs
-    //
-    bool CudaDecoder::ProcessToken(bool is_emitting) {
-        // Traversing either emitting or nonemitting arcs of the FST
-        unsigned int *d_arc_offsets = is_emitting ? fst_.d_e_offsets_ : fst_.d_ne_offsets_;
-
-        PreprocessParams preprocess_params;
-        preprocess_params.d_aux_q_state = d_aux_q_state_; 
-        preprocess_params.d_aux_q_cost = d_aux_q_cost_;
-        preprocess_params.d_aux_q_info = d_aux_q_info_; 
-        preprocess_params.d_aux_q_end = d_aux_q_end_;
-        preprocess_params.h_aux_q_end = h_aux_q_end_;
-        preprocess_params.d_main_q_state = d_main_q_state_; 
-        preprocess_params.d_main_q_cost = d_main_q_cost_;
-        preprocess_params.d_main_q_info = d_main_q_info_; 
-        preprocess_params.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2_; 
-        preprocess_params.d_main_q_narcs = d_main_q_narcs_;
-        preprocess_params.d_main_q_end = d_main_q_end_;
-        preprocess_params.h_main_q_end = h_main_q_end_;
-        preprocess_params.d_main_q_local_offset = d_main_q_local_offset_;
-        preprocess_params.h_main_q_local_offset = h_main_q_local_offset_;
-        preprocess_params.h_main_q_narcs = h_main_q_narcs_;
-        preprocess_params.q_capacity = max_tokens_per_frame_;
-        preprocess_params.h_q_overflow = h_q_overflow_;
-        preprocess_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
-        preprocess_params.d_arc_offsets = d_arc_offsets;
-        preprocess_params.d_main_q_arc_offsets = d_main_q_arc_offsets_;
-        preprocess_params.d_state_best_cost = d_state_best_cost_; 
-        preprocess_params.d_cutoff = d_cutoff_; 
-        preprocess_params.d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_; 
-        preprocess_params.d_n_CTA_done = d_n_CTA_done_;
-
-        if(is_emitting) {
-            // If we are emitting, all tokens from previous frame are already
-            // in the main_q. They were put there by PreprocessAndContracts,
-            // in the ProcessNonEmittings from previous frames 
-            // Those tokens already have children (through the ProcessNonemittings)
-            // we cannot prune them - it would break the prev_token indexes
-            // We do the PreprocessInPlace, we read from main_q and do not modify it
-            // 
-            PreprocessInPlace(preprocess_params);
-            // Preprocess sets h_main_q_narcs (pinned memory) at the end of its executing
-            cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
-
-            // Resetting the lookup table for the new frame
-            ResetStateBestCostLookupAndFinalizePreprocessInPlace();
-
-            if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 1)
-                DebugAssertsNewFrame();
-
-        } else {
-            PreprocessAndContract(preprocess_params);
-            
-            // Preprocess sets h_main_q_narcs (pinned memory) at the end of its executing
-            cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
-
-            // No need to call FinalizePreprocessInPlace - the prefix sum is done in one pass in PreprocessAndContract
-        }
-
-
-        // We need h_main_q_narcs to be ready
-        cudaEventSynchronize(can_read_h_main_q_narcs_);
-        KALDI_DECODER_CUDA_CHECK_ERROR();
-
-        if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
-            DebugAssertsBeforeExpand(is_emitting);
-
-        int32 main_q_narcs = *h_main_q_narcs_;
-        int32 q_overflow = *h_q_overflow_;
-
-        if(q_overflow) {
-            // An overflow was prevented in the contract and preprocess kernel
-            // The algorithm can still go on but quality of the result can be reduced
-            // (less tokens were generated)
-
-            PrintOverflowWarning();
-
-            *h_q_overflow_ = 0;
-        }
-
-        ExpandArcParams expand_params;
-        expand_params.d_main_q_state = d_main_q_state_;
-        expand_params.d_main_q_cost = d_main_q_cost_;
-        expand_params.d_main_q_info= d_main_q_info_;
-        expand_params.d_main_q_local_offset = d_main_q_local_offset_;
-        expand_params.h_main_q_local_offset = h_main_q_local_offset_;
-        expand_params.main_q_global_offset = main_q_global_offset_;
-        expand_params.d_main_q_end = d_main_q_end_;
-        expand_params.d_main_q_narcs = d_main_q_narcs_;
-        expand_params.h_main_q_end = h_main_q_end_;
-        expand_params.h_main_q_narcs = h_main_q_narcs_;
-        expand_params.d_aux_q_state = d_aux_q_state_; 
-        expand_params.d_aux_q_cost = d_aux_q_cost_; 
-        expand_params.d_aux_q_info = d_aux_q_info_;
-        expand_params.d_aux_q_end = d_aux_q_end_;
-        expand_params.h_aux_q_end = h_aux_q_end_;
-        expand_params.q_capacity = max_tokens_per_frame_;
-        expand_params.h_q_overflow = h_q_overflow_;
-        expand_params.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
-        expand_params.d_q_arc_offsets = d_main_q_arc_offsets_;
-        expand_params.arc_ilabels = fst_.d_arc_ilabels_;
-        expand_params.is_emitting = is_emitting;
-        expand_params.arc_weights = fst_.d_arc_weights_; 
-        expand_params.arc_nextstates = fst_.d_arc_nextstates_; 
-        expand_params.d_cutoff = d_cutoff_;
-        expand_params.beam = beam_;
-        expand_params.d_loglikelihoods = d_loglikelihoods_;
-        expand_params.d_state_best_cost = d_state_best_cost_;
-        expand_params.d_n_CTA_done = d_n_CTA_done_;
-    
-
-        // If we are non emitting and have a small number of arcs to process,
-        // we use FinalizeProcessNonemitting
-        // it is a persistent kernel which will iterate on Preprocess/ExpandArc
-        // internally, using in-block syncs
-        // it avoids calling too many kernels during the multiple iterations of NonEmitting
-        // In any cases, we need to call FinalizeProcessNonemitting to finalize ProcessNonemitting
-        // it takes care of finalizing our work for the frame (moving offsets, etc.)
-        bool done = false;
-        if(!is_emitting 
-                && main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) { 
-            FinalizeProcessNonemitting(d_arc_offsets, expand_params); 
-
-            KALDI_DECODER_CUDA_CHECK_ERROR();
-
-            // Persistent kernel finishes the job
-            done = true;
-        }
-        else {
-            ExpandArcs(expand_params, main_q_narcs);
-        }
-
-        cudaStreamSynchronize(compute_st_); 
-        KALDI_DECODER_CUDA_CHECK_ERROR();
-
-        q_overflow = *h_q_overflow_;
-
-        if(q_overflow) {
-            // An overflow was prevented in the contract and preprocess kernel
-            // The algorithm can still go on but quality of the result can be reduced
-            // (less tokens were generated)
-
-            PrintOverflowWarning();
-
-            *h_q_overflow_ = 0;
-        }
- 
-        return done;
-    }
-
-
-    void CudaDecoder::ProcessEmitting() {
-        nvtxRangePushA("ProcessEmitting");
-
-        // true => use emitting arcs
-        ProcessToken(true); 
-
-        KALDI_DECODER_CUDA_CHECK_ERROR();
-        nvtxRangePop();
-    }
-
-    void CudaDecoder::ProcessNonemitting() {
-        nvtxRangePushA("ProcessNonemitting");
-
-        // While not done, call it
-        // If remaining n_arcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS, 
-        // ProcessToken will call a persistent kernel
-        // false => use non emitting arcs
-        while(!ProcessToken(false));
-
-        KALDI_DECODER_CUDA_CHECK_ERROR();
-        nvtxRangePop();
-    }
 
     // GetBestCost
     // CPU-only code
