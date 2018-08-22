@@ -20,7 +20,7 @@
 #include <cub/cub.cuh>
 #include "decoder/cuda-decoder.h"
 
-#define DIV_ROUND_UP(a,b) ((a+b-1)/b)
+#define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 namespace kaldi {
 
@@ -28,6 +28,8 @@ typedef CudaDecoder::StateId StateId;
 typedef CudaDecoder::TokenAndArcCount TokenAndArcCount;
 typedef CudaDecoder::TokenAndArcCountUnion TokenAndArcCountUnion;
 typedef CudaDecoder::CostType CostType;
+typedef CudaDecoder::MinCostAndBeamIntegers MinCostAndBeamIntegers;
+typedef CudaDecoder::MinCostAndBeam MinCostAndBeam;
 typedef CudaDecoder::IntegerCostType IntegerCostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
 typedef CudaDecoder::ExpandArcParams ExpandArcParams; 
@@ -67,16 +69,21 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     // Also resets the cutoff to +inf
 
     // Used before first frame
-    __global__ void _init_state_best_cost_lookup_kernel(int32 size, IntegerCostType *state_best_cost, IntegerCostType *d_cutoff) {
+    __global__ void _init_state_best_cost_lookup_kernel(int32 state_best_cost_size,
+                                                        CostType default_beam,
+                                                        CostType infinite_cost,
+                                                        IntegerCostType *state_best_cost, 
+                                                        MinCostAndBeamIntegers *d_global_min_cost_and_beam) {
         // One thread resets the cutoff
-        if(threadIdx.x == 0 && blockIdx.x == 0) 
-            *d_cutoff = floatToOrderedInt(FLT_MAX);
-
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+            d_global_min_cost_and_beam->min_cost = floatToOrderedInt(infinite_cost);
+            d_global_min_cost_and_beam->beam = floatToOrderedInt(default_beam);
+        }
         // Reset lookup table
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
-                idx < size;
+                idx < state_best_cost_size;
                 idx += blockDim.x*gridDim.x) {
-            state_best_cost[idx]  = floatToOrderedInt(FLT_MAX);
+            state_best_cost[idx]  = floatToOrderedInt(infinite_cost);
         }
     }
 
@@ -86,9 +93,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
-        grid.x = DIV_ROUND_UP(nstates, block.x);
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(nstates, block.x);
 
-        _init_state_best_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, d_state_best_cost_, d_cutoff_);
+        _init_state_best_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, 
+                                                                          default_beam_, 
+                                                                          infinite_cost_,
+                                                                          d_state_best_cost_,
+                                                                          d_global_min_cost_and_beam_);
     }
 
         
@@ -125,12 +136,17 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     __global__ void _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place(const StateId *d_main_q_state_, 
                                                     const int32 *d_main_q_end_, 
                                                     const int32 *d_local_sums_prefix_sum,  
+                                                    int32 default_beam,
+                                                    CostType infinite_cost,
+                                                    MinCostAndBeamIntegers *d_global_min_cost_and_beam,
                                                     IntegerCostType *d_state_best_cost, 
-                                                    IntegerCostType *d_cutoff,
                                                     int32 *d_main_q_degrees_prefix_sum) {
-        if(blockIdx.x == 0 && threadIdx.x == 0)
-            *d_cutoff = floatToOrderedInt(FLT_MAX); // we also reset the cutoff
-
+        // One thread resets the cutoff
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+            d_global_min_cost_and_beam->min_cost = floatToOrderedInt(infinite_cost); 
+            // Resetting the beam back to default between frames
+            d_global_min_cost_and_beam->beam = floatToOrderedInt(default_beam); 
+        }
         int32 main_q_end = *d_main_q_end_; 
 
         for(int32 main_q_idx = blockIdx.x*blockDim.x + threadIdx.x;
@@ -145,7 +161,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
             int32 local_sum_offset = d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
 
-            d_state_best_cost[state]  = floatToOrderedInt(FLT_MAX);
+            d_state_best_cost[state]  = floatToOrderedInt(infinite_cost);
             d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
         }
     }
@@ -155,13 +171,15 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         dim3 grid,block;
         block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
-        grid.x = DIV_ROUND_UP(main_q_size_estimate, block.x);
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size_estimate, block.x);
 
         _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place<<<grid,block,0,compute_st_>>>(d_main_q_state_, 
                                                                       d_main_q_end_,
                                                                       d_main_q_degrees_block_sums_prefix_sum_,   
+                                                                      default_beam_,
+                                                                      infinite_cost_,
+                                                                      d_global_min_cost_and_beam_,
                                                                       d_state_best_cost_, 
-                                                                      d_cutoff_,
                                                                       d_main_q_degrees_prefix_sum_);
     }
 
@@ -249,8 +267,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             return;
 
         // Final cutoff from last ExpandArc execution
-        const BaseFloat cutoff = orderedIntToFloat(*params.d_cutoff);
-
+        MinCostAndBeamIntegers global_min_cost_and_beam = *params.d_global_min_cost_and_beam;
+        const CostType cutoff = orderedIntToFloat(global_min_cost_and_beam.min_cost)
+                               + orderedIntToFloat(global_min_cost_and_beam.beam);
 
         // The condition of the for loop is the same for all threads in the CUDA block
         // we want to keep all threads alive at the same time for now
@@ -274,7 +293,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                 // Best cost for that token_state
                 // We know we have a token associated with token_state in the queue with the cost state_best_cost
-                BaseFloat state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
+                CostType state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
 
                 // Cutoff may have decreased since the creation of the token
                 if(token_cost < cutoff) {
@@ -295,7 +314,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 // we need to reset the lookup table now
 
                 if (state_best_cost >= cutoff)
-                    params.d_state_best_cost[token_state] = floatToOrderedInt(FLT_MAX);
+                    params.d_state_best_cost[token_state] = floatToOrderedInt(params.infinite_cost);
 
             }
 
@@ -407,7 +426,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // Declaring the CTA as done
             int32 old = atomicAdd(params.d_n_CTA_done, 1);
             // Taking into account the CTAs that have early exited at the begining of this kernel
-            int32 total_active_CTAs = min(DIV_ROUND_UP(aux_q_end, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX), gridDim.x);
+            int32 total_active_CTAs = min(KALDI_CUDA_DECODER_DIV_ROUND_UP(aux_q_end, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX), gridDim.x);
             // If we're the last CTA to exit, detect it
             bool is_last_CTA = (old == (total_active_CTAs -1));
 
@@ -446,7 +465,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         KALDI_ASSERT(aux_q_size_estimate > 0);
 
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-        grid.x = DIV_ROUND_UP(aux_q_size_estimate, block.x);
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(aux_q_size_estimate, block.x);
 
         // PreprocessAndContract is called when non emitting
         // using non emitting offsets
@@ -496,8 +515,13 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         const int32 main_q_end = *params.d_main_q_end;
         const int32 main_q_size = main_q_end - 0; // main_q_offset == 0 in that kernel
 
-        // Final cutoff from the expand kernel
-        const BaseFloat cutoff = orderedIntToFloat(*params.d_cutoff);
+        // Final cutoff from last ExpandArc execution
+        // The cutoff can have decreased since moving tokens to the main_q
+        // min_cost cannot be lower than before (we only did non-emitting phases since then)
+        // but the adaptive beam may have lowered the beam
+        MinCostAndBeamIntegers global_min_cost_and_beam = *params.d_global_min_cost_and_beam;
+        const CostType cutoff = orderedIntToFloat(global_min_cost_and_beam.min_cost)
+                               + orderedIntToFloat(global_min_cost_and_beam.beam);
 
         // The condition of the for loop is the same for all threads in the CUDA block
         // we want to keep all threads alive at the same time for now
@@ -514,14 +538,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             if(main_q_idx < main_q_end) {
                 StateId token_state = params.d_main_q_state[main_q_idx]; 
-                BaseFloat token_cost = params.d_main_q_cost[main_q_idx];
+                CostType token_cost = params.d_main_q_cost[main_q_idx];
 
                 // the cutoff may have decreased since the creation of that token
                 if(token_cost < cutoff) {
 
                     // Best cost for that token_state
                     // We know we have a token associated with token_state in the queue with the cost state_best_cost
-                    BaseFloat state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]); 
+                    CostType state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]); 
                     
                     // We can have duplicates, ie token associated with the same states
                     // If this token is not the best candidate, get rid of it
@@ -617,7 +641,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // gridDim.x < number_of_local_sums
             //
 
-            int32 number_of_local_sums = DIV_ROUND_UP(main_q_size, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX);
+            int32 number_of_local_sums = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX);
 
             // We may iterate the following for loop multiple times
             // on iteration > 0, we will have to consider the offset from previous iterations
@@ -676,7 +700,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
 
         KALDI_ASSERT(main_q_size_estimate > 0);
-        grid.x = DIV_ROUND_UP(main_q_size_estimate, block.x);
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size_estimate, block.x);
 
         // PreprocessInPlace is called when emitting
         // using emitting arc offsets
@@ -717,25 +741,17 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     };
 
     //
-    // GetCutoffCandidate is used by ExpandArc and FinalizeProcessNonemitting
-    // It computes a candidate for a new cutoff. It will not necessarily be the new cutoff,
-    // we'll apply an atomicMin(d_cutoff, cutoff_candidate)
+    // GetAdaptiveBeam is used by ExpandArc and FinalizeProcessNonemitting
     //
-    // The cutoff represents the upper limit of acceptable token cost 
-    // with min_cost = minimum token.cost for all token of the current frame,
-    // we will not consider token with cost > (min_cost + beam), beam being a parameter
-    //
-    // However, given the fact that the output token queue (aux_q) is too small to store 
+    // Given the fact that the token queues are too small to store 
     // all possible tokens in the worst case scenario (where we could generate "nstates" tokens),
-    // we need to tighten the beam if we notice that we are at risk of overflowing the aux_q
+    // we need to tighten the beam if we notice that we are at risk of overflowing either the aux_q
+    // or the main_q
     //
 
-    __device__ __inline__ CostType GetCutoffCandidate(const CostType current_cutoff,
-            const CostType min_cost_in_block,
-            const CostType default_beam,
+    __device__ __forceinline__ CostType GetAdaptiveBeam(const CostType default_beam,
             const int32 q_size,
             const int32 q_capacity) {
-
 
         // Doing something simple for now
         // We have to keep beam large enough,
@@ -748,7 +764,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         if(q_size >= q_capacity/2) 
             beam /= 2;
 
-        return fmin(current_cutoff, min_cost_in_block + beam);
+        return beam;
     }
 
     __device__ __forceinline__ int32 binsearch_maxle(const int32 *vec, const int32 val, int32 low, int32 high) {
@@ -821,7 +837,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // Cutoff, stored in shared for caching purposes
         // maybe we could rely on cache ?
         //
-        __shared__ CostType sh_cached_cutoff;
+        __shared__ MinCostAndBeam sh_global_min_cost_and_beam;
 
         const int32 first_main_q_arc_index_block_offset = blockDim.x*blockIdx.x;
         const int32 total_narcs = *params.d_main_q_narcs;
@@ -836,7 +852,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
         
         if(threadIdx.x == 0) {
-            sh_cached_cutoff = orderedIntToFloat(*params.d_cutoff);
+            MinCostAndBeamIntegers global_min_cost_and_beam_integers = *params.d_global_min_cost_and_beam;
+            sh_global_min_cost_and_beam.min_cost = orderedIntToFloat(global_min_cost_and_beam_integers.min_cost);
+            sh_global_min_cost_and_beam.beam = orderedIntToFloat(global_min_cost_and_beam_integers.beam);
         }
 
         __syncthreads();
@@ -865,7 +883,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             //
 
             int32 main_q_arc_index = main_q_arc_index_block_offset + threadIdx.x;
-
+        
             // We'll need those variables later in the kernel
             // we declare them outside of the "valid_input" scope
             // to be able to access them later
@@ -873,7 +891,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             int32 main_q_idx;
             int32 arc_idx;
             StateId arc_next_state;
-            BaseFloat total_cost = FLT_MAX;
+            CostType total_cost = FLT_MAX;
 
             if(main_q_arc_index < total_narcs) {
 
@@ -950,16 +968,23 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 CostType prev_token_cost  = params.d_main_q_cost[main_q_idx];
 
                 total_cost = prev_token_cost + arc_fixed_cost + acoustic_cost;
+ 
+                // If we're emitting, reload the min_cost, it may have decreased
+                CostType min_cost =  params.is_emitting 
+                                     ? orderedIntToFloat(params.d_global_min_cost_and_beam->min_cost)
+                                     : sh_global_min_cost_and_beam.min_cost;
 
                 // If the total_cost is too large compared to our cutoff (beam search)
                 // then let's drop it
-                if(total_cost >= sh_cached_cutoff)
+                const CostType cutoff = min_cost + sh_global_min_cost_and_beam.beam;
+
+                if(total_cost >= cutoff)
                     total_cost = FLT_MAX;
                 else {
                     // We need to check if we already have a token going to that next_state,
                     // and if that token has a lower cost that we have
                     // params.d_state_best_cost[state] contains the best cost for that state in the current frame
-                    BaseFloat next_state_best_cost = orderedIntToFloat(params.d_state_best_cost[arc_next_state]);
+                    CostType next_state_best_cost = orderedIntToFloat(params.d_state_best_cost[arc_next_state]);
 
                     // If that token is the best for that state, drop it
                     if(total_cost >= next_state_best_cost)
@@ -987,6 +1012,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             int32 has_successor = (total_cost < FLT_MAX) ? 1 : 0; 
 
+            // Updating the best_state_cost lookup table with our new best cost
+            if(has_successor)
+                atomicMin(&params.d_state_best_cost[arc_next_state],
+                            floatToOrderedInt(total_cost));
+
             CostTypeAndInt cost_and_index;
             cost_and_index.cost = total_cost; 
             cost_and_index.i = has_successor;
@@ -995,16 +1025,37 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             BlockScan(sh_temp_storage_scan).InclusiveScan(cost_and_index, cost_and_index, MinCostPlusInt());
 
             if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX - 1)) {
+                // We can find a lower global_min_cost only in the emitting stage
+                if(params.is_emitting) {
+                    CostType current_global_min_cost = sh_global_min_cost_and_beam.min_cost;
+                    // if we found a lower min_cost, update the global value
+                    if(cost_and_index.cost < current_global_min_cost) {
+                        current_global_min_cost = cost_and_index.cost;
+                        atomicMin(&params.d_global_min_cost_and_beam->min_cost, floatToOrderedInt(current_global_min_cost));
+                    }
+
+                    // Reload latest global min cost
+                    CostType latest_global_min_cost = orderedIntToFloat(params.d_global_min_cost_and_beam->min_cost);
+                    current_global_min_cost = min(current_global_min_cost, latest_global_min_cost);
+                    // Updating shared memory
+                    sh_global_min_cost_and_beam.min_cost = current_global_min_cost;
+                }
+
                 // This is the last thread. The last value of the inclusive scan is the total
                 int32 total_successors_in_block = cost_and_index.i;
                 
                 // Requesting a spot of size total_successors_in_block in the aux_q
-                sh_aux_q_index_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
+                int aux_q_index_block_offset = atomicAdd(params.d_aux_q_end, total_successors_in_block);
+
+
+                // All threads will need this value
+                // Saving in shared memory
+                sh_aux_q_index_block_offset = aux_q_index_block_offset;
 
                 //
                 // Here we detect an overflow of the aux_q
                 // we detect it before actually using the aux_q
-                // We try to prevent an overflow from happening using an adaptive beam (cf GetCutoffCandidate)
+                // We try to prevent an overflow from happening using an adaptive beam (cf GetAdaptiveBeam)
                 //
                 if((sh_aux_q_index_block_offset + total_successors_in_block) >= params.q_capacity) {
                     // sh_aux_q_index_block_offset is in shared memory
@@ -1022,27 +1073,24 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
                     // Setting the flag for the host. It will be used to print a warning to stderr
                     *params.h_q_overflow = 1; 
+
+                    // We do not jump to finalize_kernel now, because only threadIdx.x == 0 
+                    // is executing this if !
+                    // We wait until the end of the divergent branch
                 } else {
+                    // If we are not overflowing the queue, let's check if we need to 
+                    // tighten the beam. If the occupancy of the aux_q gets too high,
+                    // the adaptive beam will reduce the beam
+                    
+                    CostType new_beam = GetAdaptiveBeam(params.default_beam, 
+                                                        aux_q_index_block_offset,
+                                                        params.q_capacity);
 
-                    /*
+                    if(new_beam < sh_global_min_cost_and_beam.beam) {
+                        atomicMin(&params.d_global_min_cost_and_beam->beam, floatToOrderedInt(new_beam));
+                        sh_global_min_cost_and_beam.beam = new_beam;
+                    }
 
-                       GetCutoffCandidate takes into account the current value of 
-                       d_aux_q_end and compares it with its maximum capacity.
-                       If necessary it progressively cuts down the beam 
-                       (reducing the cutoff) to only keep the best candidates
-                       and avoiding an overflow
-
-                     */
-
-                    CostType cutoff_candidate = GetCutoffCandidate(sh_cached_cutoff,
-                            cost_and_index.cost,
-                            params.beam,
-                            sh_aux_q_index_block_offset + total_successors_in_block,
-                            params.q_capacity);
-
-                    sh_cached_cutoff = (cutoff_candidate < sh_cached_cutoff) 
-                        ? fmin(orderedIntToFloat(atomicMin(params.d_cutoff, floatToOrderedInt(cutoff_candidate))), cutoff_candidate)
-                        : fmin(orderedIntToFloat(*params.d_cutoff), sh_cached_cutoff);
                 }
             }
 
@@ -1055,6 +1103,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // The only case where we can have that condition met,
             // if we detected an overflow if the previous lines
             // we need to finalize our work and quit 
+            // Now all threads are executing this code. We can jump
+            // to finalize_kernel
             if(sh_aux_q_index_block_offset == params.q_capacity) 
                 goto finalize_kernel; // keeping things clean before aborting
 
@@ -1062,7 +1112,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // If we're executing the following lines it means everything
             // is valid and we are not overflowing the aux_q
             //
-
             cost_and_index.i -= has_successor; // we want the exclusive sum now
 
             int32 aux_q_block_index = cost_and_index.i;
@@ -1074,29 +1123,22 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 params.d_aux_q_cost[aux_q_index] = total_cost;
                 params.d_aux_q_state[aux_q_index] = arc_next_state;
                 
-                // Updating the best_state_cost lookup table with our new best cost
-                atomicMin(&params.d_state_best_cost[arc_next_state],
-                        floatToOrderedInt(total_cost)
-                        );
-
-                // We've updated the sh_cached_cutoff since created the new token
+                // We've updated the cutoff since created the new token
                 // there's a chance that we no longer need to use that token
                 // we've saved the cost and the state to be able to ignore it in the following prune operation
                 // but there's no need to write out the infos
 
-                if(total_cost < sh_cached_cutoff) { 
-                    InfoToken new_tok_info;
-                    // Index of the parent token
-                    // the parent is the token used as input 
-                    // that parent is at index main_q_idx in the GPU memory
-                    // However, the main_q is emptied before processing a new frame
-                    // we need to add the offset related to the previous frames index
-                    // we add params.main_q_global_offset
-                    new_tok_info.prev_token = params.main_q_global_offset + main_q_idx;
-                    new_tok_info.arc_idx = arc_idx;
+                InfoToken new_tok_info;
+                // Index of the parent token
+                // the parent is the token used as input 
+                // that parent is at index main_q_idx in the GPU memory
+                // However, the main_q is emptied before processing a new frame
+                // we need to add the offset related to the previous frames index
+                // we add params.main_q_global_offset
+                new_tok_info.prev_token = params.main_q_global_offset + main_q_idx;
+                new_tok_info.arc_idx = arc_idx;
 
-                    params.d_aux_q_info[aux_q_index] = new_tok_info;
-                }
+                params.d_aux_q_info[aux_q_index] = new_tok_info;
             }
         }
 
@@ -1110,7 +1152,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             int32 old = atomicAdd(params.d_n_CTA_done, 1);
 
             // Taking into account the CTAs that have early exited at the begining of this kernel
-            int32 total_active_CTAs = min(DIV_ROUND_UP(total_narcs, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX), gridDim.x);
+            int32 total_active_CTAs = min(KALDI_CUDA_DECODER_DIV_ROUND_UP(total_narcs, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX), gridDim.x);
 
             // If we're the last CTA to exit - detect it
             if(old == (total_active_CTAs -1)) {
@@ -1144,7 +1186,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         KALDI_ASSERT(main_q_narcs_estimate > 0);
 
         block.x = KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX;
-        grid.x = DIV_ROUND_UP(main_q_narcs_estimate, block.x);
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_narcs_estimate, block.x);
 
         // The two members of params we need to update
         expand_params_.main_q_global_offset = main_q_global_offset_;
@@ -1216,7 +1258,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // aux_q is empty when this kernel is called
             int32 aux_q_end = 0;
 
-            CostType cutoff = orderedIntToFloat(*params.d_cutoff);
+            MinCostAndBeamIntegers global_min_cost_and_beam = *params.d_global_min_cost_and_beam;
+            CostType global_min_cost = orderedIntToFloat(global_min_cost_and_beam.min_cost);
+            CostType beam = orderedIntToFloat(global_min_cost_and_beam.beam);
 
             while(total_narcs > 0) {
 
@@ -1229,7 +1273,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     int32 main_q_arc_index = main_q_arc_index_block_offset + threadIdx.x;
 
                     // For details on how this code works, please refer to ExpandArc's comments
-                    BaseFloat total_cost = FLT_MAX;
+                    CostType total_cost = FLT_MAX;
                     int32 arc_idx;
                     StateId arc_next_state;
                     int32 main_q_idx;
@@ -1246,19 +1290,18 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         arc_idx = arc_offset_start + (main_q_arc_index - state_first_arc_idx_in_main_q);
 
                         arc_next_state = params.arc_nextstates[arc_idx];
-                        BaseFloat arc_weight = params.arc_weights[arc_idx];
-                        BaseFloat next_state_cost = orderedIntToFloat(params.d_state_best_cost[arc_next_state]);
-                        BaseFloat old_tok_cost = params.d_main_q_cost[main_q_idx];
+                        CostType arc_weight = params.arc_weights[arc_idx];
+                        CostType next_state_cost = orderedIntToFloat(params.d_state_best_cost[arc_next_state]);
+                        CostType old_tok_cost = params.d_main_q_cost[main_q_idx];
 
                         total_cost = arc_weight + old_tok_cost;
 
+                        CostType cutoff = global_min_cost + beam;
                         if(total_cost >= cutoff || total_cost >= next_state_cost) {
                             total_cost = FLT_MAX;
                         } 
                     }
-            
-                    // TODO GetBeam
-
+                     
                     int32 has_successor = (total_cost < FLT_MAX) ? 1 : 0;
 
                     if(has_successor) {
@@ -1267,14 +1310,18 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     }
 
                     int32 local_aux_q_idx;
-                    int32 total_in_blk;
-                    BlockScanInt(sh_temp_storage_scan_int).ExclusiveSum(has_successor, local_aux_q_idx, total_in_blk);
+                    int32 total_ntokens_to_aux_q;
+                    BlockScanInt(sh_temp_storage_scan_int).ExclusiveSum(has_successor, 
+                                                                        local_aux_q_idx,
+                                                                        total_ntokens_to_aux_q);
 
-                    if((main_q_end + total_in_blk) >= params.q_capacity) {
+                    // Checking if we are not overflowing the aux_q
+                    if((aux_q_end + total_ntokens_to_aux_q) >= params.q_capacity) {
                         *params.h_q_overflow = 1;
                         
-                        goto finalize_kernel; // keeping things clean before aborting
+                        goto finalize_kernel;
                     }
+
 
                     if(has_successor) {
                         int32 aux_q_idx = aux_q_end + local_aux_q_idx;
@@ -1288,8 +1335,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         params.d_aux_q_info[aux_q_idx] = new_tok_info;
                    }
 
-                    aux_q_end += total_in_blk;
-                    
+                    aux_q_end += total_ntokens_to_aux_q;
+
+                    // Getting new beam using aux_q_end
+                    beam = GetAdaptiveBeam(params.default_beam, 
+                            aux_q_end,
+                            params.q_capacity);
+
+
                     // reusing sh_temp_storage_scan_int
                     __syncthreads();
                 }
@@ -1311,14 +1364,16 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                     int32 start = -1;
 
                     StateId token_state;
-                    BaseFloat token_cost;
+                    CostType token_cost;
 
                     if(aux_q_idx < aux_q_end) {
                         token_state = params.d_aux_q_state[aux_q_idx];
                         token_cost = params.d_aux_q_cost[aux_q_idx];
 
+                        // beam may have changed since generation
+                        CostType cutoff = global_min_cost + beam;
                         if(token_cost < cutoff) {
-                            BaseFloat best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
+                            CostType best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
 
                             if(token_cost == best_cost) {
                                 start = d_arc_offsets[token_state];
@@ -1344,6 +1399,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                             TokenAndArcCountSum(),
                             scan_aggregate);
 
+                    // Checking if we are not overflowing the main_q
+                    int32 total_ntokens_to_main_q = scan_aggregate.ntokens;
+                    if((main_q_end + total_ntokens_to_main_q) >= params.q_capacity) {
+                        *params.h_q_overflow = 1;
+
+                        goto finalize_kernel;
+                    }
+                    
                     int32 degree_this_iteration_prefix_sum = token_and_arc_count.narcs;
                     int32 degree_sum_for_this_iteration = scan_aggregate.narcs;
 
@@ -1363,7 +1426,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                         params.d_main_q_info[main_q_idx] = info_token;
                     }
                     
-                    int32 total_ntokens_to_main_q = scan_aggregate.ntokens;
                     main_q_end += total_ntokens_to_main_q; 
 
                     __syncthreads(); // reusing sh_temp_storage_scan
