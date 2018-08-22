@@ -296,7 +296,6 @@ namespace kaldi {
 
     void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
             int32 max_num_frames) {
-        nvtxRangePushA("AdvanceDecoding");
         KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                 "You must call InitDecoding() before AdvanceDecoding()");
         int32 num_frames_ready = decodable->NumFramesReady();
@@ -316,6 +315,7 @@ namespace kaldi {
         ComputeLogLikelihoods(decodable);
 
         int32 prev_main_q_size = *h_main_q_end_;
+        nvtxRangePushA("Decoding");
         while (num_frames_decoded_ < target_frames_decoded) {
             // Computing a new frame
         
@@ -356,8 +356,11 @@ namespace kaldi {
             // Loglikelihoods from the acoustic model
             // We are done using loglikelihoods for current frame
             // Launching kernel for next frame now if there is one
+            
+            nvtxRangePop();
             if ((num_frames_decoded_+1) < target_frames_decoded) 
                 ComputeLogLikelihoods(decodable);
+            nvtxRangePushA("Decoding");
 
             // After ProcessEmitting we won't need the token
             // associated with the previous frame anymore
