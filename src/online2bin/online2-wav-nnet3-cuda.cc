@@ -31,8 +31,12 @@
 #include <nvToolsExt.h>
 #include <cuda_profiler_api.h>
 #include <cuda.h>
-#include <omp.h>
-namespace kaldi {
+#include <atomic>
+#include <thread>
+#include <chrono>
+
+#define MAX_DEVS 16
+using namespace kaldi;
 
 void GetDiagnosticsAndPrintOutput(const std::string &utt,
                                   const fst::SymbolTable *word_syms,
@@ -75,6 +79,247 @@ void GetDiagnosticsAndPrintOutput(const std::string &utt,
   }
 }
 
+
+struct DecodeParams {
+  bool replicate;
+  int num_threads;
+  BaseFloat chunk_length_secs;
+  bool online;
+  bool write_lattice;
+  
+  CudaFst  *cuda_fst;
+
+  OnlineNnet2FeaturePipelineConfig  feature_opts;
+  nnet3::NnetSimpleLoopedComputationOptions decodable_opts;
+  CudaDecoderConfig decoder_opts;
+  CompactLatticeWriter *clat_writer;
+  
+  std::string nnet3_rxfilename;
+  std::string wav_rspecifier;
+  std::string word_syms_rxfilename;
+  std::string spk2utt_rspecifier;
+
+  std::atomic<int> utt_idx;
+  std::mutex lock;
+  std::vector<double> total_time;
+  std::vector<double> total_audio;
+};
+
+void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
+  
+   nvtxRangePushA("Thread Timer");  
+   auto start = std::chrono::high_resolution_clock::now();
+  // feature_opts includes configuration for the iVector adaptation,
+  // as well as the basic features.
+  KALDI_LOG << "Thread " << th_idx << " of " << params.num_threads << " on device " << gpu_idx << std::endl;
+  CuDevice::Instantiate().SelectGpuId(gpu_idx);
+  CuDevice::Instantiate().AllowMultithreading();
+  OnlineNnet2FeaturePipelineInfo feature_info(params.feature_opts);
+
+  if (!params.online) {
+    feature_info.ivector_extractor_info.use_most_recent_ivector = true;
+    feature_info.ivector_extractor_info.greedy_ivector_extractor = true;
+  }
+
+  TransitionModel trans_model;
+  nnet3::AmNnetSimple am_nnet;
+  {
+    bool binary;
+    Input ki(params.nnet3_rxfilename, &binary);
+    trans_model.Read(ki.Stream(), binary);
+    am_nnet.Read(ki.Stream(), binary);
+    SetBatchnormTestMode(true, &(am_nnet.GetNnet()));
+    SetDropoutTestMode(true, &(am_nnet.GetNnet()));
+    nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet.GetNnet()));
+  }
+
+  // this object contains precomputed stuff that is used by all decodable
+  // objects.  It takes a pointer to am_nnet because if it has iVectors it has
+  // to modify the nnet to accept iVectors at intervals.
+  nnet3::DecodableNnetSimpleLoopedInfo decodable_info(params.decodable_opts,
+      &am_nnet);
+
+
+  //every thread needs its own decoder state.  Declare that here.
+  CudaDecoder cuda_decoder(params.cuda_fst[gpu_idx],params.decoder_opts);
+
+  fst::SymbolTable *word_syms = NULL;
+  if (params.word_syms_rxfilename != "")
+    if (!(word_syms = fst::SymbolTable::ReadText(params.word_syms_rxfilename)))
+      KALDI_ERR << "Could not read symbol table from file "
+        << params.word_syms_rxfilename;
+
+  int32 num_done = 0, num_err = 0;
+  double tot_like = 0.0;
+  int64 num_frames = 0;
+
+  SequentialTokenVectorReader spk2utt_reader(params.spk2utt_rspecifier);
+  RandomAccessTableReader<WaveHolder> wav_reader(params.wav_rspecifier);
+
+
+  OnlineTimingStats timing_stats;
+
+  int my_idx=0;
+  int last_idx=0;
+  int next_idx=0;
+  int num_processed=0;
+
+  while(!spk2utt_reader.Done())
+  {
+
+    nvtxRangePushA("Select Work");
+    //grab next utterance
+
+    if(params.replicate) {
+
+      my_idx=next_idx;
+      next_idx++;      //increment count by one
+
+    } else {
+      //grab unique index
+      my_idx=params.utt_idx++;
+    }
+
+    //printf("THREAD: %d, IDX: %d\n", th_idx, my_idx);
+
+    //advance reader until i am at the right utterance
+    while(!spk2utt_reader.Done() && last_idx<my_idx) {
+      //printf("THREAD: %d, skip\n", th_idx);
+      spk2utt_reader.Next();
+      last_idx++;
+    }
+    //no more utterances left so exit
+    if(spk2utt_reader.Done()) {
+      //printf("thread: %d, exit\n", th_idx);
+      break;
+    }
+    last_idx=my_idx;
+    num_processed++;
+    nvtxRangePop();
+
+    std::string spk = spk2utt_reader.Key();
+    //printf("THREAD: %d, utt: %s\n", th_idx, spk.c_str());
+    const std::vector<std::string> &uttlist = spk2utt_reader.Value();
+    OnlineIvectorExtractorAdaptationState adaptation_state(
+        feature_info.ivector_extractor_info);
+    for (size_t i = 0; i < uttlist.size(); i++) {
+      std::string utt = uttlist[i];
+      if (!wav_reader.HasKey(utt)) {
+        KALDI_WARN << "Did not find audio for utterance " << utt;
+        num_err++;
+        continue;
+      }
+      const WaveData &wave_data = wav_reader.Value(utt);
+      // get the data for channel zero (if the signal is not mono, we only
+      // take the first channel).
+      SubVector<BaseFloat> data(wave_data.Data(), 0);
+      OnlineNnet2FeaturePipeline feature_pipeline(feature_info);
+      feature_pipeline.SetAdaptationState(adaptation_state);
+
+      OnlineSilenceWeighting silence_weighting(
+          trans_model,
+          feature_info.silence_weighting_config,
+          params.decodable_opts.frame_subsampling_factor);
+
+      SingleUtteranceNnet3CudaDecoder decoder(trans_model,
+          decodable_info, cuda_decoder, &feature_pipeline);
+
+      OnlineTimer decoding_timer(utt);
+
+      BaseFloat samp_freq = wave_data.SampFreq();
+      int32 chunk_length;
+      if (params.chunk_length_secs > 0) {
+        chunk_length = int32(samp_freq * params.chunk_length_secs);
+        if (chunk_length == 0) chunk_length = 1;
+      } else {
+        chunk_length = std::numeric_limits<int32>::max();
+      }
+
+      int32 samp_offset = 0;
+      std::vector<std::pair<int32, BaseFloat> > delta_weights;
+      
+      while (samp_offset < data.Dim()) {
+        int32 samp_remaining = data.Dim() - samp_offset;
+        int32 num_samp = chunk_length < samp_remaining ? chunk_length
+          : samp_remaining;
+
+        SubVector<BaseFloat> wave_part(data, samp_offset, num_samp);
+        feature_pipeline.AcceptWaveform(samp_freq, wave_part);
+
+        samp_offset += num_samp;
+        decoding_timer.WaitUntil(samp_offset / samp_freq);
+        if (samp_offset == data.Dim()) {
+          // no more input. flush out last frames
+          feature_pipeline.InputFinished();
+        }
+
+        if (silence_weighting.Active() &&
+            feature_pipeline.IvectorFeature() != NULL) {
+          //silence_weighting.ComputeCurrentTraceback(decoder.Decoder());
+          silence_weighting.GetDeltaWeights(feature_pipeline.NumFramesReady(),
+              &delta_weights);
+          feature_pipeline.IvectorFeature()->UpdateFrameWeights(delta_weights);
+        }
+        nvtxRangePushA("AdvanceDecoding");
+        decoder.AdvanceDecoding();
+        nvtxRangePop();
+      }
+      Lattice lat;
+      if(num_processed>0) {
+        decoder.GetBestPath(true, &lat);
+      }
+
+      decoding_timer.OutputStats(&timing_stats);
+
+      if(num_processed>0) {
+        CompactLattice clat;
+        ConvertLattice(lat, &clat);
+        //        bool end_of_utterance = true;
+        //        decoder.GetLattice(end_of_utterance, &clat);
+
+        params.lock.lock();
+        GetDiagnosticsAndPrintOutput(utt, word_syms, clat,
+            &num_frames, &tot_like);
+
+
+        // In an application you might avoid updating the adaptation state if
+        // you felt the utterance had low confidence.  See lat/confidence.h
+        //feature_pipeline.GetAdaptationState(&adaptation_state);
+
+        // we want to output the lattice with un-scaled acoustics.
+        //BaseFloat inv_acoustic_scale =
+        //  1.0 / decodable_opts.acoustic_scale;
+        //ScaleLattice(AcousticLatticeScale(inv_acoustic_scale), &clat);
+
+        if(params.write_lattice) {
+          nvtxRangePushA("Lattice Write");
+          params.clat_writer->Write(utt, clat);
+          nvtxRangePop();
+        }
+        //KALDI_LOG << "Decoded utterance " << utt;
+        params.lock.unlock();
+
+        num_done++;
+      }
+//      break;
+    } //end for
+//    break;
+  } //end while
+  if(num_processed > 0 ) {
+    //timing_stats.Print(online);
+    double total_time;
+    timing_stats.GetStats(total_time, params.total_audio[th_idx]);
+
+    KALDI_LOG << "Thread: " << th_idx << " Decoded " << num_done << " utterances, "
+      << num_err << " with errors.";
+    KALDI_LOG << "Thread: " << th_idx << " Overall likelihood per frame was " << (tot_like / num_frames)
+      << " per frame over " << num_frames << " frames.";
+  }
+  delete word_syms; // will delete if non-NULL.
+  auto finish = std::chrono::high_resolution_clock::now();
+  nvtxRangePop();
+   std::chrono::duration<double> total_time = finish-start;
+  params.total_time[th_idx]= total_time.count();
 }
 
 int main(int argc, char *argv[]) {
@@ -85,6 +330,7 @@ int main(int argc, char *argv[]) {
     typedef kaldi::int32 int32;
     typedef kaldi::int64 int64;
 
+    DecodeParams params;
     const char *usage =
       "Reads in wav file(s) and simulates online decoding with neural nets\n"
       "(nnet3 setup), with optional iVector-based speaker adaptation and\n"
@@ -102,6 +348,7 @@ int main(int argc, char *argv[]) {
     bool do_endpointing = false;
     bool online = true;
     int num_gpus = 1;
+    int num_threads= 8;
     bool write_lattice = true;
     bool replicate=false;
 
@@ -109,8 +356,9 @@ int main(int argc, char *argv[]) {
 
     po.Register("write-lattice",&write_lattice, "Output lattice to a file.  Setting to false is useful when benchmarking.");
     po.Register("num-gpus", &num_gpus, "number of GPUs to decode on.  Threads are divided evenly across each GPU.");
+    po.Register("num-threads", &num_threads, "number of threads to decode in parallel.  Threads are divided evenly across each GPU.");
     po.Register("replicate",&replicate,"Replicate computation across all threads (for benchmarking)\n");
-    
+
     po.Register("chunk-length", &chunk_length_secs,
         "Length of chunk size in seconds, that we process.  Set to <= 0 "
         "to use all input in one chunk.");
@@ -129,7 +377,7 @@ int main(int argc, char *argv[]) {
         "--chunk-length=-1.");
     po.Register("num-threads-startup", &g_num_threads,
         "Number of threads used when initializing iVector extractor.");
-    
+
 
     OnlineNnet2FeaturePipelineConfig  feature_opts;
     nnet3::NnetSimpleLoopedComputationOptions decodable_opts;
@@ -147,12 +395,13 @@ int main(int argc, char *argv[]) {
       po.PrintUsage();
       return 1;
     }
+     
 
-    int threads_per_gpu = (omp_get_max_threads()+num_gpus-1)/num_gpus;
-    KALDI_LOG << "Num GPUs: " << num_gpus << " threads per gpu: " << threads_per_gpu << endl;
+    auto start = std::chrono::high_resolution_clock::now();
 
-    cuInit(0);
-#define MAX_DEVS 8
+    int threads_per_gpu = (num_threads+num_gpus-1)/num_gpus;
+    KALDI_LOG << "Num GPUs: " << num_gpus << " Num Threads: " << num_threads << " threads per gpu: " << threads_per_gpu << std::endl;
+
     CudaFst cuda_fst[MAX_DEVS];
 
     std::string nnet3_rxfilename = po.GetArg(1),
@@ -160,254 +409,83 @@ int main(int argc, char *argv[]) {
       spk2utt_rspecifier = po.GetArg(3),
       wav_rspecifier = po.GetArg(4),
       clat_wspecifier = po.GetArg(5);
-      
-
-    int utt_idx=0;
-
-    double total_time=0, total_audio=0;
-
     CompactLatticeWriter clat_writer(clat_wspecifier);
-#pragma omp parallel shared(po, cuda_fst, utt_idx, clat_writer) reduction(+:total_time,total_audio)
-    {
 
-      // feature_opts includes configuration for the iVector adaptation,
-      // as well as the basic features.
+    //read in fst and put into cuda data structure (one per device)
+    fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
+    for(int i=0;i<num_gpus;i++) {
+      cudaSetDevice(i);
+      cuda_fst[i].Initialize(*decode_fst);
+    }
 
-#if HAVE_CUDA==1
-      int device=omp_get_thread_num()/threads_per_gpu;
-      char vis_dev[100];
-      sprintf(vis_dev,"CUDA_VISIBLE_DEVICES=%d\n",device);
-      putenv(vis_dev);
-      //int device=1;
-      KALDI_LOG << "Thread " << omp_get_thread_num() << " of " << omp_get_num_threads() << " on device " << device << endl;
-      CuDevice::Instantiate().SelectGpuId(device);
-      CuDevice::Instantiate().AllowMultithreading();
-#endif
-#pragma omp barrier
-      OnlineNnet2FeaturePipelineInfo feature_info(feature_opts);
+    if(!online) chunk_length_secs = -1.0;
 
-      if (!online) {
-        feature_info.ivector_extractor_info.use_most_recent_ivector = true;
-        feature_info.ivector_extractor_info.greedy_ivector_extractor = true;
-        chunk_length_secs = -1.0;
-      }
+    vector<std::thread> threads;
 
-      TransitionModel trans_model;
-      nnet3::AmNnetSimple am_nnet;
-      {
-        bool binary;
-        Input ki(nnet3_rxfilename, &binary);
-        trans_model.Read(ki.Stream(), binary);
-        am_nnet.Read(ki.Stream(), binary);
-        SetBatchnormTestMode(true, &(am_nnet.GetNnet()));
-        SetDropoutTestMode(true, &(am_nnet.GetNnet()));
-        nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet.GetNnet()));
-      }
+    params.total_time.resize(num_threads);
+    params.total_audio.resize(num_threads);
 
-      // this object contains precomputed stuff that is used by all decodable
-      // objects.  It takes a pointer to am_nnet because if it has iVectors it has
-      // to modify the nnet to accept iVectors at intervals.
-      nnet3::DecodableNnetSimpleLoopedInfo decodable_info(decodable_opts,
-          &am_nnet);
+    params.replicate=replicate;
+    params.num_threads=num_threads;
+    params.chunk_length_secs=chunk_length_secs;
+    params.online=online;
+    params.write_lattice=write_lattice;
+    params.cuda_fst=cuda_fst;
+    params.feature_opts=feature_opts;
+    params.decodable_opts=decodable_opts;
+    params.decoder_opts=decoder_opts;
+    params.clat_writer=&clat_writer;
+
+    params.nnet3_rxfilename=nnet3_rxfilename;
+    params.wav_rspecifier=wav_rspecifier;
+    params.word_syms_rxfilename=word_syms_rxfilename;
+    params.spk2utt_rspecifier=spk2utt_rspecifier;
+
+    params.utt_idx=0;
 
 
-      fst::Fst<fst::StdArc> *decode_fst = ReadFstKaldiGeneric(fst_rxfilename);
-      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].Initialize(*decode_fst);
-#pragma omp barrier
-      CudaDecoder cuda_decoder(cuda_fst[device],decoder_opts);
-#pragma omp barrier
+    //launch decoding threads
+    for (int i=0;i<num_threads;i++) 
+      threads.push_back(std::thread(decode_function,std::ref(params),i,i%num_gpus));
 
-      fst::SymbolTable *word_syms = NULL;
-      if (word_syms_rxfilename != "")
-        if (!(word_syms = fst::SymbolTable::ReadText(word_syms_rxfilename)))
-          KALDI_ERR << "Could not read symbol table from file "
-            << word_syms_rxfilename;
+    //wait for threads to complete
+    for(int i=0;i<num_threads;i++)
+      threads[i].join();
 
-      int32 num_done = 0, num_err = 0;
-      double tot_like = 0.0;
-      int64 num_frames = 0;
-
-      SequentialTokenVectorReader spk2utt_reader(spk2utt_rspecifier);
-      RandomAccessTableReader<WaveHolder> wav_reader(wav_rspecifier);
-
-
-      OnlineTimingStats timing_stats;
-
-      int my_idx=0;
-      int last_idx=0;
-      int next_idx=0;
-      int num_processed=0;
-
-      while(!spk2utt_reader.Done())
-      {
-        //grab next utterance
-
-        if(replicate) {
-        
-          my_idx=next_idx;
-          next_idx++;      //increment count by one
-
-        } else {
-          //grab unique index
-          #pragma omp critical
-          {
-            my_idx=utt_idx++;
-          }
-        }
-        
-        //printf("THREAD: %d, IDX: %d\n", omp_get_thread_num(), my_idx);
-        
-        //advance reader until i am at the right utterance
-        while(!spk2utt_reader.Done() && last_idx<my_idx) {
-          //printf("THREAD: %d, skip\n", omp_get_thread_num());
-          spk2utt_reader.Next();
-          last_idx++;
-        }
-        //no more utterances left so exit
-        if(spk2utt_reader.Done()) {
-          //printf("thread: %d, exit\n", omp_get_thread_num());
-          break;
-        }
-        last_idx=my_idx;
-        num_processed++;
-
-        //for (; !spk2utt_reader.Done(); spk2utt_reader.Next()) {
-        std::string spk = spk2utt_reader.Key();
-        //printf("THREAD: %d, utt: %s\n", omp_get_thread_num(), spk.c_str());
-        const std::vector<std::string> &uttlist = spk2utt_reader.Value();
-        OnlineIvectorExtractorAdaptationState adaptation_state(
-            feature_info.ivector_extractor_info);
-        for (size_t i = 0; i < uttlist.size(); i++) {
-          std::string utt = uttlist[i];
-          if (!wav_reader.HasKey(utt)) {
-            KALDI_WARN << "Did not find audio for utterance " << utt;
-            num_err++;
-            continue;
-          }
-          const WaveData &wave_data = wav_reader.Value(utt);
-          // get the data for channel zero (if the signal is not mono, we only
-          // take the first channel).
-          SubVector<BaseFloat> data(wave_data.Data(), 0);
-
-          OnlineNnet2FeaturePipeline feature_pipeline(feature_info);
-          feature_pipeline.SetAdaptationState(adaptation_state);
-
-          OnlineSilenceWeighting silence_weighting(
-              trans_model,
-              feature_info.silence_weighting_config,
-              decodable_opts.frame_subsampling_factor);
-
-          SingleUtteranceNnet3CudaDecoder decoder(trans_model,
-              decodable_info, cuda_decoder, &feature_pipeline);
-
-          nvtxRangePushA("Timing Start");
-          OnlineTimer decoding_timer(utt);
-
-
-          BaseFloat samp_freq = wave_data.SampFreq();
-          int32 chunk_length;
-          if (chunk_length_secs > 0) {
-            chunk_length = int32(samp_freq * chunk_length_secs);
-            if (chunk_length == 0) chunk_length = 1;
-          } else {
-            chunk_length = std::numeric_limits<int32>::max();
-          }
-
-          int32 samp_offset = 0;
-          std::vector<std::pair<int32, BaseFloat> > delta_weights;
-
-          while (samp_offset < data.Dim()) {
-            int32 samp_remaining = data.Dim() - samp_offset;
-            int32 num_samp = chunk_length < samp_remaining ? chunk_length
-              : samp_remaining;
-
-            SubVector<BaseFloat> wave_part(data, samp_offset, num_samp);
-            feature_pipeline.AcceptWaveform(samp_freq, wave_part);
-
-            samp_offset += num_samp;
-            decoding_timer.WaitUntil(samp_offset / samp_freq);
-            if (samp_offset == data.Dim()) {
-              // no more input. flush out last frames
-              feature_pipeline.InputFinished();
-            }
-
-            if (silence_weighting.Active() &&
-                feature_pipeline.IvectorFeature() != NULL) {
-              //silence_weighting.ComputeCurrentTraceback(decoder.Decoder());
-              silence_weighting.GetDeltaWeights(feature_pipeline.NumFramesReady(),
-                  &delta_weights);
-              feature_pipeline.IvectorFeature()->UpdateFrameWeights(delta_weights);
-            }
-
-            decoder.AdvanceDecoding();
-
-          }
-
-          Lattice lat;
-          if(num_processed>0) {
-            decoder.GetBestPath(true, &lat);
-          }
-
-          decoding_timer.OutputStats(&timing_stats);
-
-          nvtxRangePop();
-
-          if(num_processed>0) {
-            CompactLattice clat;
-            ConvertLattice(lat, &clat);
-            //        bool end_of_utterance = true;
-            //        decoder.GetLattice(end_of_utterance, &clat);
-
-#pragma omp critical
-            {
-              GetDiagnosticsAndPrintOutput(utt, word_syms, clat,
-                &num_frames, &tot_like);
-
-
-              // In an application you might avoid updating the adaptation state if
-              // you felt the utterance had low confidence.  See lat/confidence.h
-              //feature_pipeline.GetAdaptationState(&adaptation_state);
-
-              // we want to output the lattice with un-scaled acoustics.
-              //BaseFloat inv_acoustic_scale =
-              //  1.0 / decodable_opts.acoustic_scale;
-              //ScaleLattice(AcousticLatticeScale(inv_acoustic_scale), &clat);
-
-              if(write_lattice)
-                clat_writer.Write(utt, clat);
-              //KALDI_LOG << "Decoded utterance " << utt;
-            }
-            num_done++;
-          }
-        }
-      }
-      if(num_processed > 0 ) {
-        //timing_stats.Print(online);
-        timing_stats.GetStats(total_time, total_audio);
+    for(int i=0;i<num_gpus;i++) {
+      cudaSetDevice(i);
+      cuda_fst[i].Finalize();
+    }
     
-        //#pragma omp barrier
+    clat_writer.Close();
+    delete decode_fst;
+    
+    cudaDeviceSynchronize();
 
-        KALDI_LOG << "Thread: " << omp_get_thread_num() << " Decoded " << num_done << " utterances, "
-          << num_err << " with errors.";
-        KALDI_LOG << "Thread: " << omp_get_thread_num() << " Overall likelihood per frame was " << (tot_like / num_frames)
-          << " per frame over " << num_frames << " frames.";
-      }
-      delete decode_fst;
-      delete word_syms; // will delete if non-NULL.
-#pragma omp barrier
-      if(omp_get_thread_num()%threads_per_gpu==0) cuda_fst[device].Finalize();
-      } //end parallel
-  
-      total_time/=omp_get_max_threads();
-      KALDI_LOG << "Total Time: " << total_time << " Total Audio: " << total_audio << " RealTimeX: " << total_audio/total_time << endl;
-      clat_writer.Close();
-      cudaDeviceSynchronize();
-      cudaProfilerStop();
-      return 0;
+    auto finish = std::chrono::high_resolution_clock::now();
+    double total_audio=0;
+    for(int i=0;i<num_threads;i++) {
+        total_audio+=params.total_audio[i];
+  KALDI_LOG << "Thread: " << i 
+                  << " Total Time: " << params.total_time[i] 
+                  << " Total Audio: " << params.total_audio[i]
+                  << " RealTimeX: " << params.total_audio[i]/params.total_time[i] << std::endl;
+    }
 
-      //return (num_done != 0 ? 0 : 1);
+    
+    std::chrono::duration<double> total_time = finish-start;
+
+    KALDI_LOG << "Aggregate Total Time: " << total_time.count()
+              << " Total Audio: " << total_audio 
+              << " RealTimeX: " << total_audio/total_time.count() << std::endl;
+
+
+    return 0;
+
+    //return (num_done != 0 ? 0 : 1);
   } catch(const std::exception& e) {
     std::cerr << e.what();
     return -1;
   }
 } // main()
+
