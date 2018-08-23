@@ -145,7 +145,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         if(threadIdx.x == 0 && blockIdx.x == 0) {
             d_global_min_cost_and_beam->min_cost = floatToOrderedInt(infinite_cost); 
             // Resetting the beam back to default between frames
-            d_global_min_cost_and_beam->beam = floatToOrderedInt(default_beam); 
+            CostType previous_beam = d_global_min_cost_and_beam->beam;
+            CostType beam = fmin(default_beam, previous_beam * KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE);
+            d_global_min_cost_and_beam->beam = floatToOrderedInt(beam); 
         }
         int32 main_q_end = *d_main_q_end_; 
 

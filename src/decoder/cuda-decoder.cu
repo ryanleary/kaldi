@@ -736,7 +736,7 @@ namespace kaldi {
     void CudaDecoder::DebugAssertsNewFrame() {
         cudaStreamSynchronize(compute_st_);
 
-        int32 float_inf_as_int = 2139095039; // TODO 
+        int32 float_inf_as_int = 2139095039; // FIXME use real infinite_cost_
 
         int32 nstates = fst_.num_states_;
 

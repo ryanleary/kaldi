@@ -28,6 +28,14 @@
 
 #include "decoder/cuda-decoder-utils.h"
 
+
+// If we're at risk of filling the tokens queue,
+// the beam is reduced to keep only the best candidates in the 
+// remaining space
+// We then slowly put the beam back to its default value
+// beam_next_frame = min(default_beam, RECOVER_RATE * beam_previous_frame)
+#define KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE 1.2
+
 // Defines for the cuda decoder kernels
 // It shouldn't be necessary to change the DIMX of the kernels
 #define KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX 256
