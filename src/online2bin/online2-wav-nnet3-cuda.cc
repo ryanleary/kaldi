@@ -34,6 +34,7 @@
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <vector>
 
 #define MAX_DEVS 16
 using namespace kaldi;
@@ -141,7 +142,7 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
 
 
   //every thread needs its own decoder state.  Declare that here.
-  CudaDecoder cuda_decoder(params.cuda_fst[gpu_idx],params.decoder_opts);
+  CudaDecoder cuda_decoder(params.cuda_fst[gpu_idx],params.decoder_opts, 10, 10); //FIXME temp nchannels nlanes hardcoded
 
   fst::SymbolTable *word_syms = NULL;
   if (params.word_syms_rxfilename != "")
@@ -261,41 +262,48 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
         }
         decoder.AdvanceDecoding();
       }
-      Lattice lat;
+      std::vector<Lattice> lats(10);
+      std::vector<Lattice*> lats_ptr(10);
+      for(int i=0;i<lats.size(); ++i)
+	lats_ptr[i] = &lats[i];
       if(num_processed>0) {
-        decoder.GetBestPath(true, &lat);
+        decoder.GetBestPath(true, lats_ptr);
       }
 
       decoding_timer.OutputStats(&timing_stats);
 
       if(num_processed>0) {
-        CompactLattice clat;
-        ConvertLattice(lat, &clat);
-        //        bool end_of_utterance = true;
-        //        decoder.GetLattice(end_of_utterance, &clat);
+	      //for(Lattice &lat : lats) {
+		{
+ 		      // Printing only the first one to compute WER using benchmark script
+		      Lattice &lat = lats[0];
+		      CompactLattice clat;
+		      ConvertLattice(lat, &clat);
+		      //        bool end_of_utterance = true;
+		      //        decoder.GetLattice(end_of_utterance, &clat);
 
-        params.lock.lock();
-        GetDiagnosticsAndPrintOutput(utt, word_syms, clat,
-            &num_frames, &tot_like);
+		      params.lock.lock();
+		      GetDiagnosticsAndPrintOutput(utt, word_syms, clat,
+				      &num_frames, &tot_like);
 
 
-        // In an application you might avoid updating the adaptation state if
-        // you felt the utterance had low confidence.  See lat/confidence.h
-        //feature_pipeline.GetAdaptationState(&adaptation_state);
+		      // In an application you might avoid updating the adaptation state if
+		      // you felt the utterance had low confidence.  See lat/confidence.h
+		      //feature_pipeline.GetAdaptationState(&adaptation_state);
 
-        // we want to output the lattice with un-scaled acoustics.
-        //BaseFloat inv_acoustic_scale =
-        //  1.0 / decodable_opts.acoustic_scale;
-        //ScaleLattice(AcousticLatticeScale(inv_acoustic_scale), &clat);
+		      // we want to output the lattice with un-scaled acoustics.
+		      //BaseFloat inv_acoustic_scale =
+		      //  1.0 / decodable_opts.acoustic_scale;
+		      //ScaleLattice(AcousticLatticeScale(inv_acoustic_scale), &clat);
 
-        if(params.write_lattice) {
-          nvtxRangePushA("Lattice Write");
-          params.clat_writer->Write(utt, clat);
-          nvtxRangePop();
-        }
-        //KALDI_LOG << "Decoded utterance " << utt;
-        params.lock.unlock();
-
+		      if(params.write_lattice) {
+			      nvtxRangePushA("Lattice Write");
+			      params.clat_writer->Write(utt, clat);
+			      nvtxRangePop();
+		      }
+		      //KALDI_LOG << "Decoded utterance " << utt;
+		      params.lock.unlock();
+	      }
         num_done++;
       }
       //break;
@@ -346,7 +354,7 @@ int main(int argc, char *argv[]) {
     bool do_endpointing = false;
     bool online = true;
     int num_gpus = 1;
-    int num_threads= 8;
+    int num_threads= 1;
     bool write_lattice = true;
     bool replicate=false;
 
