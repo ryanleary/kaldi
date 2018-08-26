@@ -32,14 +32,21 @@
 
 namespace kaldi {
 
-    CudaDecoder::CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config): fst_(fst), 
+    CudaDecoder::CudaDecoder(const CudaFst &fst, 
+                             const CudaDecoderConfig &config,
+                             int32 nlanes,
+                             int32 nchannels): fst_(fst), 
                      default_beam_(config.default_beam),
                      max_tokens_(config.max_tokens), 
                      max_tokens_per_frame_(config.max_tokens_per_frame),
-                     h_all_tokens_info_(config.max_tokens) {
+                     h_all_tokens_info_(config.max_tokens),
+                     nlanes_(nlanes),
+                     nchannels_(nchannels) {
+
         //
         // For a description of the class members, please refer to the cuda-decoder.h file
         //
+
         cudaStreamCreate(&compute_st_);
         cudaStreamCreate(&copy_st_); 
 
@@ -48,52 +55,108 @@ namespace kaldi {
         cudaEventCreate(&can_read_final_h_main_q_end_);
         cudaEventCreate(&before_finalize_nonemitting_kernel_);
 
-        cudaMalloc(&d_main_q_state_, max_tokens_per_frame_ * sizeof(*d_main_q_state_));
-        cudaMallocHost(&h_main_q_state_, max_tokens_per_frame_ * sizeof(*h_main_q_state_));
-        cudaMalloc(&d_aux_q_state_, max_tokens_per_frame_ * sizeof(*d_aux_q_state_));
+        KALDI_ASSERT(nlanes > 0);
+        KALDI_ASSERT(nchannels > 0);
 
-        cudaMalloc(&d_main_q_cost_, max_tokens_per_frame_ * sizeof(*d_main_q_cost_));
-        cudaMallocHost(&h_main_q_cost_, max_tokens_per_frame_ * sizeof(*h_main_q_cost_));
-        cudaMalloc(&d_aux_q_cost_, max_tokens_per_frame_ * sizeof(*d_aux_q_cost_));
+        h_lane_params = (LaneParams*)malloc(*, nlanes * sizeof(*h_lane_params));
+        h_channels_params = (ChannelParams*)malloc(*, nchannels * sizeof(*h_channel_params));
+        cudaMalloc(*d_lane_params, nlanes * sizeof(*h_lane_params));
+        cudaMalloc(*d_channel_params, nchannels * sizeof(*h_channels_params));
 
-        cudaMalloc(&d_main_q_info_, max_tokens_per_frame_ * sizeof(*d_main_q_info_));
-        cudaMalloc(&d_aux_q_info_, max_tokens_per_frame_ * sizeof(*d_aux_q_info_));
+        // Allocating memory for all lanes
+        // using intermediate size_t value because we're going reuse those sizes below,
+        // but also to avoid overflowing int32 with byte counts in the future
+        size_t one_aux_q_state_size = max_tokens_per_frame_ * sizeof(*d_all_aux_q_state_);
+        size_t one_aux_q_cost_size =  max_tokens_per_frame_ * sizeof(*d_all_aux_q_cost_);
+        size_t one_aux_q_info_size = max_tokens_per_frame_ * sizeof(*d_all_aux_q_info_);
+        size_t one_main_q_info_size = max_tokens_per_frame_ * sizeof(*d_all_main_q_info_);
+        size_t one_state_best_cost_size = fst_.num_states_*sizeof(*d_state_best_cost_);
+        size_t one_main_q_degrees_block_sums_prefix_sum_size = (KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)
+                                                                * sizeof(*d_main_q_degrees_block_sums_prefix_sum_);
+        cudaMalloc(&d_all_aux_q_state_, nlanes * one_aux_q_state_size);
+        cudaMalloc(&d_all_aux_q_cost_, nlanes * one_aux_q_cost_size);
+        cudaMalloc(&d_all_aux_q_info_, nlanes * one_aux_q_info_size);
+        cudaMalloc(&d_all_main_q_info_, nlanes * one_main_q_info_size);
+        cudaMalloc(&d_all_state_best_cost_, nlanes * one_state_best_cost_size);
+        cudaMalloc(&d_all_main_q_degrees_block_sums_prefix_sum_, nlanes * one_main_q_degrees_block_sums_prefix_sum_size_);
 
-        cudaMalloc(&d_main_q_local_offset_, sizeof(*d_main_q_local_offset_));
-        cudaMalloc(&d_aux_q_end_, sizeof(*d_aux_q_end_));
-        cudaMalloc(&d_n_CTA_done_, sizeof(*d_n_CTA_done_));
 
-        cudaMalloc(&d_main_q_end_and_narcs_i2_, sizeof(*d_main_q_end_and_narcs_i2_));
-        d_main_q_narcs_ = &d_main_q_end_and_narcs_i2_->split.narcs;
-        d_main_q_end_ = &d_main_q_end_and_narcs_i2_->split.ntokens;
+        // Allocating memory for all channels
+        size_t one_main_q_state_size = max_tokens_per_frame_ * sizeof(*d_all_main_q_state_);
+        size_t one_main_q_cost_size = max_tokens_per_frame_ * sizeof(*d_all_main_q_cost_);
+        size_t one_main_q_arc_offsets_size = (max_tokens_per_frame_+1) * sizeof(*d_all_main_q_arc_offsets_);
+        size_t one_loglikelihoods_size = (fst_.max_ilabel_+1)*sizeof(*d_loglikelihoods_);
 
-        cudaMalloc(&d_global_min_cost_and_beam_, sizeof(*d_global_min_cost_and_beam_));
+        cudaMalloc(&d_all_main_q_state_, nchannels * one_main_q_state_size);
+        cudaMalloc(&d_all_main_q_cost_, nchannels * one_main_q_cost_size);
+        cudaMalloc(&d_all_main_q_arc_offsets_, nchannels * one_main_q_arc_offsets_size);
+        cudaMalloc(&d_all_loglikelihoods_, nchannels * one_loglikelihoods_size);  
+       
+        // Allocating pinned memory for all isolated ints in params
+        constexpr int32 n_pinned_ints_per_lane = 2;
+        constexpr int32 n_pinned_ints_per_channel = 3;
+        int32 n_pinned_ints = nlanes * n_pinned_ints_per_lane + nchannels * n_pinned_ints_per_channel;
+        cudaMallocHost(&h_all_pinned_ints, n_pinned_ints * sizeof(*h_all_pinned_ints));
 
-        // TODO alloc once, for all small vals, better data locality
-        cudaMallocHost(&h_main_q_end_, sizeof(*h_main_q_end_));  
-        cudaMallocHost(&h_main_q_narcs_, sizeof(*h_main_q_narcs_));  
-        cudaMallocHost(&h_main_q_local_offset_, sizeof(*h_main_q_local_offset_));  
-        cudaMallocHost(&h_aux_q_end_, sizeof(*h_aux_q_end_));  
-        cudaMallocHost(&h_main_q_end_before_finalize_nonemitting_kernel_, sizeof(*h_main_q_end_before_finalize_nonemitting_kernel_));  
+        int i_pinned_int = 0;
+        // Setting lanes params
+        for(int ilane=0; ilane<n_lanes_; ++ilane) {
+            LaneParams params;
+            params.d_aux_q_state = &d_all_aux_q_state_[ilane*one_aux_q_state_size]; 
+            params.d_aux_q_cost = &d_all_aux_q_cost_[ilane*one_aux_q_cost_size]; 
+            params.d_aux_q_info = &d_all_aux_q_info_[ilane*one_aux_q_info_size]; 
+            params.d_main_q_info = &d_all_main_q_info_[ilane*one_main_q_info_size]; 
+            params.d_state_best_cost = &d_all_state_best_cost_[ilane*one_state_best_cost_size]; 
 
-        cudaMallocHost(&h_q_overflow_, sizeof(h_q_overflow_));  
+            params.d_main_q_degrees_block_sums_prefix_sum_ = 
+                &d_all_main_q_degrees_block_sums_prefix_sum_[ilane*one_main_q_degrees_block_sums_prefix_sum_size];
+            params.n_CTA_done_ = 0;
+            params.aux_q_end_ = 0;
 
-        cudaMalloc(&d_main_q_degrees_prefix_sum_, max_tokens_per_frame_ * sizeof(*d_main_q_degrees_prefix_sum_));
+            params.h_aux_q_end_ = &h_all_pinned_ints[i_pinned_int++]; 
+            params.h_q_overflow = &h_all_pinned_ints[i_pinned_int++]; 
+            d_lane_params[ilane] = params;
+        }
 
-        // d_main_q_degrees_block_sums_prefix_sum_ is the prefix sum of the "block sums"
-        // a block sum is, for each CUDA block, the sum of the arc degrees of all tokens associated to that CUDA block
-        // we add +1 because we want the last element of the prefix sum (a prefix sum of n elements generates (n+1) values)
-        cudaMalloc(&d_main_q_degrees_block_sums_prefix_sum_, 
-                (KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1)
-                 * sizeof(*d_main_q_degrees_block_sums_prefix_sum_));
+        // Setting channels params
+        for(int ichannel=0; ichannel<n_channels_; ++ichannel) {
+                ChannelParams params;
+                params.d_main_q_state = &d_all_main_q_state_[ichannel*one_main_q_state_size]; 
+                params.d_main_q_cost = &d_all_main_q_cost_[ichannel*one_main_q_state_size]; 
+                params.d_main_q_arc_offsets = &d_all_main_q_arc_offsets_[ichannel*one_main_q_arc_offsets]; 
+                params.d_main_q_degrees_prefix_sum =
+                    &d_all_main_q_degrees_prefix_sum_[ichannel*one_main_q_degrees_prefix_sum]; 
+                params.d_loglikelihoods = &d_all_loglikelihoods_[ichannel*one_loglikelihoods]; 
+                TokenAndArcCountUnion main_q_end_and_narcs_i2_; 
+                params.main_q_global_offset_ = 0; 
+                params.main_q_local_offset_ = 0;
+                InfoTokenVector h_all_tokens_info_; 
 
-        cudaMalloc(&d_main_q_arc_offsets_, (max_tokens_per_frame_+1) * sizeof(*d_main_q_arc_offsets_));
+                params.h_main_q_local_offset = &h_all_pinned_ints[i_pinned_int++]; 
+                params.h_main_q_end = &h_all_pinned_ints[i_pinned_int++];
+                params.h_main_q_narcs = &h_all_pinned_ints[i_pinned_int++];
+                d_channel_params[ichannel] = params;
+        }
+        KALDI_ASSERT(i_pinned_int == n_pinned_ints); 
 
-        cudaMalloc(&d_loglikelihoods_, (fst_.max_ilabel_+1)*sizeof(*d_loglikelihoods_));  
+        // Initialize host tokens memory pools
+        h_all_tokens_info_.resize(n_channels_);
+        for(int ichannel=0; ichannel<n_channels_; ++ichannel) 
+            h_all_tokens_info_[ichannel].SetCudaStream(copy_st_);
 
-        cudaMalloc(&d_state_best_cost_, fst_.num_states_*sizeof(*d_state_best_cost_));
+        // Setting Kernel Params
+        // sent to kernels by copy
 
-        h_all_tokens_info_.SetCudaStream(copy_st_);
+        // infinite_cost : used as +INF for min_cost and d_state_cost
+        // we will compute min_cost + beam during computation
+        // if min_cost == FLT_MAX, we have an overflow
+        // avoiding that by removing the beam from infinite
+        // (2* the beam in case of rounding error)
+        kernel_params.infinite_cost = FLT_MAX - 2*config.default_beam;
+        kernel_params.arc_ilabels = fst_.d_arc_ilabels_;
+        kernel_params.arc_weights = fst_.d_arc_weights_;
+        kernel_params.arc_nextstates = fst_.d_arc_nextstates_;
+        kernel_params.default_beam = default_beam_;
 
         if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
             KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
@@ -104,70 +167,6 @@ namespace kaldi {
         }
 
         KALDI_DECODER_CUDA_CHECK_ERROR();
-
-
-        // Used as +INF for min_cost and d_state_cost
-        // we will compute min_cost + beam during computation
-        // if min_cost == FLT_MAX, we have an overflow
-        // avoiding that by removing the beam from infinite
-        // (2* the beam in case of rounding error)
-        infinite_cost_ = FLT_MAX - 2*config.default_beam;
-        // Building the parameters structs
-        // Used to launch the ExpandArc and Preprocess kernels
-
-        preprocess_params_.d_aux_q_state = d_aux_q_state_; 
-        preprocess_params_.d_aux_q_cost = d_aux_q_cost_;
-        preprocess_params_.d_aux_q_info = d_aux_q_info_; 
-        preprocess_params_.d_aux_q_end = d_aux_q_end_;
-        preprocess_params_.h_aux_q_end = h_aux_q_end_;
-        preprocess_params_.d_main_q_state = d_main_q_state_; 
-        preprocess_params_.d_main_q_cost = d_main_q_cost_;
-        preprocess_params_.d_main_q_info = d_main_q_info_; 
-        preprocess_params_.d_main_q_end_and_narcs_i2 = d_main_q_end_and_narcs_i2_; 
-        preprocess_params_.d_main_q_narcs = d_main_q_narcs_;
-        preprocess_params_.d_main_q_end = d_main_q_end_;
-        preprocess_params_.h_main_q_end = h_main_q_end_;
-        preprocess_params_.h_main_q_end_before_finalize_nonemitting_kernel = h_main_q_end_before_finalize_nonemitting_kernel_;
-        preprocess_params_.d_main_q_local_offset = d_main_q_local_offset_;
-        preprocess_params_.h_main_q_local_offset = h_main_q_local_offset_;
-        preprocess_params_.h_main_q_narcs = h_main_q_narcs_;
-        preprocess_params_.q_capacity = max_tokens_per_frame_;
-        preprocess_params_.h_q_overflow = h_q_overflow_;
-        preprocess_params_.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
-        preprocess_params_.d_main_q_arc_offsets = d_main_q_arc_offsets_;
-        preprocess_params_.d_state_best_cost = d_state_best_cost_; 
-        preprocess_params_.d_global_min_cost_and_beam = d_global_min_cost_and_beam_; 
-        preprocess_params_.d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_; 
-        preprocess_params_.d_n_CTA_done = d_n_CTA_done_;
-        preprocess_params_.infinite_cost = infinite_cost_;
-
-        expand_params_.d_main_q_state = d_main_q_state_;
-        expand_params_.d_main_q_cost = d_main_q_cost_;
-        expand_params_.d_main_q_info= d_main_q_info_;
-        expand_params_.d_main_q_local_offset = d_main_q_local_offset_;
-        expand_params_.h_main_q_local_offset = h_main_q_local_offset_;
-        expand_params_.d_main_q_end = d_main_q_end_;
-        expand_params_.d_main_q_narcs = d_main_q_narcs_;
-        expand_params_.h_main_q_end = h_main_q_end_;
-        expand_params_.h_main_q_narcs = h_main_q_narcs_;
-        expand_params_.d_aux_q_state = d_aux_q_state_; 
-        expand_params_.d_aux_q_cost = d_aux_q_cost_; 
-        expand_params_.d_aux_q_info = d_aux_q_info_;
-        expand_params_.d_aux_q_end = d_aux_q_end_;
-        expand_params_.h_aux_q_end = h_aux_q_end_;
-        expand_params_.q_capacity = max_tokens_per_frame_;
-        expand_params_.h_q_overflow = h_q_overflow_;
-        expand_params_.d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_; 
-        expand_params_.d_q_arc_offsets = d_main_q_arc_offsets_;
-        expand_params_.arc_ilabels = fst_.d_arc_ilabels_;
-        expand_params_.arc_weights = fst_.d_arc_weights_; 
-        expand_params_.arc_nextstates = fst_.d_arc_nextstates_; 
-        expand_params_.d_global_min_cost_and_beam = d_global_min_cost_and_beam_; 
-        expand_params_.default_beam = default_beam_;
-        expand_params_.d_loglikelihoods = d_loglikelihoods_;
-        expand_params_.d_state_best_cost = d_state_best_cost_;
-        expand_params_.d_n_CTA_done = d_n_CTA_done_;
-
     }
 
     CudaDecoder::~CudaDecoder() {
@@ -179,30 +178,25 @@ namespace kaldi {
         cudaEventDestroy(can_read_final_h_main_q_end_);
         cudaEventDestroy(before_finalize_nonemitting_kernel_);
 
-        cudaFree(d_main_q_state_);
-        cudaFree(d_aux_q_state_);
-        cudaFree(d_main_q_cost_);
-        cudaFree(d_aux_q_cost_);
-        cudaFree(d_main_q_info_);
-        cudaFree(d_aux_q_info_);
-        cudaFree(d_main_q_local_offset_);
-        cudaFree(d_aux_q_end_);
-        cudaFree(d_n_CTA_done_);
-        cudaFree(d_main_q_end_and_narcs_i2_);
-        cudaFree(d_main_q_degrees_prefix_sum_);
-        cudaFree(d_main_q_degrees_block_sums_prefix_sum_);
-        cudaFree(d_main_q_arc_offsets_);
-        cudaFree(d_loglikelihoods_);
-        cudaFree(d_state_best_cost_);
-        cudaFree(d_global_min_cost_and_beam_);
+        free(h_lane_params);
+        free(h_channels_params);
+        cudaFree(d_lane_params);
+        cudaFree(d_channel_params);
 
-        cudaFreeHost(h_main_q_end_);
-        cudaFreeHost(h_main_q_narcs_);
-        cudaFreeHost(h_main_q_local_offset_);
-        cudaFreeHost(h_aux_q_end_);
-        cudaFreeHost(h_main_q_cost_);
-        cudaFreeHost(h_main_q_state_);
+        cudaFree(d_all_aux_q_state_);
+        cudaFree(d_all_aux_q_cost_);
+        cudaFree(d_all_aux_q_info_);
+        cudaFree(d_all_main_q_info_);
+        cudaFree(d_all_state_best_cost_);
+        cudaFree(d_all_main_q_degrees_block_sums_prefix_sum_);
 
+        cudaFree(d_all_main_q_state_);
+        cudaFree(d_all_main_q_cost_);
+        cudaFree(d_all_main_q_arc_offsets_);
+        cudaFree(d_all_loglikelihoods_);
+
+        cudaFreeHost(h_all_pinned_ints);
+       
         if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
             cudaFreeHost(h_debug_buf1_);
             cudaFreeHost(h_debug_buf2_);

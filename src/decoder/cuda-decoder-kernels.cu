@@ -870,6 +870,8 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                   main_q_arc_index_block_offset < total_narcs;
                   main_q_arc_index_block_offset += gridDim.x*blockDim.x) {
 
+            //FIXME we need to reload the beam at some point
+
             //
             // Important : this thread is not responsible for a token in the input queue main_q
             // but for an arc, going out of a token in the main_q

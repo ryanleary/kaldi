@@ -28,6 +28,24 @@
 
 #include "decoder/cuda-decoder-utils.h"
 
+//
+// To understand the following lines it is important to 
+// know the difference between what we call a decoder lane and a decoder 
+// channel
+//
+// A decoder channel is linked to one utterance. Frames
+// from the same must be sent to the same channel.
+// 
+// A decoder lane is where the computation actually happens
+// a decoder lane is given a frame and its associated channel
+// and does the actual computation
+//
+// An analogy would be lane -> a core, channel -> a software thread
+//
+
+
+// Number of GPU decoder lanes
+#define KALDI_CUDA_DECODER_MAX_N_LANES 40
 
 // If we're at risk of filling the tokens queue,
 // the beam is reduced to keep only the best candidates in the 
@@ -62,9 +80,10 @@ namespace kaldi {
 
    struct CudaDecoderConfig {
        BaseFloat default_beam;
-       uint32_t max_tokens;
-       uint32_t max_tokens_per_frame;
-
+       int32 max_tokens;
+       int32 max_tokens_per_frame;
+       int32 nlanes;
+       int32 nchannels;
 
        CudaDecoderConfig(): default_beam(15.0),
        max_tokens(50000000),
@@ -99,13 +118,19 @@ namespace kaldi {
             typedef StdArc::Label Label;
             typedef StdArc::StateId StateId;
             typedef float CostType;
+            typedef int32 LaneId;
+            typedef int32 ChannelId;
+
             // IntegerCostType is the type used in the lookup table d_state_best_cost
             // and the d_cutoff
             // We use a 1:1 conversion between CostType <--> IntegerCostType
             // IntegerCostType is used because it triggers native atomic operations
             typedef int32 IntegerCostType;
 
-            CudaDecoder(const CudaFst &fst, const CudaDecoderConfig &config);  
+            CudaDecoder(const CudaFst &fst, 
+                        const CudaDecoderConfig &config,
+                        int nlanes=1,
+                        int nchannels=1);  
             ~CudaDecoder();
 
             // Decode this utterance.
@@ -486,119 +511,174 @@ private:
             // are not finals because the aux queue will be pruned.
             //
 
-            StateId *d_main_q_state_, *d_aux_q_state_; 
-            CostType *d_main_q_cost_, *d_aux_q_cost_;
-            InfoToken *d_main_q_info_, *d_aux_q_info_;
+            //
+            // Parameters used by a decoder lane
+            // At the end of each frame, we know everything stored
+            // by those parameters (lookup table, aux_q, etc.)
+            // is back to its original state
+            // We can reuse it for another frame/channel without doing anything
+            //
+            struct LaneParams {
+                // Ordering struct members by size for memory alignment (64bits, then 32bits members)
 
-            // ExpandArcs does not use at its input the complete main queue
-            // It only reads from the index range [main_q_local_offset, end[
-            int32 *h_main_q_local_offset_; 
-            int32 *d_main_q_local_offset_;
+                // aux_q, tokens split in 3 parts (cf main_q)
+                StateId *d_aux_q_state_; 
+                CostType *d_aux_q_cost_;
+                InfoToken *d_aux_q_info_;
 
+                // End index of the aux queue
+                // only tokens at index i with i < aux_q_end 
+                // are valid tokens
+                int32 *h_aux_q_end_; // copy of the value in pinned memory
 
-            // end index of the main queue
-            // only tokens at index i with i < main_q_end 
-            // are valid tokens
-            int32 *d_main_q_end_;
-            int32 *h_main_q_end_; // pinned memory
-            // This value is only set by PreprocessAndContracts kernels,
-            // not the FinalizeNonEmitting. Allows us to read from it during
-            // execution of FinalizeNonEmitting
-            int32 *h_main_q_end_before_finalize_nonemitting_kernel_; // pinned memory
+                // d_main_q_info_ is only needed as a buffer when creating the 
+                // tokens. It is not needed by the next frame computation
+                // We send it back to the host, and at the end of a frame's computation,
+                // it can be used by another channel. That's why it's in 
+                // "LaneParams", and not "ChannelParams"
+                InfoToken *d_main_q_info_;
 
-            // Same thing for the aux queue
-            int32 *d_aux_q_end_;
-            int32 *h_aux_q_end_;
+                // Depending on the value of the parameter "max_tokens_per_frame"
+                // we can end up with an overflow when generating the tokens for a frame
+                // We try to prevent this from happening using an adaptive beam
+                // if an overflow is about to happen, the kernels revert all data
+                // to the last valid state, and set that flag to true
+                // Even if that flag is set, we can continue the execution (quality
+                // of the output can be lowered)
+                // We use that flag to display a warning to stderr
+                int32 *h_q_overflow_;
 
-            // Each valid token the subqueue main_q[main_q_offset, main_q_end[ has 
-            // a number of outgoing arcs (out-degree)
-            // main_q_narcs is the sum of those numbers
-            // To see when a token is considered as valid, please refer to the Preprocess kernels
-            int32 *d_main_q_narcs_;
-            int32 *h_main_q_narcs_; // pinned memory
-
-            // Contains both main_q_end and narcs
-            // The pointers refer to the same location than the d_main_q_end and d_main_q_narcs pointers,
-            // ie : 
-            // d_main_q_end = &d_main_q_end_and_narcs->split.ntokens
-            // d_main_q_narcs = &d_main_q_end_and_narcs->split.narcs
-            // We sometime need to update both end and narcs at the same time,
-            // using an 64 bits atomic
-            TokenAndArcCountUnion *d_main_q_end_and_narcs_i2_; 
-
-            // After each frame, we copy the main queue (GPU memory)
-            // to the end of h_all_tokens_info (CPU memory)
-            // We only move to the CPU what's needed for the final backtrack in GetBestPath
-            // ie { prev_token, arc_idx } (= struct InfoToken)
-            InfoTokenVector h_all_tokens_info_; 
-
-            // The token at index i in the main queue has in reality 
-            // a global index of (i + main_q_global_offset)
-            // This global index is unique and takes into account that 
-            // we've flushed the main_q back to the host. We need unique indexes 
-            // for each token in order to have valid token.prev_token data members
-            // and be able to backtrack at the end
-            int32 main_q_global_offset_;
-
-
-            // Depending on the value of the parameter "max_tokens_per_frame"
-            // we can end up with an overflow when generating the tokens for a frame
-            // We try to prevent this from happening using an adaptive beam
-            // if an overflow is about to happen, the kernels revert all data
-            // to the last valid state, and set that flag to true
-            // Even if that flag is set, we can continue the execution (quality
-            // of the output can be lowered)
-            // We use that flag to display a warning to stderr
-            int32 *h_q_overflow_;
-
-            // Buffers for copies on host on the current main_q
-            // Those are only buffers - and must be considered as containing 
-            // uninitialized data
-            // If you need to read from those,
-            // please explicitly copy data from device first !
-            // We use them in "ReachedFinal" for instance
-            StateId *h_main_q_state_; 
-            CostType *h_main_q_cost_; 
-
-            // Some kernels need to perform some operations before exiting
-            // d_n_CTA_done is a counter that we increment when a CTA (CUDA blocks)
-            // is done
-            // Each CTA then tests the value for d_n_CTA_done to detect if it's the last to exit
-            // If that's the cast, it does what it has to do, and sets d_n_CTA_done back to 0
-            int32 *d_n_CTA_done_;
-
-            // The load balancing of the Expand kernel relies on the prefix sum of the degrees 
-            // of the state in the queue (more info in the ExpandKernel implementation) 
-            // That array contains that prefix sum. It is set by the "Preprocess*" kernels
-            // and used by the Expand kernel
-            int32 *d_main_q_degrees_prefix_sum_;
-        
-            // When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
-            // (1) First generate the prefix sum inside each CUDA blocks
-            // (2) then generate the prefix sum of the sums of each CUDA blocks
-            // (3) Use (1) and (2) to generate the global prefix sum
-            // Data from step 1 and 3 is stored in d_main_q_degrees_prefix_sum
-            // Data from step 2 is stored in d_main_q_degrees_block_sums_prefix_sum
-            // Note : this is only used by PreprocessInPlace
-            // PreprocessAndContract uses a trick to compute the global prefix sum in one pass
-            int32 *d_main_q_degrees_block_sums_prefix_sum_;
-
-            // d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
-            // we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
-            // we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
-            int32 *d_main_q_arc_offsets_;
+                // d_state_best_cost[state] -> best cost for that state for the current frame
+                // reset between frames
+                // type int32 to be able to use native atomicMin instruction
+                // we use a 1:1 conversion float <---> sortable int
+                IntegerCostType *d_state_best_cost_;
+            
+                // When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
+                // (1) First generate the prefix sum inside each CUDA blocks
+                // (2) then generate the prefix sum of the sums of each CUDA blocks
+                // (3) Use (1) and (2) to generate the global prefix sum
+                // Data from step 1 and 3 is stored in d_main_q_degrees_prefix_sum
+                // Data from step 2 is stored in d_main_q_degrees_block_sums_prefix_sum
+                // Note : this is only used by PreprocessInPlace
+                // PreprocessAndContract uses a trick to compute the global prefix sum in one pass
+                int32 *d_main_q_degrees_block_sums_prefix_sum_;
 
 
-            // d_state_best_cost[state] -> best cost for that state for the current frame
-            // reset between frames
-            // type int32 to be able to use native atomicMin instruction
-            // we use a 1:1 conversion float <---> sortable int
-            IntegerCostType *d_state_best_cost_;
+                // Some kernels need to perform some operations before exiting
+                // n_CTA_done is a counter that we increment when a CTA (CUDA blocks)
+                // is done
+                // Each CTA then tests the value for n_CTA_done to detect if it's the last to exit
+                // If that's the cast, it does what it has to do, and sets n_CTA_done back to 0
+                int32 n_CTA_done_;
+                int32 aux_q_end_;
+            };
+
+            // 
+            // Parameters used by a decoder channel
+            // Their job is to save the state of the decoding 
+            // channel between frames
+            //
+            struct ChannelParams {
+                // Ordering struct members by size for memory alignment (64bits, then 32bits members)
+
+                // Parts of the main_q that we need to compute next frame
+                // d_main_q_info was sent back to the host, and we don't need
+                // it to compute next frame
+                StateId *d_main_q_state_;
+                CostType *d_main_q_cost_;
+
+                // ExpandArcs does not use at its input the complete main queue
+                // It only reads from the index range [main_q_local_offset, end[
+                int32 *h_main_q_local_offset_; 
+
+                // Contains both main_q_end and narcs
+                // The pointers refer to the same location than the d_main_q_end and d_main_q_narcs pointers,
+                // ie : 
+                // main_q_end = &d_main_q_end_and_narcs->split.ntokens
+                // main_q_narcs = &d_main_q_end_and_narcs->split.narcs
+                // End index of the main queue
+                // only tokens at index i with i < main_q_end 
+                // are valid tokens
+                // Each valid token the subqueue main_q[main_q_offset, main_q_end[ has 
+                // a number of outgoing arcs (out-degree)
+                // main_q_narcs is the sum of those numbers 
+                //
+                // We sometime need to update both end and narcs at the same time,
+                // using an 64 bits atomic, which is why we use an union
+                TokenAndArcCountUnion main_q_end_and_narcs_i2_; 
+
+                // Equivalent in pinned memory
+                int32 *h_main_q_end_;
+                int32 *h_main_q_narcs;
+
+                // After each frame, we copy the main queue (GPU memory)
+                // to the end of h_all_tokens_info (CPU memory)
+                // We only move to the CPU what's needed for the final backtrack in GetBestPath
+                // ie { prev_token, arc_idx } (= struct InfoToken)
+                InfoTokenVector h_all_tokens_info_; 
+
+                // The load balancing of the Expand kernel relies on the prefix sum of the degrees 
+                // of the state in the queue (more info in the ExpandKernel implementation) 
+                // That array contains that prefix sum. It is set by the "Preprocess*" kernels
+                // and used by the Expand kernel
+                int32 *d_main_q_degrees_prefix_sum_;
+
+                // d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
+                // we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
+                // we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
+                int32 *d_main_q_arc_offsets_;
 
 
-            // loglikelihoods computed by the acoustic model
-            // we need it to compute the cost of emitting edges
-            CostType *d_loglikelihoods_;
+                // loglikelihoods computed by the acoustic model
+                // we need it to compute the cost of emitting edges
+                CostType *d_loglikelihoods_;
+
+                // Cutoff for the current frame
+                // Contains both the global min cost (min cost for that frame)
+                // And the current beam
+                // We use an adaptive beam, so the beam might change during computation
+                MinCostAndBeamIntegers global_min_cost_and_beam_;
+
+                // The token at index i in the main queue has in reality 
+                // a global index of (i + main_q_global_offset)
+                // This global index is unique and takes into account that 
+                // we've flushed the main_q back to the host. We need unique indexes 
+                // for each token in order to have valid token.prev_token data members
+                // and be able to backtrack at the end
+                int32 main_q_global_offset_;
+
+                // Equivalent to the corresponding h_* 
+                // members (cf above), but directly in memory
+                int32 main_q_local_offset_;
+
+            };
+
+            // In AdvanceDecoding,
+            // the lane lane_id will compute the channel
+            // with channel_id = channel_to_compute[lane_id]
+            struct GlobalParams {
+                ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
+                int32 nchannels_to_compute;
+
+                int32 q_capacity;
+                CostType infinite_cost;
+                expand_params_.arc_ilabels = fst_.d_arc_ilabels_;
+                expand_params_.arc_weights = fst_.d_arc_weights_; 
+                expand_params_.arc_nextstates = fst_.d_arc_nextstates_; 
+                expand_params_.default_beam = default_beam_;
+            };
+
+            GlobalParams global_params_;
+
+            LaneParams *h_lane_params, *d_lane_params_; 
+            int32 nlanes_;
+            ChannelParams *h_lane_params, *d_channel_params_; 
+            int32 nchannels_;
+
+            // is_channel_busy[i] <=> channel i is currently 
+            // being used by a channel lane
+            std::bitset is_channel_busy;
 
             // CUDA streams
             // kernels are launched in compute_st
@@ -607,11 +687,6 @@ private:
             // we synchronize the two using events
             cudaStream_t compute_st_, copy_st_;
 
-            // Parameters used to launch Expand and Preprocess kernels
-            // We reuse most of the parameters, saving the data structures as class members
-            PreprocessParams preprocess_params_;
-            ExpandArcParams expand_params_;
-            
             // CUDA events
 
             // We need to synchronize the streams copy_st and compute_st
@@ -632,18 +707,21 @@ private:
             // triggered at the end of a frame computation
             cudaEvent_t can_read_final_h_main_q_end_;
 
+            // Buffers for copies on host on the current main_q
+            // Those are only buffers - and must be considered as containing 
+            // uninitialized data
+            // If you need to read from those,
+            // please explicitly copy data from device first !
+            // We use them in "ReachedFinal" for instance
+            StateId *h_main_q_state_; 
+            CostType *h_main_q_cost_; 
+
             // When we generate a new tokens list we only keep candidates 
             // that have a cost < best_cost_in_the_queue + beam
             // At first beam = default_beam_
             // We may decrease that beam if we are generating too many tokens
             // (adaptive beam)
             CostType default_beam_;
-
-            // Cutoff for the current frame
-            // Contains both the global min cost (min cost for that frame)
-            // And the current beam
-            // We use an adaptive beam, so the beam might change during computation
-            MinCostAndBeamIntegers *d_global_min_cost_and_beam_;
 
             int32 max_tokens_;
             int32 max_tokens_per_frame_;
@@ -654,6 +732,26 @@ private:
             // Max possible cost
             // used to init the min_cost and d_state_best_cost_
             CostType infinite_cost_;
+
+            // Pointers directly returned by cudaMalloc in constructor
+            // We used those pointers to set the others
+            // We need to call cudaFree on those in the destructor
+            // Those pointers are only used for that - not during computation
+            StateId *d_all_main_q_state_; 
+            CostType *d_all_main_q_cost_;
+            InfoToken *d_all_main_q_info_;
+
+            StateId *d_all_aux_q_state_; 
+            CostType *d_all_aux_q_cost_;
+            InfoToken *d_all_aux_q_info_;
+
+
+            int32 *d_all_q_degrees_prefix_sum_;
+            int32 *d_all_q_degrees_block_sums_prefix_sum_;
+            int32 *d_all_q_arc_offsets_;
+            int32 *d_all_loglikelihoods_;
+            int32 *h_all_pinned_ints;
+            IntegerCostType *d_all_state_best_cost_;
 
             // Used for debugging purposes
             // only malloc'ed if necessary
