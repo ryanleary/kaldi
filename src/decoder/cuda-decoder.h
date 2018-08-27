@@ -106,6 +106,8 @@ namespace kaldi {
    };
 
 
+   class KernelParams;
+
    //
    // CudaDecoder
    // path-based (one-best) decoder 
@@ -524,7 +526,7 @@ private:
                 // Parts of the main_q that we need to compute next frame
                 // d_main_q_info was sent back to the host, and we don't need
                 // it to compute next frame
-                StateId *d_main_q_state;
+                StateId *d_main_q_state; // TODO PointersPool instead
                 CostType *d_main_q_cost;
 
                 // The load balancing of the Expand kernel relies on the prefix sum of the degrees 
@@ -556,24 +558,7 @@ private:
                 // and be able to backtrack at the end
                 int32 main_q_global_offset;            
              };
-
-            // In AdvanceDecoding,
-            // the lane lane_id will compute the channel
-            // with channel_id = channel_to_compute[lane_id]
-            struct KernelParams {
-                ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
-                int32 nchannels_to_compute;
-
-                int32 q_capacity;
-                CostType infinite_cost;
-                int32 *arc_ilabels;
-                CostType *arc_weights;
-                int32 *arc_nextstates;
-                CostType default_beam;
-                int32 init_channel_id;
-            };
-
-            GlobalParams *h_kernel_params_;
+            KernelParams *h_kernel_params_;
 
             LaneParams *h_lane_params, *d_lane_params_; 
             int32 nlanes_;
@@ -657,7 +642,6 @@ private:
             int32 *d_all_q_degrees_block_sums_prefix_sum_;
             int32 *d_all_q_arc_offsets_;
             int32 *d_all_loglikelihoods_;
-            int32 *h_all_pinned_ints;
             IntegerCostType *d_all_state_best_cost_;
 
             // Used for debugging purposes

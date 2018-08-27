@@ -34,6 +34,43 @@ typedef CudaDecoder::IntegerCostType IntegerCostType;
 typedef CudaDecoder::PreprocessParams PreprocessParams; 
 typedef CudaDecoder::ExpandArcParams ExpandArcParams; 
 
+// In AdvanceDecoding,
+// the lane lane_id will compute the channel
+// with channel_id = channel_to_compute[lane_id]
+struct KernelParams {
+    ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
+    int32 nchannels_to_compute;
+
+    int32 q_capacity;
+    CostType infinite_cost;
+    int32 *arc_ilabels;
+    CostType *arc_weights;
+    int32 *arc_nextstates;
+    CostType default_beam;
+    int32 init_channel_id;
+
+    // TODO Preprocess compiler function
+    StateId *d_all_main_q_state; 
+    __host__ __device__ StateId *d_main_q_state(LaneId lane_id) {
+        return &d_all_main_q_state[lane_id*q_capacity];
+    }
+
+        CostType *d_all_main_q_cost_;
+    InfoToken *d_all_main_q_info_;
+
+
+    StateId *d_all_aux_q_state_; 
+    CostType *d_all_aux_q_cost_;
+    InfoToken *d_all_aux_q_info_;
+
+    int32 *d_all_q_degrees_prefix_sum_;
+    int32 *d_all_q_degrees_block_sums_prefix_sum_;
+    int32 *d_all_q_arc_offsets_;
+    int32 *d_all_loglikelihoods_;
+    IntegerCostType *d_all_state_best_cost_;
+};
+
+
     //
     // Utils device function
     //
@@ -68,55 +105,27 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     // look for the description of CudaDecoder::InitStateBestCostLookup() in cuda-decoder.h
     // Also resets the cutoff to +inf
 
-    // Used before first frame
-    __global__ void _init_state_best_cost_lookup_kernel(int32 state_best_cost_size,
-                                                        CostType default_beam,
-                                                        CostType infinite_cost,
-                                                        IntegerCostType *state_best_cost, 
-                                                        MinCostAndBeamIntegers *d_global_min_cost_and_beam) {
-        // One thread resets the cutoff
-        if(threadIdx.x == 0 && blockIdx.x == 0) {
-            d_global_min_cost_and_beam->min_cost = floatToOrderedInt(infinite_cost);
-            d_global_min_cost_and_beam->beam = floatToOrderedInt(default_beam);
-        }
+    // Used to initialize the lane lookup tables in CudaDecoder's constructor
+    __global__ void _init_state_best_cost_lookup_kernel(KernelParams kernel_params) {
+        LaneParams &lane_params = kernel_params.d_lane_params[blockIdx.z];
         // Reset lookup table
         for(int32 idx = blockIdx.x*blockDim.x + threadIdx.x;
                 idx < state_best_cost_size;
                 idx += blockDim.x*gridDim.x) {
-            state_best_cost[idx]  = floatToOrderedInt(infinite_cost);
+            lane_params.d_state_best_cost[idx] = floatToOrderedInt(kernel_params.infinite_cost);
         }
     }
 
-    void CudaDecoder::InitStateBestCostLookup() {
-        int32 nstates = fst_.NumStates();
-        KALDI_ASSERT(nstates > 0);
-
-        dim3 grid,block;
-        block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
-        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(nstates, block.x);
-
-        _init_state_best_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(nstates, 
-                                                                          default_beam_, 
-                                                                          infinite_cost_,
-                                                                          d_state_best_cost_,
-                                                                          d_global_min_cost_and_beam_);
-    }
-
-    void CudaDecoder::SetChannelsInKernelParams(const std::vector<ChannelId> &channels) {
-        KALDI_ASSERT(channels.size() < n_lanes_);
-        for(LaneId lane_id=0; lane_id<channels.size(); ++lane_id)
-            h_kernel_params_->channel_to_compute[lane_id] = channels[lane_id];
-        h_kernel_params_->nchannels = channels.size();
-    }
-
+    // Called when channels will start decoding a new utterance
+    // do everything that's needed to do on the device to start decoding a new utterance with those channels
     __global__ init_decoding_on_device_kernel_(KernelParams kernel_params) {
         ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
         ChannelParams &params = kernel_params.d_channel_params[channel_id];
         ChannelParams &init_params = kernel_params.d_channel_params[kernel_params.init_channel_id];
 
-        int main_q_end = init_params.final_frame_main_q_end;
+        int init_main_q_end = init_params.final_frame_main_q_end;
         for(int idx = blockDim.x*blockIdx.x + threadIdx.x;
-                idx < main_q_end;
+                idx < init_main_q_end;
                 idx += blockDim.x*gridDim,x) {
             params.d_main_q_state[idx] = init_params.d_main_q_state[idx];
             params.d_main_q_cost[idx] = init_params.d_main_q_cost[idx];
@@ -132,23 +141,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         }
     }
 
+    /*
 
-    // Clones init_channel into all channels in channels
-    void CudaDecoder::InitDecodingOnDevice(const std::vector<ChannelId> &channels) {
-        int main_q_size = h_channel_params_[init_channel_id_].final_frame_main_q_end;
-        dim3 grid,block;
-        block.x = KALDI_CUDA_DECODER_GENERIC_DIMX;
-        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size, block.x);
-        grid.z = channels.size(); 
-
-        // Getting *h_kernel_params ready to use
-        SetChannelsInKernelParams(channels);
-        init_decoding_on_device_kernel_<<<grid,block>>>(*h_kernel_params, channel_id);
-    }
-
-     /*
-     
-     ResetStateBestCostLookupAndFinalizePreprocessInPlace
+       ResetStateBestCostLookupAndFinalizePreprocessInPlace
      Does two things :
      (1) Reset the lookup between frames :
          Using the queue to reset only the values needed
@@ -176,23 +171,23 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
      */
 
-    __global__ void _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place(const StateId *d_main_q_state_, 
-                                                    const int32 *d_main_q_end_, 
-                                                    const int32 *d_local_sums_prefix_sum,  
-                                                    int32 default_beam,
-                                                    CostType infinite_cost,
-                                                    MinCostAndBeamIntegers *d_global_min_cost_and_beam,
-                                                    IntegerCostType *d_state_best_cost, 
-                                                    int32 *d_main_q_degrees_prefix_sum) {
+    __global__ void _finalize_frame_computation(KernelParams kernel_params) {
+        LaneParams &lane_params = kernel_params.d_lane_params[blockIdx.z];
+        ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
+        ChannelParams &channel_params = kernel_params.d_channel_params[channel_id];
+
+        int32 main_q_end = lane_params.main_q_end;
         // One thread resets the cutoff
         if(threadIdx.x == 0 && blockIdx.x == 0) {
-            d_global_min_cost_and_beam->min_cost = floatToOrderedInt(infinite_cost); 
+            lane_params.global_min_cost_and_beam.min_cost = floatToOrderedInt(kernel_params.infinite_cost); 
             // Resetting the beam back to default between frames
             CostType previous_beam = d_global_min_cost_and_beam->beam;
             CostType beam = fmin(default_beam, previous_beam * KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE);
-            d_global_min_cost_and_beam->beam = floatToOrderedInt(beam); 
+            lane_params.global_min_cost_and_beam.beam = floatToOrderedInt(beam); 
+            int32 main_q_narcs = lane_params.main_q_narcs;
+            channel_params.final_frame_main_q_end = main_q_end;
+            channel_params.final_frame_main_q_narcs = main_q_narcs;
         }
-        int32 main_q_end = *d_main_q_end_; 
 
         for(int32 main_q_idx = blockIdx.x*blockDim.x + threadIdx.x;
                 main_q_idx < main_q_end;
@@ -200,32 +195,14 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // d_main_q_state_ contains the list of states that we've considered in the last frame
             // it corresponds to the list of indexes i such as d_state_best_cost[i] < +INF
             // faster than init_state_cost_lookup_kernel by a factor of ~10
-            StateId state = d_main_q_state_[main_q_idx];
-
+            StateId state = channel_params.d_main_q_state_[main_q_idx];
 
             int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-            int32 local_sum_offset = d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
+            int32 local_sum_offset = lane_params.d_local_sums_prefix_sum[local_sum_idx]; // we rely on the caches for this one
 
-            d_state_best_cost[state]  = floatToOrderedInt(infinite_cost);
-            d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
+            lane_params.d_state_best_cost[state]  = floatToOrderedInt(infinite_cost);
+            channel_params.d_main_q_degrees_prefix_sum[main_q_idx] += local_sum_offset;
         }
-    }
-
-    void CudaDecoder::ResetStateBestCostLookupAndFinalizePreprocessInPlace(int32 main_q_size_estimate) {
-        KALDI_ASSERT(main_q_size_estimate > 0);
-
-        dim3 grid,block;
-        block.x = KALDI_CUDA_DECODER_KERNEL_INIT_LOOKUP_DIMX;
-        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size_estimate, block.x);
-
-        _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place<<<grid,block,0,compute_st_>>>(d_main_q_state_, 
-                                                                      d_main_q_end_,
-                                                                      d_main_q_degrees_block_sums_prefix_sum_,   
-                                                                      default_beam_,
-                                                                      infinite_cost_,
-                                                                      d_global_min_cost_and_beam_,
-                                                                      d_state_best_cost_, 
-                                                                      d_main_q_degrees_prefix_sum_);
     }
 
 
@@ -272,7 +249,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     */
 
     // Important : pass the struct PreprocessParams by copy - passing it using a ref will not work (CPU -> GPU)
-    __global__ void _preprocess_and_contract_kernel(PreprocessParams params) {
+    __global__ void _preprocess_and_contract_kernel(KernelParams kernel_params) {
         // Prefix sum operator
         typedef cub::BlockScan<TokenAndArcCount, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
         __shared__ typename BlockScan::TempStorage sh_temp_storage;
@@ -299,11 +276,15 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         // it is used to compute the global prefix sum of degrees in one pass
         //
         __shared__ TokenAndArcCountUnion sh_main_q_global_block_offset;
+        
+        LaneParams &lane_params = kernel_params.d_lane_params[blockIdx.z];
+        ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
+        ChannelParams &channel_params = kernel_params.d_channel_params[channel_id];
 
         // This CTA will start working in aux_q on indexes >= first_block_offset
         // If we have nothing to do, stop here
         int32 first_block_offset = blockDim.x*blockIdx.x;
-        const int32 aux_q_end = *params.d_aux_q_end;
+        const int32 aux_q_end = lane_params.aux_q_end;
 
         // Early exit if all threads in the CTA have nothing to do
         // it does break the finalize_kernel: code below, 
@@ -312,7 +293,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             return;
 
         // Final cutoff from last ExpandArc execution
-        MinCostAndBeamIntegers global_min_cost_and_beam = *params.d_global_min_cost_and_beam;
+        MinCostAndBeamIntegers global_min_cost_and_beam = channel_params.d_global_min_cost_and_beam;
         const CostType cutoff = orderedIntToFloat(global_min_cost_and_beam.min_cost)
                                + orderedIntToFloat(global_min_cost_and_beam.beam);
 
@@ -333,21 +314,20 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             // if aux_q_idx is a valid index in the main_q
             if(aux_q_idx < aux_q_end) {
                 // Cost and state associated with the token
-                token_cost = params.d_aux_q_cost[aux_q_idx];
-                token_state = params.d_aux_q_state[aux_q_idx];
+                token_cost = channel_params.d_aux_q_cost[aux_q_idx];
+                token_state = channel_params.d_aux_q_state[aux_q_idx];
 
                 // Best cost for that token_state
                 // We know we have a token associated with token_state in the queue with the cost state_best_cost
-                CostType state_best_cost = orderedIntToFloat(params.d_state_best_cost[token_state]);
+                CostType state_best_cost = orderedIntToFloat(lane_params.d_state_best_cost[token_state]);
 
                 // Cutoff may have decreased since the creation of the token
                 if(token_cost < cutoff) {
-                    
                     // We can have duplicates, ie token associated with the same states
                     // If this token is not the best candidate, get rid of it
                     if(token_cost == state_best_cost) {
-                        arc_start = params.d_arc_offsets[token_state];
-                        int32 arc_end = params.d_arc_offsets[token_state+1];
+                        arc_start = kernel_params.d_arc_offsets[token_state];
+                        int32 arc_end = kernel_params.d_arc_offsets[token_state+1];
                         degree = arc_end - arc_start;
                     }
                 }
@@ -359,13 +339,11 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 // we need to reset the lookup table now
 
                 if (state_best_cost >= cutoff)
-                    params.d_state_best_cost[token_state] = floatToOrderedInt(params.infinite_cost);
+                    lane_params.d_state_best_cost[token_state] = floatToOrderedInt(params.infinite_cost);
 
             }
 
             int32 is_pruned = (arc_start == -1);
-
-
             TokenAndArcCount block_prefix_sum_token_arc_count;
 
             // We now know which tokens will be moved to the main_q, the remaining will be pruned
@@ -405,7 +383,7 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                 //
                 // We then store the return value, which is the global offset on where to store those tokens,
                 // and the total number of arcs up until that global offset
-                sh_main_q_global_block_offset.both = atomicAdd(&params.d_main_q_end_and_narcs_i2->both, token_and_arc_count_block_sum.both);
+                sh_main_q_global_block_offset.both = atomicAdd(&lane_params.main_q_end_and_narcs_i2.both, token_and_arc_count_block_sum.both);
             }
 
             // Syncing for three reasons :
@@ -415,12 +393,12 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             __syncthreads(); 
 
             // Checking if we are overflowing the main_q
-            if((sh_main_q_global_block_offset.split.ntokens + sh_nsurvival_tokens_in_CTA) >= params.q_capacity) {
+            if((sh_main_q_global_block_offset.split.ntokens + sh_nsurvival_tokens_in_CTA) >= kernel_params.q_capacity) {
                 if(threadIdx.x == (KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX-1)) {
                     // We are overflowing the main_q
                     // We first revert what this CTA has done, ie revert the previous atomicAdd
                     // because all CTAs will revert, we know we will have a valid state after completion of this kernel
-                    atomicAdd(&params.d_main_q_end_and_narcs_i2->both, -token_and_arc_count_block_sum.both); // revert
+                    atomicAdd(&lane_params.main_q_end_and_narcs_i2.both, -token_and_arc_count_block_sum.both); // revert
 
                     // Setting the flag. It will print a warning to stderr
                     *params.h_q_overflow = 1;

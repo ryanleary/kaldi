@@ -95,15 +95,6 @@ namespace kaldi {
         // Setting lanes params
         for(int ilane=0; ilane<n_lanes_; ++ilane) {
             LaneParams params;
-            params.d_aux_q_state = &d_all_aux_q_state_[ilane*one_aux_q_state_size]; 
-            params.d_aux_q_cost = &d_all_aux_q_cost_[ilane*one_aux_q_cost_size]; 
-            params.d_aux_q_info = &d_all_aux_q_info_[ilane*one_aux_q_info_size]; 
-            params.d_main_q_info = &d_all_main_q_info_[ilane*one_main_q_info_size]; 
-            params.d_state_best_cost = &d_all_state_best_cost_[ilane*one_state_best_cost_size]; 
-            params.d_loglikelihoods = &d_all_loglikelihoods_[ichannel*one_loglikelihoods]; 
-
-            params.d_main_q_degrees_block_sums_prefix_sum_ = 
-                &d_all_main_q_degrees_block_sums_prefix_sum_[ilane*one_main_q_degrees_block_sums_prefix_sum_size];
             params.main_q_end_and_narcs.split.ntokens = 0;
             params.main_q_end_and_narcs.split.narcs = 0;
             params.n_CTA_done_ = 0;
@@ -117,11 +108,7 @@ namespace kaldi {
         // Setting channels params
         for(int ichannel=0; ichannel<n_channels_; ++ichannel) {
             ChannelParams params;
-            params.d_main_q_state = &d_all_main_q_state_[ichannel*one_main_q_state_size]; 
-            params.d_main_q_cost = &d_all_main_q_cost_[ichannel*one_main_q_state_size]; 
-            params.d_main_q_arc_offsets = &d_all_main_q_arc_offsets_[ichannel*one_main_q_arc_offsets]; 
-            params.d_main_q_degrees_prefix_sum =
-                &d_all_main_q_degrees_prefix_sum_[ichannel*one_main_q_degrees_prefix_sum]; 
+            // TODO init beam and min_cost (integer format)
             h_channel_params[ichannel] = params;
         }
         
@@ -172,8 +159,13 @@ namespace kaldi {
         num_frames_decoded_.resize(n_channels_);
 
         // Filling all best_state_cost with +INF
-        for(int ilane=0; ilane<n_lanes_; ++ilane)
-            InitStateBestCostLookup(lane_id);
+        dim3 grid,block;
+        int32 nstates = fst_.NumStates();
+        KALDI_ASSERT(nstates > 0);
+        block.x = KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX;
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(nstates, block.x);
+        grid.z = n_lanes_;
+        _init_state_best_cost_lookup_kernel<<<grid,block,0,compute_st_>>>(*kernel_params);
 
         // Making sure that everything is ready to use
         cudaStreamSynchronize(compute_st_);
@@ -288,7 +280,20 @@ namespace kaldi {
 
     void CudaDecoder::InitDecoding(const std::vector<ChannelId> &channels) {
         KALDI_ASSERT(channels.size() < n_lanes_);
-        InitDecodingOnDevice(channels);
+
+        // Size of the initial main_q_size
+        int init_main_q_size = h_channel_params_[init_channel_id_].final_frame_main_q_end;
+        dim3 grid,block;
+        block.x = KALDI_CUDA_DECODER_GENERIC_DIMX;
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(init_main_q_size, block.x);
+        grid.z = channels.size(); 
+
+        // Getting *h_kernel_params ready to use
+        SetChannelsInKernelParams(channels);
+
+        // Initializing the main_q_end and everything else needed
+        // to get the channels ready to compute new utterances
+        init_decoding_on_device_kernel_<<<grid,block>>>(*h_kernel_params);
 
         // Tokens from initial main_q needed on host
         for(ChannelId channel_id : channels)
@@ -501,11 +506,9 @@ namespace kaldi {
             // (preprocess in place is the last one to use the state_best_cost lookup)
             grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(max_main_q_end_estimate, block.x);
             block.x = KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX;
-            _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(preprocess_params_);
-
+            _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(*kernel_params);
             // Resetting the lookup table for the next frame + FinalizePreprocessInPlace
-            // TODO saves the final_ in there
-            _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place<<<grid,block>>>(*kernel_params);
+            _finalize_frame_computation<<<grid,block>>>(*kernel_params);
 
             // Moving back to host the final (for this frame) values of :
             // - main_q_end
@@ -814,4 +817,10 @@ namespace kaldi {
             KALDI_ASSERT(h_state_best_cost[i] == float_inf_as_int);
     }
 
+    void CudaDecoder::SetChannelsInKernelParams(const std::vector<ChannelId> &channels) {
+        KALDI_ASSERT(channels.size() < n_lanes_);
+        for(LaneId lane_id=0; lane_id<channels.size(); ++lane_id)
+            h_kernel_params_->channel_to_compute[lane_id] = channels[lane_id];
+        h_kernel_params_->nchannels = channels.size();
+    }
 } // end namespace kaldi.
