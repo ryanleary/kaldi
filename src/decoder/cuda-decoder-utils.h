@@ -78,7 +78,7 @@ namespace kaldi {
             // Use e_offsets or ne_offsets depending on what you need (emitting/nonemitting)
             // The ilabels arrays are of size e_count_, not arc_count_
 
-            BaseFloat *h_arc_weights_, *d_arc_weights_;
+            BaseFloat *h_arc_weights_, *d_arc_weights_; // TODO define CostType here
             StateId *h_arc_nextstates_, *d_arc_nextstates_;
             int32 *h_arc_ilabels_, *d_arc_ilabels_;
             int32 *h_arc_olabels_;
@@ -103,16 +103,17 @@ namespace kaldi {
     // back to the CPU memory
     //
     class InfoTokenVector {
-        size_t capacity_, size_;
+        int32 capacity_, size_;
         // Stream used for the async copies device->host
         cudaStream_t copy_st_;
         InfoToken *h_data_;
 
         public:
-        InfoTokenVector(int initial_capacity);
+        InfoTokenVector(int initial_capacity, cudaStream_t copy_st_);
+        void Clone(const InfoTokenVector &other);
         void Reset();
-        void SetCudaStream(cudaStream_t st);
         void CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count);    
+        int32 Size() { return size_ };
         void Reserve(size_t min_capacity);    
         InfoToken *GetRawPointer() const;
         virtual ~InfoTokenVector();

@@ -102,7 +102,50 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
                                                                           d_global_min_cost_and_beam_);
     }
 
-        
+    void CudaDecoder::SetChannelsInKernelParams(const std::vector<ChannelId> &channels) {
+        KALDI_ASSERT(channels.size() < n_lanes_);
+        for(LaneId lane_id=0; lane_id<channels.size(); ++lane_id)
+            h_kernel_params_->channel_to_compute[lane_id] = channels[lane_id];
+        h_kernel_params_->nchannels = channels.size();
+    }
+
+    __global__ init_decoding_on_device_kernel_(KernelParams kernel_params) {
+        ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
+        ChannelParams &params = kernel_params.d_channel_params[channel_id];
+        ChannelParams &init_params = kernel_params.d_channel_params[kernel_params.init_channel_id];
+
+        int main_q_end = init_params.final_frame_main_q_end;
+        for(int idx = blockDim.x*blockIdx.x + threadIdx.x;
+                idx < main_q_end;
+                idx += blockDim.x*gridDim,x) {
+            params.d_main_q_state[idx] = init_params.d_main_q_state[idx];
+            params.d_main_q_cost[idx] = init_params.d_main_q_cost[idx];
+            params.d_main_q_degrees_prefix_sum[idx] = init_params.d_main_q_degrees_prefix_sum[idx];
+            params.d_main_q_arc_offset[idx] = init_params.d_main_q_arc_offset[idx];
+        }
+
+        if(threadIdx.x == 0 && blockIdx.x == 0) {
+            params.final_frame_main_q_end  = main_q_end;
+            params.final_frame_main_q_narcs = init_params.final_frame_main_q_narcs;
+            params.global_min_cost_and_beam.min_cost = kernel_params.infinite_cost;
+            params.global_min_cost_and_beam.beam = kernel_params.default_beam;
+        }
+    }
+
+
+    // Clones init_channel into all channels in channels
+    void CudaDecoder::InitDecodingOnDevice(const std::vector<ChannelId> &channels) {
+        int main_q_size = h_channel_params_[init_channel_id_].final_frame_main_q_end;
+        dim3 grid,block;
+        block.x = KALDI_CUDA_DECODER_GENERIC_DIMX;
+        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size, block.x);
+        grid.z = channels.size(); 
+
+        // Getting *h_kernel_params ready to use
+        SetChannelsInKernelParams(channels);
+        init_decoding_on_device_kernel_<<<grid,block>>>(*h_kernel_params, channel_id);
+    }
+
      /*
      
      ResetStateBestCostLookupAndFinalizePreprocessInPlace
@@ -1249,12 +1292,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             __shared__ typename BlockScanInt::TempStorage sh_temp_storage_scan_int;
 
             int32 total_narcs = *params.d_main_q_narcs;
-
-            // We launch the kernel before knowing the value of total_narcs
-            // if it was too early, we exit and the host will relaunch heavy load
-            // non emitting kernels (using Preprocess and ExpandArc kernels)
-            if(total_narcs >= KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) 
-                return;
 
             int32 main_q_offset = *params.d_main_q_local_offset;
             int32 main_q_end = *params.d_main_q_end;
