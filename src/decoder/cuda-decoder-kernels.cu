@@ -504,22 +504,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
     }
 
 
-    void CudaDecoder::PreprocessAndContract(int32 aux_q_size_estimate) {
-        dim3 grid,block;
-
-        KALDI_ASSERT(aux_q_size_estimate > 0);
-
-        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(aux_q_size_estimate, block.x);
-
-        // PreprocessAndContract is called when non emitting
-        // using non emitting offsets
-        preprocess_params_.d_arc_offsets = fst_.d_ne_offsets_;
-        _preprocess_and_contract_kernel<<<grid,block,0,compute_st_>>>(preprocess_params_);
-    }
-
-
-
 /*
     PreprocessInPlace
     This kernel is also a preprocessing kernel, but this time does it in place
@@ -738,21 +722,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             }
         }
     }
-
-
-    void CudaDecoder::PreprocessInPlace(int32 main_q_size_estimate) {
-        dim3 grid,block;
-        block.x = KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
-
-        KALDI_ASSERT(main_q_size_estimate > 0);
-        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_size_estimate, block.x);
-
-        // PreprocessInPlace is called when emitting
-        // using emitting arc offsets
-        preprocess_params_.d_arc_offsets = fst_.d_e_offsets_;
-        _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(preprocess_params_);
-    }
-
 
 
    //
@@ -1203,47 +1172,44 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
 
             // If we're the last CTA to exit - detect it
             if(old == (total_active_CTAs -1)) {
-                __threadfence(); // we want last value of d_aux_q_end
-
-                // h_* pointers are in pinned memory, we can update them from the GPU
-                *params.h_aux_q_end = *params.d_aux_q_end;
-                *params.d_main_q_narcs = 0;
-                *params.h_main_q_narcs = 0;
-                *params.d_n_CTA_done = 0; 
-
-                if(params.is_emitting) {
-                    // It was the last time that we were using tokens in the main_q
-                    // flushing it now
-                    *params.d_main_q_end = 0;
-                    *params.h_main_q_end = 0;
-                } else {
-                    // Tokens processed in that nonemitting iteration will be ignored in the next iteration
-                    *params.d_main_q_local_offset = main_q_end;
-                    *params.h_main_q_local_offset = main_q_end;
-                }
-
             }
         }
 
     }
 
-    void CudaDecoder::ExpandArcs(bool is_emitting, int32 main_q_narcs_estimate) {
-        dim3 grid,block;
+    __global__ initialize_lanes_with_channels_(KernelParams kernel_params) {
+        LaneParams &lane_params = kernel_params.d_lane_params[blockIdx.z];
+        ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
+        ChannelParams &channel_params = kernel_params.d_channel_params[channel_id];
 
-        KALDI_ASSERT(main_q_narcs_estimate > 0);
-
-        block.x = KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX;
-        grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_narcs_estimate, block.x);
-
-        // The two members of params we need to update
-        expand_params_.main_q_global_offset = main_q_global_offset_;
-        expand_params_.is_emitting = is_emitting;
-            
-        _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(expand_params_);
+        // Getting the lane ready for that channel
+        lane_params.main_q_end = channel_params.final_frame_main_q_end;
+        lane_params.main_q_narcs = channel_params.final_frame_main_q_narcs;
     }
 
+    __global__ post_expand_emitting_(KernelParams kernel_params) {
+        LaneParams &lane_params = kernel_params.d_lane_params[blockIdx.z];
+        ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
+        ChannelParams &channel_params = kernel_params.d_channel_params[channel_id];
+        // main_q_end contains the tokens from the previous frame
+        // after emitting, we won't use them anymore to create new tokens
+        // we reset the main_q, making space for tokens from this current frame
+        lane_params.main_q_end = 0;
+        lane_params.main_q_narcs = 0;
+        lane_params.pre_expand_main_q_end = 0;
+        channel_params.main_q_global_offset += channel_params.final_frame_main_q_end;
+    }
 
-
+    __global__ post_expand_non_emitting_(KernelParams kernel_params) {
+        LaneParams &lane_params = kernel_params.d_lane_params[blockIdx.z];
+        ChannelId channel_id = kernel_params.channel_to_compute[blockIdx.z];
+        ChannelParams &channel_params = kernel_params.d_channel_params[channel_id];
+        // Resetting narcs, we are done processing those arcs
+        lane_params.main_q_narcs = 0;
+        // Done processing tokens [offset, end[. Moving the offset
+        lane_params.main_q_local_offset += lane_params.pre_expand_main_q_end;
+        lane_params.pre_expand_main_q_end = lane_params.main_q_end;
+    }
     /*
         
        FinalizeProcessNonemitting
@@ -1480,11 +1446,9 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
             if(threadIdx.x == 0) {
                 // Next step is ProcessEmitting of next frame, from is currToken_offset
                 *params.d_main_q_end = main_q_end; 
-                *params.h_main_q_end = main_q_end; 
-
                 *params.d_main_q_local_offset = 0; 
-                *params.h_main_q_local_offset = 0; 
 
+                // TODO update global_offset
                 // No need to update the cutoff - maybe the beam
                 //*params.d_cutoff = floatToOrderedInt(sh_cutoff);
             }
@@ -1499,7 +1463,6 @@ typedef CudaDecoder::ExpandArcParams ExpandArcParams;
         expand_params_.main_q_global_offset = main_q_global_offset_;
         expand_params_.is_emitting = false;
 
-        _finalize_process_non_emitting<<<grid,block,0,compute_st_>>>(fst_.d_ne_offsets_, expand_params_);
     }
 
 

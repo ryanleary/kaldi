@@ -296,11 +296,12 @@ namespace kaldi {
     }
 
     void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
-            int32 max_num_frames) {
+                                      const std::vector<ChannelId> &channels,
+                                      int32 max_num_frames) {
         KALDI_ASSERT(num_frames_decoded_ >= 0 &&
                 "You must call InitDecoding() before AdvanceDecoding()");
+        
         int32 num_frames_ready = decodable->NumFramesReady();
-
         // num_frames_ready must be >= num_frames_decoded, or else
         // the number of frames ready must have decreased (which doesn't
         // make sense) or the decodable object changed between calls
@@ -312,14 +313,35 @@ namespace kaldi {
             target_frames_decoded = std::min(target_frames_decoded,
                     num_frames_decoded_ + max_num_frames);
 
+        int32 n_lanes_used = channels.size();
+        // We can process at most n_lanes_ channels at the same time
+        KALDI_ASSERT(n_lanes_used < n_lanes_);
+
+        // Setting up the  *kernel_params
+        SetChannelsInKernelParams(channels);
+        dim3 grid,block;
+        block.x = 1;
+        grid.x = 1;
+        grid.z = n_lanes_used;
+        // Getting the lanes ready to work with those channels  
+        initialize_lanes_with_channels_<<<grid,block>>>(*kernel_params);
+
         // Loglikelihoods from the acoustic model
+        // FIXME for now we duplicate the loglikelihoods 
+        // to all channels for perf. measurement. 
+        // We must decide which design to adopt
         ComputeLogLikelihoods(decodable);
 
-        int32 prev_main_q_size = *h_main_q_end_;
         nvtxRangePushA("Decoding");
+        
+        int32 max_main_q_narcs = 0;
+        // Looking for the channel with max numbers of arcs
+        for(ChannelId channel_id : channels)
+            max_main_q_narcs = std::max(max_main_q_narcs, h_channel_params_[channel_id].frame_final_main_q_narcs);
+
         while (num_frames_decoded_ < target_frames_decoded) {
             // Computing a new frame
-        
+
             // ProcessEmitting 
             // 
             // Before executing ProcessEmitting, we have :
@@ -343,22 +365,37 @@ namespace kaldi {
             // with the previous frame (i-1). Using d_main_q_state and the emitting arcs from the FST graph,
             // we create a new tokens queue, which will be stored in the aux_q
 
-            cudaEventSynchronize(can_read_h_main_q_narcs_);
-            int32 main_q_n_e_arcs = *h_main_q_narcs_;
+            grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(max_main_q_narcs, block.x);
+            block.x = KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX;
 
-            if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 1)
-                DebugAssertsNewFrame();
+            // Process emitting, expanding arcs
+            _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(*kernel_params_, true);
 
-            if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
-                DebugAssertsBeforeExpand(true);
+            // Post emitting phase. Resets the main_q.
+            grid.x = 1; 
+            block.x = 1;
+            _post_expand_emitting<<<grid,block,0,compute_st_>>>(*kernel_params);
 
-            ExpandArcs(true, main_q_n_e_arcs);
+            // Updating the global_offsets on host
+            for(ChannelId channel_id : channels) {
+                h_channel_params_[channel_id].main_q_global_offset +=
+                    h_channel_params_[channel_id].final_frame_main_q_end;
+            }
+
+            // Moving the lanes_params to host,
+            // to have the aux_q_end values
+            cudaMemcpyAsync(h_lanes_params,     
+                    d_lanes_params, 
+                    n_lanes_*sizeof(LaneParams), 
+                    cudaMemcpyDeviceToHost,
+                    compute_st_);
+
+            cudaStreamSynchronize(compute_st_);
 
             // Loglikelihoods from the acoustic model
             // We are done using loglikelihoods for current frame
             // Launching kernel for next frame now if there is one
-            
-            nvtxRangePop();
+            nvtxRangePop(); // Decoding
             if ((num_frames_decoded_+1) < target_frames_decoded) 
                 ComputeLogLikelihoods(decodable);
             nvtxRangePushA("Decoding");
@@ -373,8 +410,6 @@ namespace kaldi {
             // the global offset takes into account all tokens that have been moved
             // to the host memory
 
-            main_q_global_offset_ += prev_main_q_size;
-            
             // ProcessNonemitting
             //
             // Processing non emitting arcs
@@ -398,80 +433,114 @@ namespace kaldi {
             // for next kernels on compute_st_ 
             cudaStreamWaitEvent(compute_st_, can_write_to_main_q_, 0);
 
-            // Using that value as estimate for how many threads to launch
-            int main_q_size_narcs_estimate = main_q_n_e_arcs;
-
+            int32 max_aux_q_end = 0;
             bool finalize_nonemitting_was_executed = false;
-            PreprocessAndContract(main_q_size_narcs_estimate);
-            bool first_attempt = true;
-            while(!finalize_nonemitting_was_executed) {
-                // We push to the pipeline a fixed number of NonEmitting iterations
-                // If that's not enough, we'll detect it and push some more
-                int32 to_launch = first_attempt 
-                                  ? KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_FIRST
-                                  : KALDI_CUDA_DECODER_NONEM_NEXPAND_PIPELINE_RELAUNCH;
-
-                for(int32 i=0; i<to_launch; ++i) {
-                    if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0)
-                        DebugAssertsBeforeExpand(false);
-
-                    ExpandArcs(false, main_q_size_narcs_estimate);
-                    PreprocessAndContract(main_q_size_narcs_estimate);
+            while(true) {
+                for(LaneId lane_id=0; lane_id < n_lane_used; ++lane_id) {
+                    int32 aux_q_end = h_lane_params[lane_id].aux_q_end;
+                    max_aux_q_end = std::max(max_aux_q_end, aux_q_end);
                 }
 
-                cudaEventRecord(before_finalize_nonemitting_kernel_, compute_st_);
-                // Try to compute the final iterations of NonEmitting
-                // if too many arcs still need to be processed,
-                // this kernel stops and we'll run more "heavy load" iterations
-                FinalizeProcessNonemitting(); 
-               
-                cudaEventSynchronize(before_finalize_nonemitting_kernel_);
+                grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(max_aux_q_end, block.x);
+                block.x = KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX;
+                _preprocess_and_contract_kernel<<<grid,block,0,compute_st_>>>(*kernel_params);
 
-                // If the number of arcs was above that value, 
-                // the finalize nonemitting kernel killed itself 
-                // and we must relaunch heavy load kernels (ExpandArcs)
-                int main_q_narcs = *h_main_q_narcs_;
-                finalize_nonemitting_was_executed = (main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS);
-                first_attempt = false;
+                // Moving the lanes_params to host,
+                // to have the main_q_narcs values
+                cudaMemcpyAsync(h_lanes_params,     
+                        d_lanes_params, 
+                        n_lanes_*sizeof(LaneParams), 
+                        cudaMemcpyDeviceToHost,
+                        compute_st_);
+
+                cudaStreamSynchronize(compute_st_);
+
+                for(LaneId lane_id=0; lane_id < n_lane_used; ++lane_id) {
+                    int32 main_q_narcs = h_lane_params[lane_id].main_q_narcs;
+                    max_main_q_narcs = std::max(max_aux_q_end, main_q_narcs);
+                }
+            
+                // If we have only a few arcs, jumping to the one-CTA per channel persistent version
+                if(max_main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS)
+                    break;
+
+                grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(max_main_q_narcs, block.x);
+                block.x = KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX;
+                _expand_arcs_kernel<<<grid,block,0,compute_st_>>>(*kernel_params_, true);
+                grid.x = 1; 
+                block.x = 1;
+                _post_expand_nonemitting<<<grid,block,0,compute_st_>>>(*kernel_params);
+
+                // Moving the lanes_params to host,
+                // to have the aux_q_end values
+                cudaMemcpyAsync(h_lanes_params,     
+                        d_lanes_params, 
+                        n_lanes_*sizeof(LaneParams), 
+                        cudaMemcpyDeviceToHost,
+                        compute_st_);
+
+                cudaStreamSynchronize(compute_st_);
+
             }
 
-            // The final h_main_q_end_ for this frame is written in finalize nonemitting
-            cudaEventRecord(can_read_final_h_main_q_end_, compute_st_);
+            grid.x = 1;
+            block.x = KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX;
+            _finalize_process_non_emitting<<<grid,block,0,compute_st_>>>(*kernel_params);
 
+            // No need to wait for the final main_q_end after FinalizeProcessNonEmitting,
+            // it won't change much. Using the current value
+            int32 max_main_q_end_estimate = 0;
+            for(ChannelId channel_id : channels) {
+                max_main_q_end_estimate = std::max(max_main_q_end_estimate,
+                        h_lane_params_[channel_id].main_q_narcs);
+            }
 
-            // Before FinalizeProcessNonEmitting most of the main_q has been built
-            // We use value of main_q_end before this kernel as an estimate,
-            // Note : This is not an upper bound, FinalizeProcessNonEmitting can generates
-            // more than KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS tokens
-            int main_q_size_estimate = *h_main_q_end_before_finalize_nonemitting_kernel_
-                                        + KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS;
-            
             // PreprocessInPlace for next ProcessEmitting
-            // We do it here (and not at the beginning of the loop) for two reasons :
-            // - We can pipeline it in the CUDA queue
-            // - The lookup table is back to its original state (full of +INF) at 
-            //   the end of each frame. We can possibly share it between decoders
-            //   (not implemented yet)
-            PreprocessInPlace(main_q_size_estimate);
-            cudaEventRecord(can_read_h_main_q_narcs_, compute_st_);
+            // We do it here (and not at the beginning of the loop) to 
+            // return the lane back to its original state after this frame computation
+            // (preprocess in place is the last one to use the state_best_cost lookup)
+            grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(max_main_q_end_estimate, block.x);
+            block.x = KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX;
+            _preprocess_in_place_kernel<<<grid,block,0,compute_st_>>>(preprocess_params_);
 
             // Resetting the lookup table for the next frame + FinalizePreprocessInPlace
-            ResetStateBestCostLookupAndFinalizePreprocessInPlace(main_q_size_estimate);
- 
-            // We need the exact value of h_main_q_end_ for the copy to host
-            cudaEventSynchronize(can_read_final_h_main_q_end_);
-            prev_main_q_size = *h_main_q_end_;
-            
-            // We are done with the current frame
-            // We copy back its  tokens to the host
-            // We only copy the "info" part (arc_idx + prev_token)
-            // because we don't need anything else for the final backtrack
-            h_all_tokens_info_.CopyFromDevice(main_q_global_offset_, d_main_q_info_, prev_main_q_size);
+            // TODO saves the final_ in there
+            _reset_state_cost_lookup_kernel_and_finalize_preprocess_in_place<<<grid,block>>>(*kernel_params);
+
+            // Moving back to host the final (for this frame) values of :
+            // - main_q_end
+            // - main_q_narcs
+            cudaMemcpyAsync(h_lanes_params,     
+                    d_lanes_params, 
+                    n_lanes_*sizeof(LaneParams), 
+                    cudaMemcpyDeviceToHost,
+                    compute_st_);
+
+            cudaStreamSynchronize(compute_st_);
+
+            for(LaneId lane_id=0; lane_id < n_lane_used; ++lane_id) {
+                int32 main_q_end = h_lane_params[lane_id].main_q_end;
+                int32 main_q_narcs = h_lane_params[lane_id].main_q_narcs;
+                ChannelId channel_id = channels[lane_id];
+                h_channel_params[channel_id].final_frame_main_q_end = main_q_end;
+                h_channel_params[channel_id].final_frame_main_q_narcs = main_q_narcs;
+                // Computing for next iteration of current while loop
+                max_main_q_narcs = std::max(max_main_q_narcs, main_q_narcs);
+                // We are done with the current frame
+                // We copy back its  tokens to the host
+                // We only copy the "info" part (arc_idx + prev_token)
+                // because we don't need anything else for the final backtrack
+                // TODO buffer on device
+                h_all_tokens_info_[channel_id].CopyFromDevice(h_lane_params[lane_id].d_main_q_info, main_q_end);
+                num_frames_decoded_[channel_id]++; 
+            }
+
+            // We cannot write to the lanes.d_main_q_info 
+            // until the copy is done
             cudaEventRecord(can_write_to_main_q_, copy_st_);
             
             CheckOverflow();
             KALDI_DECODER_CUDA_CHECK_ERROR();
-            num_frames_decoded_++; 
         }   
     
         nvtxRangePop();
