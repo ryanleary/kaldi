@@ -28,6 +28,22 @@
     }                                                                 \
 } while(0);
 
+#define KALDI_CUDA_DECODER_1D_KERNEL_LOOP(i, n)                      \
+	for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
+			i += blockDim.x * gridDim.x)
+
+#define KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(offset, th_idx, n)         \
+	for (int offset = blockIdx.x * blockDim.x, th_idx = threadIdx.x; offset < (n);     \
+			offset += blockDim.x * gridDim.x)
+
+#define IS_LAST_1D_THREAD() \
+	(threadIdx.x == (blockDim.x-1))
+
+#define KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(i, n)                   \
+	for (int i = blockIdx.y; i < (n);  i += gridDim.y)                     
+
+
+
 #include "util/stl-utils.h"
 #include "fst/fstlib.h"
 
@@ -119,6 +135,29 @@ namespace kaldi {
         virtual ~InfoTokenVector();
     };
 
+    template<typename T>
+	    class DeviceMatrix {
+		    T *data_;	
+		    // TODO ideally we'd want ld_ to be templated, 
+		    // and be a power of 2, to avoid having a lot of int multiplication
+		    int ld_;	 // leading dimension
+		    public:
+		    DeviceMatrix(int nrows, int ld) : ld_(ld) {
+			    cudaMalloc(&data, nrows*ld*sizeof(*data));
+		    }
+
+		    virtual ~DeviceMatrix() {
+			    cudaFree(data);
+		    }
+
+		    __host__ __device__ T *row(int r) {
+			    return &data[r*ld];
+		    }
+
+		    __host__ __device__ T *data() {
+			    return data_;
+		    }
+	    };
 } // end namespace kaldi
 
 #endif
