@@ -442,10 +442,6 @@ namespace kaldi {
 			//
 			struct LaneCounters {
 				// Contains both main_q_end and narcs
-				// The pointers refer to the same location than the d_main_q_end and d_main_q_narcs pointers,
-				// ie : 
-				// main_q_end = &d_main_q_end_and_narcs->split.ntokens
-				// main_q_narcs = &d_main_q_end_and_narcs->split.narcs
 				// End index of the main queue
 				// only tokens at index i with i < main_q_end 
 				// are valid tokens
@@ -462,7 +458,6 @@ namespace kaldi {
 				// is done
 				// Each CTA then tests the value for n_CTA_done to detect if it's the last to exit
 				// If that's the cast, it does what it has to do, and sets n_CTA_done back to 0
-				int32 n_CTA_done;
 				int32 aux_q_end;
 
 				// Depending on the value of the parameter "max_tokens_per_frame"
@@ -475,16 +470,14 @@ namespace kaldi {
 				// We use that flag to display a warning to stderr
 				int32 q_overflow;
 
-				int32 post_expand_aux_q_end;
-
 				// ExpandArcs does not use at its input the complete main queue
 				// It only reads from the index range [main_q_local_offset, end[
 				int32 main_q_local_offset;
 				int32 main_q_global_offset;            
 
-				IntegerCostType int_min_cost;
+				IntegerCostType min_int_cost;
 				IntegerCostType int_beam;
-				IntegerCostType int_cutoff; // min_cost + beam
+				IntegerCostType int_cutoff; // min_cost + beam (if min_cost < INF, otherwise INF)
 			};
 
 			// 
@@ -497,11 +490,10 @@ namespace kaldi {
 				// Contains both the global min cost (min cost for that frame)
 				// And the current beam
 				// We use an adaptive beam, so the beam might change during computation
-				CostType beam;
+				CostType prev_beam;
 
-				// main_q_end and main_q_narcs at the end of the frame 
-				int32 frame_final_main_q_end;
-				int32 frame_final_main_q_narcs;
+				// main_q_end and main_q_narcs at the end of the previous frame
+				int2 prev_main_q_narcs_and_end;
 
 				// The token at index i in the main queue has in reality 
 				// a global index of (i + main_q_global_offset)
@@ -509,7 +501,7 @@ namespace kaldi {
 				// we've flushed the main_q back to the host. We need unique indexes 
 				// for each token in order to have valid token.prev_token data members
 				// and be able to backtrack at the end
-				int32 main_q_global_offset;            
+				int32 prev_main_q_global_offset;            
 			};
 			KernelParams *h_kernel_params_;
 
@@ -553,7 +545,9 @@ namespace kaldi {
 					d_loglikelihoods(nchannels, nilabels),
 					d_state_best_cost(nlanes, num_states),
 					q_capacity(max_tokens_per_frame) {}
-
+				// In AdvanceDecoding,
+				// the lane lane_id will compute the channel
+				// with channel_id = channel_to_compute[lane_id]
 				ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
 				int32 nchannels_to_compute;
 
@@ -674,10 +668,6 @@ namespace kaldi {
 
 			// Keep track of the number of frames decoded in the current file.
 			std::vector<int32> num_frames_decoded_;
-
-			// Max possible cost
-			// used to init the min_cost and d_state_best_cost_
-			CostType infinite_cost_;
 
 			// Used for debugging purposes
 			// only malloc'ed if necessary

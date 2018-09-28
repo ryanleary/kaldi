@@ -36,7 +36,7 @@
 	for (int offset = blockIdx.x * blockDim.x, th_idx = threadIdx.x; offset < (n);     \
 			offset += blockDim.x * gridDim.x)
 
-#define IS_LAST_1D_THREAD() \
+#define KALDI_CUDA_DECODER_IS_LAST_1D_THREAD() \
 	(threadIdx.x == (blockDim.x-1))
 
 #define KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(i, n)                   \
@@ -136,10 +136,9 @@ namespace kaldi {
     };
 
     template<typename T>
+	    // if necessary, make a version that always use ld_ as the next power of 2
 	    class DeviceMatrix {
 		    T *data_;	
-		    // TODO ideally we'd want ld_ to be templated, 
-		    // and be a power of 2, to avoid having a lot of int multiplication
 		    int ld_;	 // leading dimension
 		    public:
 		    DeviceMatrix(int nrows, int ld) : ld_(ld) {
