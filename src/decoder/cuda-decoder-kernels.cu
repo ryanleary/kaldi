@@ -279,7 +279,7 @@ namespace kaldi {
 					// Saving the global prefix sum
 					// = (narcs until now in the main queue) + (narcs until this thread in the CTA)
 					params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx] = sh_main_q_global_block_offset.split.narcs 
-						+ block_prefix_sum_token_arc_count.narcs;
+						+ block_prefix_sum_token_arc_count.narcs; // TODO detect if last, write to lane_counters
 					// Saving the CSR arc offset for that token's state
 					// it will be used by the expand kernel, and avoid doing a new random memory access in the expand kernel
 					params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx] = arc_start;
@@ -323,10 +323,6 @@ finalize_kernel:
 		// Operator for the prefix sum inside the CUDA block
 		typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
-
-		// All threads in the last CUDA block (CTA) alive will have work to do at the end
-		// this bool will be needed to broadcast the information from thread0 to all threads in the last CTA 
-		__shared__ bool sh_is_last_CTA;
 
 		const int nlanes = params.nchannels_to_compute;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
