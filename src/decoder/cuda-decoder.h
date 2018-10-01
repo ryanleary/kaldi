@@ -106,8 +106,6 @@ namespace kaldi {
 	};
 
 
-	class KernelParams;
-
 	//
 	// CudaDecoder
 	// path-based (one-best) decoder 
@@ -157,7 +155,7 @@ namespace kaldi {
 					int32 max_num_frames = -1);
 
 			/// Returns the number of frames already decoded.  
-			int32 NumFramesDecoded() const { return num_frames_decoded_; }
+			int32 NumFramesDecoded(ChannelId ichannel) const;
 
 			// ReachedFinal returns true if the last frame's token queue 
 			// contains at least one token associated with a final state
@@ -335,6 +333,8 @@ namespace kaldi {
 
 			void PreprocessInPlace(int32 main_q_size_estimate);
 
+			void LoadChannelsStatesToLanesCPU();
+			void SaveChannelsStatesFromLanesCPU();
 
 			//
 			// FinalizeProcessNonemitting
@@ -440,6 +440,7 @@ namespace kaldi {
 			// is back to its original state
 			// We can reuse it for another frame/channel without doing anything
 			//
+			public: // TODO
 			struct LaneCounters {
 				// Contains both main_q_end and narcs
 				// End index of the main queue
@@ -459,6 +460,7 @@ namespace kaldi {
 				// Each CTA then tests the value for n_CTA_done to detect if it's the last to exit
 				// If that's the cast, it does what it has to do, and sets n_CTA_done back to 0
 				int32 aux_q_end;
+				int32 post_expand_aux_q_end; // used for double buffering
 
 				// Depending on the value of the parameter "max_tokens_per_frame"
 				// we can end up with an overflow when generating the tokens for a frame
@@ -503,27 +505,54 @@ namespace kaldi {
 				// and be able to backtrack at the end
 				int32 prev_main_q_global_offset;            
 			};
-			KernelParams *h_kernel_params_;
 
-			std::vector<ChannelCounters> h_lane_params; 
-			std::vector<LaneCounters> h_lane_params; 
+			LaneCounters *h_lanes_counters_;	
+			ChannelCounters *h_channels_counters_;	
 			int32 nlanes_, nchannels_;
+
+			template<typename T>
+				// if necessary, make a version that always use ld_ as the next power of 2
+				class DeviceMatrix {
+					T *data_;	
+					int ld_;	 // leading dimension
+					public:
+					DeviceMatrix(int nrows, int ld) : ld_(ld) {
+						cudaMalloc(&data_, nrows*ld*sizeof(*data_));
+					}
+
+					virtual ~DeviceMatrix() {
+						cudaFree(data_);
+					}
+
+					__host__ __device__ T *row(int r) {
+						return &data[r*ld];
+					}
+
+					__host__ __device__ T *data() {
+						return data_;
+					}
+				};
+
 
 			// Wrappers for code clarity
 			template<typename T> 
-			class LaneMatrix : DeviceMatrix<T> {
-				__host__ __device__ T *lane(int ilane) {
-					return row(ilane);
+				class LaneMatrix : public DeviceMatrix<T> {
+				public:
+					LaneMatrix(int nrows, int ld) : DeviceMatrix(nrows, ld) {}
+					__host__ __device__ T *lane(int ilane) {
+						return row(ilane);
 				}
-			}
+			};
 			
 			template<typename T> 
-			class ChannelMatrix : DeviceMatrix<T> {
+			class ChannelMatrix : public DeviceMatrix<T> {
+				public:
+				ChannelMatrix(int nrows, int ld) : DeviceMatrix(nrows, ld) {}
 				__host__ __device__ T *channel(int ichannel) {
 					return row(ichannel);
 				}
-			}
-
+			};
+			public: // TODO
 			struct KernelParams {
 				KernelParams(int nlanes, 
 						int nchannels, 
@@ -531,32 +560,30 @@ namespace kaldi {
 						int nilabels,
 						int num_states) :
 					d_channels_counters(nchannels, 1),
-					d_channels_counters(nlanes, 1),
-					d_main_q_state(nchannels, max_tokens_per_frame),
-					d_main_q_cost(nchannels, max_tokens_per_frame),
+					d_lanes_counters(nlanes, 1),
+					d_main_q_state_and_cost(nchannels, max_tokens_per_frame),
 					d_main_q_info(nlanes, max_tokens_per_frame),
-					d_aux_q_state(nlanes, max_tokens_per_frame),
-					d_aux_q_cost(nlanes, max_tokens_per_frame),
+					d_aux_q_state_and_cost(nlanes, max_tokens_per_frame),
 					d_aux_q_info(nlanes, max_tokens_per_frame),
-					d_q_degrees_prefix_sum(nchannels, max_tokens_per_frame),
-					d_q_degrees_block_sums_prefix_sum(nlanes, 
-							KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX) + 1),
-					d_q_arc_offsets.(nchannels,  max_tokens_per_frame)
+					d_main_q_degrees_prefix_sum(nchannels, max_tokens_per_frame),
+					d_main_q_degrees_block_sums_prefix_sum(nlanes, 
+							KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame, KALDI_CUDA_DECODER_1D_BLOCK) + 1),
+					d_main_q_arc_offsets(nchannels,  max_tokens_per_frame),
 					d_loglikelihoods(nchannels, nilabels),
-					d_state_best_cost(nlanes, num_states),
+					d_state_best_int_cost(nlanes, num_states),
 					q_capacity(max_tokens_per_frame) {}
 				// In AdvanceDecoding,
 				// the lane lane_id will compute the channel
 				// with channel_id = channel_to_compute[lane_id]
 				ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
-				int32 nchannels_to_compute;
+				int32 nlanes_used;
+				int32 max_nlanes;
 
 				ChannelMatrix<ChannelCounters> d_channels_counters; 
 				LaneMatrix<LaneCounters> d_lanes_counters; 
 
 				// main_q_* TODO comments
-				ChannelMatrix<StateId> d_main_q_state; 
-				ChannelMatrix<CostType> d_main_q_cost; 
+				ChannelMatrix<int2> d_main_q_state_and_cost; 
 
 				// d_main_q_info_ is only needed as a buffer when creating the 
 				// tokens. It is not needed by the next frame computation
@@ -566,15 +593,14 @@ namespace kaldi {
 				LaneMatrix<InfoToken> d_main_q_info; 
 
 				// Same thing for the aux q
-				LaneMatrix<StateId> d_aux_q_state; 
-				LaneMatrix<CostType> d_aux_q_cost; 
+				LaneMatrix<int2> d_aux_q_state_and_cost; // TODO int_cost
 				LaneMatrix<InfoToken> d_aux_q_info; 
 
 				// The load balancing of the Expand kernel relies on the prefix sum of the degrees 
 				// of the state in the queue (more info in the ExpandKernel implementation) 
 				// That array contains that prefix sum. It is set by the "Preprocess*" kernels
 				// and used by the Expand kernel
-				ChannelMatrix<int32> d_q_degrees_prefix_sum; 
+				ChannelMatrix<int32> d_main_q_degrees_prefix_sum; 
 
 				// When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
 				// (1) First generate the prefix sum inside each CUDA blocks
@@ -584,12 +610,12 @@ namespace kaldi {
 				// Data from step 2 is stored in d_main_q_degrees_block_sums_prefix_sum
 				// Note : this is only used by PreprocessInPlace
 				// PreprocessAndContract uses a trick to compute the global prefix sum in one pass	    
-				LaneMatrix<int32> d_q_degrees_block_sums_prefix_sum; 
+				LaneMatrix<int32> d_main_q_degrees_block_sums_prefix_sum; 
 
 				// d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
 				// we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
 				// we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
-				ChannelMatrix<int32> d_q_arc_offsets; 
+				ChannelMatrix<int32> d_main_q_arc_offsets; 
 
 				// loglikelihoods computed by the acoustic model
 				// we need it to compute the cost of emitting edges
@@ -599,18 +625,20 @@ namespace kaldi {
 				// reset between frames
 				// type int32 to be able to use native atomicMin instruction
 				// we use a 1:1 conversion float <---> sortable int
-				LaneMatrix<IntegerCostType> d_state_best_cost; 
+				LaneMatrix<IntegerCostType> d_state_best_int_cost; 
 
 				// TODO use the CudaFst datastructure
 				int32 q_capacity;
-				CostType infinite_cost;
-				int32 *arc_ilabels;
-				CostType *arc_weights;
-				int32 *arc_nextstates;
+				CostType *d_arc_weights;
+				int32 *d_arc_nextstates;
+				int32 *d_arc_ilabels;
+				int32 *d_arc_offsets;
+				int32 nstates;
 				CostType default_beam;
 				int32 init_channel_id;
 			};
 
+			KernelParams *h_kernel_params_;
 
 			// When starting a new utterance,
 			// init_channel_id is used to initialize a channel
@@ -669,6 +697,7 @@ namespace kaldi {
 			// Keep track of the number of frames decoded in the current file.
 			std::vector<int32> num_frames_decoded_;
 
+			std::vector<InfoTokenVector> h_all_tokens_info_;
 			// Used for debugging purposes
 			// only malloc'ed if necessary
 			int32 *h_debug_buf1_, *h_debug_buf2_;

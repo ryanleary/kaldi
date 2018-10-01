@@ -42,10 +42,24 @@
 #define KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(i, n)                   \
 	for (int i = blockIdx.y; i < (n);  i += gridDim.y)                     
 
+#define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
+
+#define KALDI_CUDA_DECODER_1D_BLOCK 256                      
+#define KALDI_CUDA_DECODER_ONE_WARP_BLOCK 32                      
+
+inline dim3 KALDI_CUDA_DECODER_NUM_BLOCKS(int N, int M) {
+	dim3 grid;
+	// TODO MAX_NUM_BLOCKS
+	grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(N, KALDI_CUDA_DECODER_1D_BLOCK);
+	grid.y = M;
+
+	return grid;
+}
 
 
 #include "util/stl-utils.h"
 #include "fst/fstlib.h"
+#include <cuda.h>
 
 namespace kaldi {
 
@@ -129,34 +143,13 @@ namespace kaldi {
         void Clone(const InfoTokenVector &other);
         void Reset();
         void CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count);    
-        int32 Size() { return size_ };
-        void Reserve(size_t min_capacity);    
+        int32 Size() { return size_; }
+        void Reserve(size_t min_capacity);
         InfoToken *GetRawPointer() const;
         virtual ~InfoTokenVector();
     };
 
-    template<typename T>
-	    // if necessary, make a version that always use ld_ as the next power of 2
-	    class DeviceMatrix {
-		    T *data_;	
-		    int ld_;	 // leading dimension
-		    public:
-		    DeviceMatrix(int nrows, int ld) : ld_(ld) {
-			    cudaMalloc(&data, nrows*ld*sizeof(*data));
-		    }
 
-		    virtual ~DeviceMatrix() {
-			    cudaFree(data);
-		    }
-
-		    __host__ __device__ T *row(int r) {
-			    return &data[r*ld];
-		    }
-
-		    __host__ __device__ T *data() {
-			    return data_;
-		    }
-	    };
 } // end namespace kaldi
 
 #endif
