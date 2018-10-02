@@ -1,9 +1,5 @@
 // decoder/cuda-decoder.h
-
-// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
-
-// See ../../COPYING for clarification regarding multiple authors
-//
+// TODO nvidia apache2
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -25,6 +21,8 @@
 #include "itf/decodable-itf.h"
 #include "omp.h"
 #include <cuda_runtime_api.h>
+#include <vector>
+#include <tuple>
 
 #include "decoder/cuda-decoder-utils.h"
 
@@ -115,7 +113,6 @@ namespace kaldi {
 	//
 
 	class CudaDecoder {
-
 		public:
 			typedef fst::StdArc StdArc;
 			typedef StdArc::Weight StdWeight;
@@ -152,14 +149,11 @@ namespace kaldi {
 			/// that many frames.  If it returns false, then no tokens are alive,
 			/// which is a kind of error state.
 			void AdvanceDecoding(DecodableInterface *decodable,
+					const std::vector<ChannelId> &channels,
 					int32 max_num_frames = -1);
 
 			/// Returns the number of frames already decoded.  
 			int32 NumFramesDecoded(ChannelId ichannel) const;
-
-			// ReachedFinal returns true if the last frame's token queue 
-			// contains at least one token associated with a final state
-			bool ReachedFinal() const;
 
 			// GetBestPath gets the decoding traceback. If "use_final_probs" is true
 			// AND we reached a final state, it limits itself to final states;
@@ -169,12 +163,12 @@ namespace kaldi {
 			// If Decode() returned true, it is safe to assume GetBestPath will return true.
 			// It returns true if the output lattice was nonempty (i.e. had states in it);
 			// using the return value is deprecated.
-			bool GetBestPath(Lattice *fst_out, bool use_final_probs = true) const;
+			bool GetBestPath(const std::vector<ChannelId> &channels, const std::vector<Lattice*> &fst_out_vec, bool use_final_probs=true);
 
 			// GetBestCost sets in *min the token's best cost in the main_q
 			// it also sets in *arg the index of that token (argmin)
 			// is isfinal is true, we take into account the final costs
-			void GetBestCost(bool isfinal, CostType *best_cost, int32 *best_cost_arg) const;
+			void GetBestCost(const std::vector<ChannelId> &channels, bool isfinal, std::vector<std::pair<int32,CostType>> *argmins, std::vector<bool> *has_reached_final);
 
 			/// FinalRelativeCost() serves the same function as ReachedFinal(), but gives
 			/// more information.  It returns the difference between the best (final-cost plus
@@ -182,7 +176,6 @@ namespace kaldi {
 			/// on the final frame.  If it is infinity it means no final-states were present
 			/// on the final frame.  It will usually be nonnegative.
 			CostType FinalRelativeCost() const;
-
 
 			//
 			// Data structures used by the kernels
@@ -333,8 +326,8 @@ namespace kaldi {
 
 			void PreprocessInPlace(int32 main_q_size_estimate);
 
-			void LoadChannelsStatesToLanesCPU();
-			void SaveChannelsStatesFromLanesCPU();
+			void LoadChannelsStateToLanesCPU();
+			void SaveChannelsStateFromLanesCPU();
 
 			//
 			// FinalizeProcessNonemitting
@@ -480,6 +473,11 @@ namespace kaldi {
 				IntegerCostType min_int_cost;
 				IntegerCostType int_beam;
 				IntegerCostType int_cutoff; // min_cost + beam (if min_cost < INF, otherwise INF)
+
+				// Only valid after calling GetBestCost
+				// different than min_int_cost : we include the "final" cost
+				int2 min_int_cost_and_arg_with_final;
+				int32 reached_final;
 			};
 
 			// 
@@ -506,8 +504,8 @@ namespace kaldi {
 				int32 prev_main_q_global_offset;            
 			};
 
-			LaneCounters *h_lanes_counters_;	
-			ChannelCounters *h_channels_counters_;	
+			LaneCounters *h_lanes_counters_, *d_lanes_counters_;	
+			ChannelCounters *h_channels_counters_, *d_channels_counters_;	
 			int32 nlanes_, nchannels_;
 
 			template<typename T>
@@ -632,7 +630,9 @@ namespace kaldi {
 				CostType *d_arc_weights;
 				int32 *d_arc_nextstates;
 				int32 *d_arc_ilabels;
-				int32 *d_arc_offsets;
+				uint32 *d_arc_e_offsets;
+				uint32 *d_arc_ne_offsets;
+				CostType *d_fst_final_costs;
 				int32 nstates;
 				CostType default_beam;
 				int32 init_channel_id;
@@ -674,15 +674,6 @@ namespace kaldi {
 			// h_main_q_end is final for this frame
 			// triggered at the end of a frame computation
 			cudaEvent_t can_read_final_h_main_q_end_;
-
-			// Buffers for copies on host on the current main_q
-			// Those are only buffers - and must be considered as containing 
-			// uninitialized data
-			// If you need to read from those,
-			// please explicitly copy data from device first !
-			// We use them in "ReachedFinal" for instance
-			StateId *h_main_q_state_; 
-			CostType *h_main_q_cost_; 
 
 			// When we generate a new tokens list we only keep candidates 
 			// that have a cost < best_cost_in_the_queue + beam

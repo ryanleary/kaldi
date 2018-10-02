@@ -1,9 +1,5 @@
 // decoder/cuda-decoder-utils.h
-
-// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
-
-// See ../../COPYING for clarification regarding multiple authors
-//
+// TODO nvidia apache2
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -45,6 +41,7 @@
 #define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 #define KALDI_CUDA_DECODER_1D_BLOCK 256                      
+#define KALDI_CUDA_DECODER_LARGEST_1D_BLOCK 1024
 #define KALDI_CUDA_DECODER_ONE_WARP_BLOCK 32                      
 
 inline dim3 KALDI_CUDA_DECODER_NUM_BLOCKS(int N, int M) {
@@ -108,14 +105,14 @@ namespace kaldi {
             // Use e_offsets or ne_offsets depending on what you need (emitting/nonemitting)
             // The ilabels arrays are of size e_count_, not arc_count_
 
-            BaseFloat *h_arc_weights_, *d_arc_weights_; // TODO define CostType here
+            float *h_arc_weights_, *d_arc_weights_; // TODO define CostType here
             StateId *h_arc_nextstates_, *d_arc_nextstates_;
             int32 *h_arc_ilabels_, *d_arc_ilabels_;
             int32 *h_arc_olabels_;
 
             // Final costs
             // final cost of state i is h_final_[i]
-            float *h_final_;
+            float *h_final_, *d_final_;
     };
 
     // InfoToken contains data that needs to be saved for the backtrack
@@ -142,7 +139,7 @@ namespace kaldi {
         InfoTokenVector(int initial_capacity, cudaStream_t copy_st_);
         void Clone(const InfoTokenVector &other);
         void Reset();
-        void CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count);    
+        void CopyFromDevice(InfoToken *d_ptr, size_t count);    
         int32 Size() { return size_; }
         void Reserve(size_t min_capacity);
         InfoToken *GetRawPointer() const;

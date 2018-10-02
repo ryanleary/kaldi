@@ -1,9 +1,5 @@
 // decoder/cuda-decoder-kernels.cu
-
-// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
-
-// See ../../COPYING for clarification regarding multiple authors
-//
+// TODO nvidia apache2
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -93,6 +89,14 @@ namespace kaldi {
 		return uold.i2;
 	} 	
 
+	__device__ __inline__ int2 atomicMinI2(int2 *ptr, int2 val) {
+		unsigned long long int *ptr64 = reinterpret_cast<unsigned long long int*>(ptr);
+		Int64UnionInt2 uval, uold;
+		uval.i2 = val;
+		uold.l = atomicMin(ptr64, uval.l); 
+		return uold.i2;
+	}
+
 	// GetAdaptiveBeam is used by ExpandArc and FinalizeProcessNonemitting
 	//
 	// Given the fact that the token queues are too small to store 
@@ -158,7 +162,7 @@ namespace kaldi {
 	 */
 
 	// Important : pass the struct PreprocessParams by copy - passing it using a ref will not work (CPU -> GPU)
-	__global__ void _preprocess_and_contract_kernel(KernelParams params) {
+	__global__ void preprocess_and_contract_kernel(KernelParams params) {
 		typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
 		// We need to move the survival tokens to the main_q
@@ -209,8 +213,10 @@ namespace kaldi {
 						// We can have duplicates, ie token associated with the same states
 						// If this token is not the best candidate, get rid of it
 						if(token_int_cost == state_best_int_cost) {
-							arc_start = params.d_arc_offsets[token_state];
-							const int32 arc_end = params.d_arc_offsets[token_state+1];
+							// Contract is always called for non-emitting
+							// using non-emitting offsets
+							arc_start = params.d_arc_ne_offsets[token_state];
+							const int32 arc_end = params.d_arc_ne_offsets[token_state+1];
 							degree = arc_end - arc_start;
 						}
 					}
@@ -330,7 +336,7 @@ finalize_kernel:
 
 	 */
 
-	__global__ void _preprocess_in_place_kernel(KernelParams params) {
+	__global__ void preprocess_in_place_kernel(KernelParams params) {
 		// Operator for the prefix sum inside the CUDA block
 		typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
@@ -376,8 +382,9 @@ finalize_kernel:
 						// We can have duplicates, ie token associated with the same states
 						// If this token is not the best candidate, get rid of it
 						if(token_int_cost == state_best_int_cost) {
-							const int32 start = params.d_arc_offsets[token_state]; 
-							const int32 end = params.d_arc_offsets[token_state+1]; 
+							// Next step is emitting (next frame), using emitting offsets
+							const int32 start = params.d_arc_e_offsets[token_state]; 
+							const int32 end = params.d_arc_e_offsets[token_state+1]; 
 							degree  = end - start;
 
 							// Saving the start offset for the expand kernel
@@ -762,10 +769,10 @@ finalize_kernel:
 	}
 
 	template<bool IS_EMITTING>
-	__global__ void post_expand_updates(KernelParams params) {
+	__global__ void post_expand_kernel(KernelParams params) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
-			const LaneCounters *lane_counters = params.d_lane_counters.lane(ilane);
+			LaneCounters *lane_counters = params.d_lane_counters.lane(ilane);
 			const int32 ichannel = params.channel_to_compute[ilane];
 			const int prev_main_q_end = lane_counters->aux_q_end;
 			const int prev_aux_q_end = lane_counters->aux_q_end;
@@ -866,146 +873,175 @@ we do not need inter-block communication (we launch only one CUDA block)
 
 
 	__launch_bounds__(KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX, 1)
-	__global__ void _finalize_process_non_emitting(KernelParams params) {
-		typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> Int2BlockScan;
-		typedef cub::BlockScan<int, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> IntBlockScan;
-		__shared__ typename IntBlockScan::TempStorage sh_temp_storage_int_scan;
-		__shared__ typename Int2BlockScan::TempStorage sh_temp_storage_int2_scan;
+		__global__ void finalize_process_non_emitting_kernel(KernelParams params) {
+			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> Int2BlockScan;
+			typedef cub::BlockScan<int, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> IntBlockScan;
+			__shared__ typename IntBlockScan::TempStorage sh_temp_storage_int_scan;
+			__shared__ typename Int2BlockScan::TempStorage sh_temp_storage_int2_scan;
 
+			const int nlanes = params.nlanes_used;
+			KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
+				LaneCounters *lane_counters = params.d_lanes_counters.lane(ilane);
+				const int32 ichannel = params.channel_to_compute[ilane];
+
+				int2 both = lane_counters->main_q_narcs_and_end;
+				int32 main_q_narcs = both.x;
+				int32 main_q_end = both.y; 
+				int32 main_q_local_offset = lane_counters->main_q_local_offset;
+				const int32 main_q_global_offset = lane_counters->main_q_global_offset;
+				// aux_q is empty when this kernel is called
+				int32 aux_q_end = 0;
+
+				IntegerCostType int_cutoff = lane_counters->int_cutoff;
+				while(main_q_narcs > 0) {
+					// Step 1 : ExpandArcs
+					KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(offset, thread_idx, main_q_narcs)  {
+						const int32 main_q_arc_idx = offset + thread_idx;
+						// For details on how this code works, please refer to comments in expand_arcs
+						IntegerCostType total_int_cost = INT_MAX;
+						int32 arc_idx;
+						StateId arc_next_state;
+						int32 main_q_idx;
+						if(main_q_arc_idx < main_q_narcs) {
+							main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum.channel(ichannel), 
+									main_q_arc_idx, 
+									main_q_local_offset,
+									main_q_end-1); 
+
+							const int32 state_first_arc_idx_in_main_q = params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx];
+							const int32 arc_offset_start = params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx];
+							arc_idx = arc_offset_start + (main_q_arc_idx - state_first_arc_idx_in_main_q);
+
+							arc_next_state = params.d_arc_nextstates[arc_idx];
+							CostType arc_weight = params.d_arc_weights[arc_idx];
+							CostType prev_token_cost = orderedIntToFloat(params.d_main_q_state_and_cost.channel(ilane)[main_q_idx].y); 
+							total_int_cost = floatToOrderedInt(arc_weight + prev_token_cost);
+
+							if(total_int_cost < int_cutoff) {
+								const IntegerCostType next_state_best_int_cost = params.d_state_best_int_cost.lane(ilane)[arc_next_state];
+								if(total_int_cost != next_state_best_int_cost)
+									total_int_cost = INT_MAX; // not the best
+							} else
+								total_int_cost = INT_MAX; // above cutoff 
+						}
+
+						const int32 has_successor = (total_int_cost < INT_MAX) ? 1 : 0;
+						if(has_successor) 
+							atomicMin_block(&params.d_state_best_int_cost.lane(ilane)[arc_next_state], total_int_cost); // new best cost
+
+						int32 local_aux_q_idx;
+						int32 nsuccessors;
+						IntBlockScan(sh_temp_storage_int_scan).ExclusiveSum(has_successor, 
+								local_aux_q_idx,
+								nsuccessors); // aggregate
+
+						// Checking if we are overflowing the aux_q
+						if((aux_q_end + nsuccessors) >= params.q_capacity) {
+							lane_counters->q_overflow = 1;
+							// nothing to revert in global memory
+							goto finalize_kernel;
+						}
+
+						if(has_successor) {
+							const int32 aux_q_idx = aux_q_end + local_aux_q_idx;
+							const int32 prev_token_idx = main_q_global_offset + main_q_idx;
+							params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx] = {arc_next_state,total_int_cost};
+							params.d_aux_q_info.lane(ilane)[aux_q_idx] = {prev_token_idx,arc_idx};
+						}
+
+						aux_q_end += nsuccessors;
+
+						// reusing sh_temp_storage_scan_int TODO double buffering
+						__syncthreads();
+					}
+
+					// Step 2 : PreprocessAndContract
+					// Reset for new iteration
+					main_q_narcs = 0;
+					main_q_local_offset = main_q_end;
+					KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(offset, thread_idx, aux_q_end) {
+						const int32 aux_q_idx = offset + thread_idx;
+						int32 degree = 0;
+						int32 start = -1;
+						StateId token_state;
+						IntegerCostType token_int_cost;
+						if(aux_q_idx < aux_q_end) {
+							int2 both = params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx];
+							token_state = both.x; 
+							token_int_cost = both.y; 
+							// beam may have changed since generation
+							if(token_int_cost < int_cutoff) {
+								IntegerCostType best_int_cost = params.d_state_best_int_cost.lane(ilane)[token_state];
+								if(token_int_cost == best_int_cost) {
+									// We are non-emitting in this kernel, using ne offsets
+									start = params.d_arc_ne_offsets[token_state];
+									int32 end = params.d_arc_ne_offsets[token_state+1];
+									degree = end - start;
+								}
+							}
+						}
+						int has_valid_nonpruned_token = (start != -1) ? 1 : 0;
+						int2 narcs_and_ntokens_prefix_sum = {degree, has_valid_nonpruned_token};
+						int2 aggregate, zero2 = {0,0};
+						Int2BlockScan(sh_temp_storage_int2_scan).ExclusiveScan(narcs_and_ntokens_prefix_sum, 
+								narcs_and_ntokens_prefix_sum,
+								zero2,
+								PlusPlus(),
+								aggregate);
+
+						// Checking if we are not overflowing the main_q
+						const int32 total_ntokens = aggregate.y; 
+						if((main_q_end + total_ntokens) >= params.q_capacity) {
+							lane_counters->q_overflow = 1;
+							goto finalize_kernel;
+						}
+						const int32 degree_prefix_sum = main_q_narcs + narcs_and_ntokens_prefix_sum.x;
+						const int32 degree_sum = aggregate.x;
+						main_q_narcs += degree_sum;
+						if(has_valid_nonpruned_token) {
+							const int32 local_main_q_idx = narcs_and_ntokens_prefix_sum.y;
+							const int32 main_q_idx = main_q_end + local_main_q_idx;
+
+							params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx] = start;
+							params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx] = degree_prefix_sum;
+							params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx] = {token_state,token_int_cost};
+							params.d_main_q_info.lane(ilane)[main_q_idx] = params.d_aux_q_info.lane(ilane)[aux_q_idx];
+						}
+						main_q_end += total_ntokens; 
+						__syncthreads(); // reusing sh_temp_storage_scan TODO double buffering
+					}
+					aux_q_end = 0; // aux_q is now considered empty
+				}
+finalize_kernel:
+				if(threadIdx.x == 0) 
+					lane_counters->main_q_narcs_and_end.y = main_q_end; 
+			}
+		}
+
+	__global__ void get_best_cost_kernel(KernelParams params, bool isfinal, CostType fst_zero) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			LaneCounters *lane_counters = params.d_lanes_counters.lane(ilane);
 			const int32 ichannel = params.channel_to_compute[ilane];
-
-			int2 both = lane_counters->main_q_narcs_and_end;
-			int32 main_q_narcs = both.x;
-			int32 main_q_end = both.y; 
-			int32 main_q_local_offset = lane_counters->main_q_local_offset;
-			const int32 main_q_global_offset = lane_counters->main_q_global_offset;
-			// aux_q is empty when this kernel is called
-			int32 aux_q_end = 0;
-
-			IntegerCostType int_cutoff = lane_counters->int_cutoff;
-			while(main_q_narcs > 0) {
-				// Step 1 : ExpandArcs
-				KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(offset, thread_idx, main_q_narcs)  {
-					const int32 main_q_arc_idx = offset + thread_idx;
-					// For details on how this code works, please refer to comments in expand_arcs
-					IntegerCostType total_int_cost = INT_MAX;
-					int32 arc_idx;
-					StateId arc_next_state;
-					int32 main_q_idx;
-					if(main_q_arc_idx < main_q_narcs) {
-						main_q_idx = binsearch_maxle(params.d_main_q_degrees_prefix_sum.channel(ichannel), 
-								main_q_arc_idx, 
-								main_q_local_offset,
-								main_q_end-1); 
-
-						const int32 state_first_arc_idx_in_main_q = params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx];
-						const int32 arc_offset_start = params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx];
-						arc_idx = arc_offset_start + (main_q_arc_idx - state_first_arc_idx_in_main_q);
-
-						arc_next_state = params.d_arc_nextstates[arc_idx];
-						CostType arc_weight = params.d_arc_weights[arc_idx];
-						CostType prev_token_cost = orderedIntToFloat(params.d_main_q_state_and_cost.channel(ilane)[main_q_idx].y); 
-						total_int_cost = floatToOrderedInt(arc_weight + prev_token_cost);
-
-						if(total_int_cost < int_cutoff) {
-							const IntegerCostType next_state_best_int_cost = params.d_state_best_int_cost.lane(ilane)[arc_next_state];
-							if(total_int_cost != next_state_best_int_cost)
-								total_int_cost = INT_MAX; // not the best
-						} else
-							total_int_cost = INT_MAX; // above cutoff 
-					}
-
-					const int32 has_successor = (total_int_cost < INT_MAX) ? 1 : 0;
-					if(has_successor) 
-						atomicMin_block(&params.d_state_best_int_cost.lane(ilane)[arc_next_state], total_int_cost); // new best cost
-
-					int32 local_aux_q_idx;
-					int32 nsuccessors;
-					IntBlockScan(sh_temp_storage_int_scan).ExclusiveSum(has_successor, 
-							local_aux_q_idx,
-							nsuccessors); // aggregate
-
-					// Checking if we are overflowing the aux_q
-					if((aux_q_end + nsuccessors) >= params.q_capacity) {
-						lane_counters->q_overflow = 1;
-						// nothing to revert in global memory
-						goto finalize_kernel;
-					}
-
-					if(has_successor) {
-						const int32 aux_q_idx = aux_q_end + local_aux_q_idx;
-						const int32 prev_token_idx = main_q_global_offset + main_q_idx;
-						params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx] = {arc_next_state,total_int_cost};
-						params.d_aux_q_info.lane(ilane)[aux_q_idx] = {prev_token_idx,arc_idx};
-					}
-
-					aux_q_end += nsuccessors;
-
-					// reusing sh_temp_storage_scan_int TODO double buffering
-					__syncthreads();
+			const ChannelCounters *channel_counters = params.d_channels_counters.channel(ichannel);
+			const int32 main_q_end = channel_counters->prev_main_q_narcs_and_end.y;
+			const int32 global_offset = channel_counters->prev_main_q_global_offset;
+			KALDI_CUDA_DECODER_1D_KERNEL_LOOP(idx, main_q_end) {
+				const int2 both = params.d_main_q_state_and_cost.channel(ichannel)[idx];
+				const int token_state = both.x;
+				const int token_int_cost = both.y;
+				CostType cost = orderedIntToFloat(token_int_cost);	
+				if(isfinal) {
+					const CostType final_cost = params.d_fst_final_costs[token_state];
+					if(final_cost != fst_zero)
+						lane_counters->reached_final = 1;
+					cost += final_cost; 
 				}
-
-			// Step 2 : PreprocessAndContract
-			// Reset for new iteration
-			main_q_narcs = 0;
-			main_q_local_offset = main_q_end;
-			KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(offset, thread_idx, aux_q_end) {
-				const int32 aux_q_idx = offset + thread_idx;
-				int32 degree = 0;
-				int32 start = -1;
-				StateId token_state;
-				IntegerCostType token_int_cost;
-				if(aux_q_idx < aux_q_end) {
-					int2 both = params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx];
-					token_state = both.x; 
-					token_int_cost = both.y; 
-					// beam may have changed since generation
-					if(token_int_cost < int_cutoff) {
-						IntegerCostType best_int_cost = params.d_state_best_int_cost.lane(ilane)[token_state];
-						if(token_int_cost == best_int_cost) {
-							start = params.d_arc_offsets[token_state];
-							int32 end = params.d_arc_offsets[token_state+1];
-							degree = end - start;
-						}
-					}
-				}
-				int has_valid_nonpruned_token = (start != -1) ? 1 : 0;
-				int2 narcs_and_ntokens_prefix_sum = {degree, has_valid_nonpruned_token};
-				int2 aggregate, zero2 = {0,0};
-				Int2BlockScan(sh_temp_storage_int2_scan).ExclusiveScan(narcs_and_ntokens_prefix_sum, 
-						narcs_and_ntokens_prefix_sum,
-						zero2,
-						PlusPlus(),
-						aggregate);
-
-				// Checking if we are not overflowing the main_q
-				const int32 total_ntokens = aggregate.y; 
-				if((main_q_end + total_ntokens) >= params.q_capacity) {
-					lane_counters->q_overflow = 1;
-					goto finalize_kernel;
-				}
-				const int32 degree_prefix_sum = main_q_narcs + narcs_and_ntokens_prefix_sum.x;
-				const int32 degree_sum = aggregate.x;
-				main_q_narcs += degree_sum;
-				if(has_valid_nonpruned_token) {
-					const int32 local_main_q_idx = narcs_and_ntokens_prefix_sum.y;
-					const int32 main_q_idx = main_q_end + local_main_q_idx;
-
-					params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx] = start;
-					params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx] = degree_prefix_sum;
-					params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx] = {token_state,token_int_cost};
-					params.d_main_q_info.lane(ilane)[main_q_idx] = params.d_aux_q_info.lane(ilane)[aux_q_idx];
-				}
-				main_q_end += total_ntokens; 
-				__syncthreads(); // reusing sh_temp_storage_scan TODO double buffering
+				const IntegerCostType int_cost = floatToOrderedInt(cost); 
+				const int32 global_idx = global_offset+idx;
+				const int2 min_and_arg = {int_cost, global_idx}; // sort by cost, put it first
+				atomicMinI2(&lane_counters->min_int_cost_and_arg_with_final, min_and_arg); // TODO maybe reduce locally
 			}
-			aux_q_end = 0; // aux_q is now considered empty
 		}
-		finalize_kernel:
-		if(threadIdx.x == 0) 
-			lane_counters->main_q_narcs_and_end.y = main_q_end; 
 	}
 } // end namespace kaldi

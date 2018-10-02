@@ -1,9 +1,5 @@
 // decoder/cuda-decoder-utils.cu
-
-// 2018 - Hugo Braun, Justin Luitjens, Ryan Leary
-
-// See ../../COPYING for clarification regarding multiple authors
-//
+// TODO nvidia apache2
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -42,6 +38,7 @@ namespace kaldi {
 
         cudaMalloc((void**)&d_e_offsets_,(num_states_+1)*sizeof(*d_e_offsets_));
         cudaMalloc((void**)&d_ne_offsets_,(num_states_+1)*sizeof(*d_ne_offsets_));
+        cudaMalloc((void**)&d_final_,(num_states_)*sizeof(*d_final_));
  
        //iterate through states and arcs and count number of arcs per state
         e_count_=0;
@@ -84,6 +81,7 @@ namespace kaldi {
 
         cudaMemcpy(d_e_offsets_,h_e_offsets_,(num_states_+1)*sizeof(*d_e_offsets_),cudaMemcpyHostToDevice);
         cudaMemcpy(d_ne_offsets_,h_ne_offsets_,(num_states_+1)*sizeof(*d_ne_offsets_),cudaMemcpyHostToDevice);
+        cudaMemcpy(d_final_,h_final_,num_states_*sizeof(*d_final_),cudaMemcpyHostToDevice);
 
         cudaMallocHost(&h_arc_weights_,arc_count_*sizeof(*h_arc_weights_));
         cudaMallocHost(&h_arc_nextstates_,arc_count_*sizeof(*h_arc_nextstates_));
@@ -137,6 +135,7 @@ namespace kaldi {
 
         cudaFree(d_e_offsets_);
         cudaFree(d_ne_offsets_);
+        cudaFree(d_final_);
 
         cudaFreeHost(h_arc_weights_);
         cudaFreeHost(h_arc_nextstates_);
@@ -156,21 +155,15 @@ namespace kaldi {
     // Constructor always takes an initial capacity for the vector
     // even if the vector can grow if necessary, it damages performance
     // we need to have an appropriate initial capacity (is set using a parameter in CudaDecoderConfig)
-    InfoTokenVector::InfoTokenVector(int capacity) {
-        capacity_ = capacity;
+    InfoTokenVector::InfoTokenVector(int capacity, cudaStream_t copy_st) : capacity_(capacity), copy_st_(copy_st) {
         KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_ << " tokens";
         cudaMallocHost(&h_data_, capacity_ * sizeof(*h_data_)); 
-        SetCudaStream(0); // using default stream
         Reset();
     }
 
     void InfoTokenVector::Reset() {
         size_ = 0;
     };
-
-    void InfoTokenVector::SetCudaStream(cudaStream_t st) {
-        copy_st_ = st;
-    }
 
     void InfoTokenVector::CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count) {
         Reserve(size_+count); // making sure we have the space
