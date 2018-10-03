@@ -119,8 +119,8 @@ namespace kaldi {
     // in GetBestPath
     // It will be moved back to CPU memory using a InfoTokenVector
     struct InfoToken {
-        int prev_token;
-        int arc_idx;
+        int32 prev_token;
+        int32 arc_idx;
     };
 
     //

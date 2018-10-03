@@ -81,6 +81,20 @@ namespace kaldi {
 		unsigned long long int l;
 	};
 
+
+	#if __CUDA_ARCH__ < 350
+	__device__ unsigned long long atomicMinCAS(unsigned long long *addr, unsigned long long value) {
+		unsigned long long old = *addr, assumed;
+		if(old <= value) return old;
+		do {
+			assumed = old;
+			old = atomicCAS((unsigned int*)addr, __float_as_int(assumed), __float_as_int(value));
+
+		} while(old!=assumed);
+		return old;
+	}
+	#endif 
+
 	__device__ __inline__ int2 atomicAddI2(int2 *ptr, int2 val) {
 		unsigned long long int *ptr64 = reinterpret_cast<unsigned long long int*>(ptr);
 		Int64UnionInt2 uval, uold;
@@ -93,7 +107,11 @@ namespace kaldi {
 		unsigned long long int *ptr64 = reinterpret_cast<unsigned long long int*>(ptr);
 		Int64UnionInt2 uval, uold;
 		uval.i2 = val;
+		#if __CUDA_ARCH__ < 350
+		uold.l = atomicMinCAS(ptr64, uval.l); // overloading fails for some reasons
+		#else
 		uold.l = atomicMin(ptr64, uval.l); 
+		#endif 
 		return uold.i2;
 	}
 
@@ -476,10 +494,10 @@ finalize_kernel:
 
 			const int nlanes = params.nlanes_used;
 			KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
-				const LaneCounters *lane_counters = params.d_lane_counters.channel(ilane);
-				const int32 main_q_offset = lane_counters->main_q_offset;
-				const int32 main_q_end = lane_counters->main_q_end_and_narcs.end;
-				const int32 total_narcs = lane_counters->main_q_end_and_narcs.narcs;
+				LaneCounters *lane_counters = params.d_lanes_counters.lane(ilane);
+				const int32 main_q_offset = lane_counters->main_q_local_offset;
+				const int32 main_q_end = lane_counters->main_q_narcs_and_end.y;
+				const int32 total_narcs = lane_counters->main_q_narcs_and_end.x;
 				KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(block_offset, thread_idx, total_narcs) {
 					// Position of considered token in the main_q
 					const int32 ichannel = params.channel_to_compute[ilane];
@@ -553,7 +571,7 @@ finalize_kernel:
 						// arc_offset_start is the offset in the CSR, to find the arcs 
 						// related to the state main_q_state_[main_q_idx]
 						// it was set by the preprocess kernel
-						const int32 arc_offset_start = params.d_q_arc_offsets.channel(ichannel)[main_q_idx];
+						const int32 arc_offset_start = params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx];
 
 						// local_arc_index is the arc index for that state
 						// if local_arc_index == 2, we will process the second arc
@@ -564,16 +582,16 @@ finalize_kernel:
 						arc_idx = arc_offset_start + local_arc_index; 
 
 						// Destination of that arc
-						arc_next_state = params.arc_nextstates[arc_idx];
+						arc_next_state = params.d_arc_nextstates[arc_idx];
 
 						// Building the total cost incrementally 
 						// we'll add the acoustic cost and the old token's cost
-						const CostType arc_fixed_cost = params.arc_weights[arc_idx];
+						const CostType arc_fixed_cost = params.d_arc_weights[arc_idx];
 						// TODO move q_arc_offset to .x
 						const CostType prev_token_cost  = orderedIntToFloat(params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].y);
 						CostType total_cost = prev_token_cost + arc_fixed_cost;
 						if(IS_EMITTING) {
-							const int32 arc_ilabel = params.arc_ilabels[arc_idx];
+							const int32 arc_ilabel = params.d_arc_ilabels[arc_idx];
 							total_cost += params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; 
 						}
 						int_total_cost = floatToOrderedInt(total_cost);
@@ -616,27 +634,27 @@ finalize_kernel:
 
 					// Updating the best_state_cost lookup table with our new best cost
 					if(has_successor)
-						atomicMin(&params.d_state_best_int_cost.channel(ichannel)[arc_next_state],
+						atomicMin(&params.d_state_best_int_cost.lane(ilane)[arc_next_state],
 								int_total_cost);
 
 					int2 int_cost_and_index = {int_total_cost, has_successor};
-					BlockScan(sh_temp_storage_scan).InclusiveScan(cost_and_index, cost_and_index, MinPlus());
-					if(KALDI_DECODER_IS_LAST_1D_THREAD()) {
+					BlockScan(sh_temp_storage_scan).InclusiveScan(int_cost_and_index, int_cost_and_index, MinPlus());
+					if(KALDI_CUDA_DECODER_IS_LAST_1D_THREAD()) {
 						// We can find a lower global_min_cost only in the emitting stage
 						if(IS_EMITTING) {
-							IntegerCostType global_int_min_cost = lane_counters->int_min_cost;
-							IntegerCostType local_int_min_cost = int_cost_and_index.x;
+							IntegerCostType global_min_int_cost = lane_counters->min_int_cost;
+							IntegerCostType local_min_int_cost = int_cost_and_index.x;
 							// if we found a lower min_cost, update the global value
-							if(local_int_min_cost < global_int_min_cost) {
-								atomicMin(&lane_counters->int_min_cost, global_int_min_cost);
+							if(local_min_int_cost < global_min_int_cost) {
+								atomicMin(&lane_counters->min_int_cost, global_min_int_cost);
 								const CostType beam = orderedIntToFloat(lane_counters->int_beam);
-								IntegerCostType new_int_cutoff = floatToOrderedInt(orderedIntToFloat(local_int_min_cost) + beam);
+								IntegerCostType new_int_cutoff = floatToOrderedInt(orderedIntToFloat(local_min_int_cost) + beam);
 								atomicMin(&lane_counters->int_cutoff, new_int_cutoff);
 							}
 						}
 						// We are in a divergent branch
 						// This is the last thread. The last value of the inclusive scan is the total
-						const int32 total_successors_in_block = cost_and_index.y;
+						const int32 total_successors_in_block = int_cost_and_index.y;
 						// Requesting a spot of size total_successors_in_block in the aux_q
 						const int aux_q_index_block_offset = atomicAdd(&lane_counters->aux_q_end, total_successors_in_block);
 						// All threads will need this value
@@ -658,7 +676,7 @@ finalize_kernel:
 							// we'll be back to the last valid state 
 							// We'll be able to continue computation, but quality of the output
 							// may be lower (we weren't able to save all tokens)
-							atomicAdd(&lane_counters->d_aux_q_end, -total_successors_in_block); 
+							atomicAdd(&lane_counters->aux_q_end, -total_successors_in_block); 
 							// Setting the flag for the host. It will be used to print a warning to stderr
 							lane_counters->q_overflow = 1; 
 							// We do not jump to finalize_kernel now, because only threadIdx.x == 0 
@@ -692,12 +710,12 @@ finalize_kernel:
 					// If we're executing the following lines it means everything
 					// is valid and we are not overflowing the aux_q
 					//
-					cost_and_index.y -= has_successor; // we want the exclusive sum now
-					const int32 aux_q_block_index = cost_and_index.y;
+					int_cost_and_index.y -= has_successor; // we want the exclusive sum now
+					const int32 aux_q_block_index = int_cost_and_index.y;
 					const int32 aux_q_index = sh_aux_q_index_block_offset + aux_q_block_index;
 					if(has_successor) {
 						// We save the new token to the aux_q
-						params.d_aux_q_state_int_cost[aux_q_index] = {arc_next_state, int_cost};
+						params.d_aux_q_state_and_cost.lane(ilane)[aux_q_index] = {arc_next_state, int_total_cost};
 						// Index of the parent token
 						// the parent is the token used as input 
 						// that parent is at index main_q_idx in the GPU memory
@@ -705,7 +723,7 @@ finalize_kernel:
 						// we need to add the offset related to the previous frames index
 						// we add params.main_q_global_offset
 						const int32 prev_token = lane_counters->main_q_global_offset + main_q_idx;
-						params.d_aux_q_prev_and_arc[aux_q_index] = {prev_token, arc_idx};
+						params.d_aux_q_info.lane(ilane)[aux_q_index] = {prev_token, arc_idx};
 					}
 				}
 			}
@@ -772,10 +790,9 @@ finalize_kernel:
 	__global__ void post_expand_kernel(KernelParams params) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
-			LaneCounters *lane_counters = params.d_lane_counters.lane(ilane);
-			const int32 ichannel = params.channel_to_compute[ilane];
+			LaneCounters *lane_counters = params.d_lanes_counters.lane(ilane);
 			const int prev_main_q_end = lane_counters->aux_q_end;
-			const int prev_aux_q_end = lane_counters->aux_q_end;
+			const int aux_q_end = lane_counters->aux_q_end;
 			// The next step is the contracting step from aux_q to main_q
 			// It will need the aux_q_end value. But it will also empty the aux_q
 			// We're resetting aux_q_end to 0 now, but we're saving its old value 
@@ -790,7 +807,7 @@ finalize_kernel:
 				// we reset the main_q
 				lane_counters->main_q_narcs_and_end = {0,0};
 				// The main_q was flushed - we need to update the global_offset
-				lane_counters.main_q_global_offset += prev_main_q_end;
+				lane_counters->main_q_global_offset += prev_main_q_end;
 			} else {
 				// Moving local offset. Tokens created by last expand
 				// will be pruned, and survivals will be moved at the end
@@ -927,7 +944,7 @@ we do not need inter-block communication (we launch only one CUDA block)
 
 						const int32 has_successor = (total_int_cost < INT_MAX) ? 1 : 0;
 						if(has_successor) 
-							atomicMin_block(&params.d_state_best_int_cost.lane(ilane)[arc_next_state], total_int_cost); // new best cost
+							atomicMin(&params.d_state_best_int_cost.lane(ilane)[arc_next_state], total_int_cost); // new best cost
 
 						int32 local_aux_q_idx;
 						int32 nsuccessors;

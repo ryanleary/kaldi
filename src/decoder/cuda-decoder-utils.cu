@@ -165,10 +165,10 @@ namespace kaldi {
         size_ = 0;
     };
 
-    void InfoTokenVector::CopyFromDevice(size_t offset, InfoToken *d_ptr, size_t count) {
+    void InfoTokenVector::CopyFromDevice(InfoToken *d_ptr, size_t count) { // TODO add the Append keyword 
         Reserve(size_+count); // making sure we have the space
 
-        cudaMemcpyAsync(&h_data_[offset], d_ptr, count*sizeof(*h_data_), cudaMemcpyDeviceToHost, copy_st_);
+        cudaMemcpyAsync(&h_data_[size_], d_ptr, count*sizeof(*h_data_), cudaMemcpyDeviceToHost, copy_st_);
         size_ += count;
     }
 

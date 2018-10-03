@@ -522,12 +522,12 @@ namespace kaldi {
 						cudaFree(data_);
 					}
 
-					__host__ __device__ T *row(int r) {
-						return &data[r*ld];
-					}
-
 					__host__ __device__ T *data() {
 						return data_;
+					}
+				protected:
+					__host__ __device__ T *row(const int32 r) {
+						return &data_[r*ld_];
 					}
 				};
 
@@ -535,28 +535,28 @@ namespace kaldi {
 			// Wrappers for code clarity
 			template<typename T> 
 				class LaneMatrix : public DeviceMatrix<T> {
-				public:
-					LaneMatrix(int nrows, int ld) : DeviceMatrix(nrows, ld) {}
-					__host__ __device__ T *lane(int ilane) {
-						return row(ilane);
-				}
-			};
-			
+					public:
+						LaneMatrix(const int32 nrows, const int32 ld) : DeviceMatrix<T>(nrows, ld) {}
+						__host__ __device__ T *lane(const int32 ilane) {
+							return this->row(ilane);
+						}
+				};
+
 			template<typename T> 
-			class ChannelMatrix : public DeviceMatrix<T> {
-				public:
-				ChannelMatrix(int nrows, int ld) : DeviceMatrix(nrows, ld) {}
-				__host__ __device__ T *channel(int ichannel) {
-					return row(ichannel);
-				}
-			};
+				class ChannelMatrix : public DeviceMatrix<T> {
+					public:
+						ChannelMatrix(const int32 nrows, const int32 ld) : DeviceMatrix<T>(nrows, ld) {}
+						__host__ __device__ T *channel(const int32 ichannel) {
+							return this->row(ichannel);
+						}
+				};
 			public: // TODO
 			struct KernelParams {
-				KernelParams(int nlanes, 
-						int nchannels, 
-						int max_tokens_per_frame,
-						int nilabels,
-						int num_states) :
+				KernelParams(const int32 nlanes, 
+						const int32 nchannels, 
+						const int32 max_tokens_per_frame,
+						const int32 nilabels,
+						const int32 num_states) :
 					d_channels_counters(nchannels, 1),
 					d_lanes_counters(nlanes, 1),
 					d_main_q_state_and_cost(nchannels, max_tokens_per_frame),
