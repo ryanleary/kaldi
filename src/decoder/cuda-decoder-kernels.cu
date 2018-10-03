@@ -83,15 +83,13 @@ namespace kaldi {
 
 
 	#if __CUDA_ARCH__ < 350
-	__device__ unsigned long long atomicMinCAS(unsigned long long *addr, unsigned long long value) {
+	__device__ void atomicMinCAS(unsigned long long *addr, unsigned long long value) {
 		unsigned long long old = *addr, assumed;
-		if(old <= value) return old;
+		if(old <= value) return;
 		do {
 			assumed = old;
-			old = atomicCAS((unsigned int*)addr, __float_as_int(assumed), __float_as_int(value));
-
-		} while(old!=assumed);
-		return old;
+			old = atomicCAS(addr, assumed, value);
+		} while(old!=assumed && old > value);  
 	}
 	#endif 
 
@@ -103,16 +101,15 @@ namespace kaldi {
 		return uold.i2;
 	} 	
 
-	__device__ __inline__ int2 atomicMinI2(int2 *ptr, int2 val) {
+	__device__ __inline__ void atomicMinI2(int2 *ptr, int2 val) {
 		unsigned long long int *ptr64 = reinterpret_cast<unsigned long long int*>(ptr);
-		Int64UnionInt2 uval, uold;
+		Int64UnionInt2 uval;
 		uval.i2 = val;
 		#if __CUDA_ARCH__ < 350
-		uold.l = atomicMinCAS(ptr64, uval.l); // overloading fails for some reasons
+		atomicMinCAS(ptr64, uval.l); // overloading fails for some reasons (C function?)
 		#else
-		uold.l = atomicMin(ptr64, uval.l); 
+		atomicMin(ptr64, uval.l); 
 		#endif 
-		return uold.i2;
 	}
 
 	// GetAdaptiveBeam is used by ExpandArc and FinalizeProcessNonemitting

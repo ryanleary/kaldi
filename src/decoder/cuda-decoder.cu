@@ -137,6 +137,7 @@ namespace kaldi {
 	}
 
 	void CudaDecoder::ComputeInitialChannel() {
+		printf("GOGOGO \n");
 		KALDI_ASSERT(nlanes_ > 0);
 		const int ilane = 0;
 		// Adding the start state to the initial token queue
@@ -236,8 +237,14 @@ namespace kaldi {
 
 		// Waiting for copy to be done
 		cudaStreamSynchronize(copy_st_);
+		KALDI_ASSERT(0);
 
 		KALDI_DECODER_CUDA_CHECK_ERROR();
+	}
+
+	void CudaDecoder::InitDecoding() {
+		std::vector<ChannelId> channels = {0};	
+		InitDecoding(channels);
 	}
 
 	void CudaDecoder::InitDecoding(const std::vector<ChannelId> &channels) {
@@ -274,6 +281,12 @@ namespace kaldi {
 			h_channels_counters_[ichannel].prev_main_q_narcs_and_end = h_lanes_counters_[ilane].main_q_narcs_and_end;
 			h_channels_counters_[ichannel].prev_main_q_global_offset = h_lanes_counters_[ilane].main_q_global_offset;
 		}
+	}
+
+	void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
+			int32 max_num_frames) {
+		std::vector<ChannelId> channels = {0};	
+		AdvanceDecoding(decodable, channels, max_num_frames);
 	}
 
 	void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
@@ -608,6 +621,11 @@ namespace kaldi {
 	// from there
 	// It then returns that path
 	//
+	bool CudaDecoder::GetBestPath(Lattice* fst_out, bool use_final_probs) {
+		std::vector<ChannelId> channels = {0};	
+		std::vector<Lattice*> fst_out_vec = {fst_out};	
+		GetBestPath(channels, fst_out_vec, use_final_probs); 
+	}
 	bool CudaDecoder::GetBestPath(const std::vector<ChannelId> &channels, const std::vector<Lattice*> &fst_out_vec, bool use_final_probs) {
 		nvtxRangePushA("GetBestPath");
 		std::vector<std::pair<int32,CostType>> argmins;
@@ -678,5 +696,14 @@ namespace kaldi {
 		for(LaneId lane_id=0; lane_id<channels.size(); ++lane_id)
 			h_kernel_params_->channel_to_compute[lane_id] = channels[lane_id];
 		h_kernel_params_->nlanes_used = channels.size();
+	}
+
+	int32 CudaDecoder::NumFramesDecoded(ChannelId ichannel) const {
+		KALDI_ASSERT(ichannel < nchannels_);
+		return num_frames_decoded_[ichannel];	
+	}
+
+	int32 CudaDecoder::NumFramesDecoded() const {
+		return NumFramesDecoded(0);
 	}
 } // end namespace kaldi.

@@ -136,12 +136,12 @@ namespace kaldi {
         InfoToken *h_data_;
 
         public:
-        InfoTokenVector(int initial_capacity, cudaStream_t copy_st_);
+        InfoTokenVector(int32 initial_capacity, cudaStream_t copy_st_);
         void Clone(const InfoTokenVector &other);
         void Reset();
-        void CopyFromDevice(InfoToken *d_ptr, size_t count);    
-        int32 Size() { return size_; }
-        void Reserve(size_t min_capacity);
+        void CopyFromDevice(InfoToken *d_ptr, int32 count);    
+        int32 Size() const { return size_; }
+        void Reserve(int32 min_capacity);
         InfoToken *GetRawPointer() const;
         virtual ~InfoTokenVector();
     };

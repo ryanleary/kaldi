@@ -137,12 +137,14 @@ namespace kaldi {
 			// Computes the initial channel
 			// The initial channel is used to initialize a channel
 			// when a new utterance starts
+			// TODO private
 			void ComputeInitialChannel();
 
 			// InitDecoding initializes the decoding, and should only be used if you
 			// intend to call AdvanceDecoding() on the channels listed in channels
 			// 
 			void InitDecoding(const std::vector<ChannelId> &channels); 
+			void InitDecoding(); // batch size = 1
 
 			/// This will decode until there are no more frames ready in the decodable
 			/// object, but if max_num_frames is >= 0 it will decode no more than
@@ -151,9 +153,12 @@ namespace kaldi {
 			void AdvanceDecoding(DecodableInterface *decodable,
 					const std::vector<ChannelId> &channels,
 					int32 max_num_frames = -1);
+			void AdvanceDecoding(DecodableInterface *decodable,
+					int32 max_num_frames = -1); // batch size = 1
 
 			/// Returns the number of frames already decoded.  
 			int32 NumFramesDecoded(ChannelId ichannel) const;
+			int32 NumFramesDecoded() const; // batch size = 1
 
 			// GetBestPath gets the decoding traceback. If "use_final_probs" is true
 			// AND we reached a final state, it limits itself to final states;
@@ -164,6 +169,7 @@ namespace kaldi {
 			// It returns true if the output lattice was nonempty (i.e. had states in it);
 			// using the return value is deprecated.
 			bool GetBestPath(const std::vector<ChannelId> &channels, const std::vector<Lattice*> &fst_out_vec, bool use_final_probs=true);
+			bool GetBestPath(Lattice* fst_out, bool use_final_probs=true); // batch size = 1
 
 			// GetBestCost sets in *min the token's best cost in the main_q
 			// it also sets in *arg the index of that token (argmin)
