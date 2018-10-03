@@ -573,9 +573,11 @@ namespace kaldi {
 					d_main_q_degrees_block_sums_prefix_sum(nlanes, 
 							KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame, KALDI_CUDA_DECODER_1D_BLOCK) + 1),
 					d_main_q_arc_offsets(nchannels,  max_tokens_per_frame),
-					d_loglikelihoods(nchannels, nilabels),
+					//d_loglikelihoods(nchannels, nilabels),
 					d_state_best_int_cost(nlanes, num_states),
-					q_capacity(max_tokens_per_frame) {}
+					q_capacity(max_tokens_per_frame) {
+						cudaMalloc(&d_loglikelihoods, nilabels*sizeof(*d_loglikelihoods)); // FIXME temp
+					}
 				// In AdvanceDecoding,
 				// the lane lane_id will compute the channel
 				// with channel_id = channel_to_compute[lane_id]
@@ -623,7 +625,9 @@ namespace kaldi {
 
 				// loglikelihoods computed by the acoustic model
 				// we need it to compute the cost of emitting edges
-				ChannelMatrix<CostType> d_loglikelihoods; 
+				CostType *d_loglikelihoods;
+				//ChannelMatrix<CostType> d_loglikelihoods; 
+			
 
 				// d_state_best_cost[state] -> best cost for that state for the current frame
 				// reset between frames

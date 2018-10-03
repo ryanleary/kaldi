@@ -589,7 +589,8 @@ finalize_kernel:
 						CostType total_cost = prev_token_cost + arc_fixed_cost;
 						if(IS_EMITTING) {
 							const int32 arc_ilabel = params.d_arc_ilabels[arc_idx];
-							total_cost += params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; 
+							//total_cost += params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; 
+							total_cost += params.d_loglikelihoods[arc_ilabel]; //FIXME above
 						}
 						int_total_cost = floatToOrderedInt(total_cost);
 

@@ -549,11 +549,11 @@ namespace kaldi {
 
 
 	void CudaDecoder::ComputeLogLikelihoods(DecodableInterface *decodable) {
-		/* TODO
-		int32 frame = num_frames_decoded_;
-
-		decodable->ComputeLogLikelihoods(d_loglikelihoods_,frame,fst_.max_ilabel_+1, compute_st_);
-		*/
+		const std::vector<ChannelId> channels = {0};  // TODO != channels
+		for(const ChannelId ichannel : channels) {
+			int32 frame = num_frames_decoded_[ichannel];
+			decodable->ComputeLogLikelihoods(h_kernel_params_->d_loglikelihoods, frame, fst_.max_ilabel_+1, compute_st_);
+		}
 	}
 
 	void CudaDecoder::CheckOverflow() {
@@ -624,7 +624,7 @@ namespace kaldi {
 	bool CudaDecoder::GetBestPath(Lattice* fst_out, bool use_final_probs) {
 		std::vector<ChannelId> channels = {0};	
 		std::vector<Lattice*> fst_out_vec = {fst_out};	
-		GetBestPath(channels, fst_out_vec, use_final_probs); 
+		return GetBestPath(channels, fst_out_vec, use_final_probs); 
 	}
 	bool CudaDecoder::GetBestPath(const std::vector<ChannelId> &channels, const std::vector<Lattice*> &fst_out_vec, bool use_final_probs) {
 		nvtxRangePushA("GetBestPath");
