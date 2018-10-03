@@ -49,7 +49,6 @@ inline dim3 KALDI_CUDA_DECODER_NUM_BLOCKS(int N, int M) {
 	// TODO MAX_NUM_BLOCKS
 	grid.x = KALDI_CUDA_DECODER_DIV_ROUND_UP(N, KALDI_CUDA_DECODER_1D_BLOCK);
 	grid.y = M;
-
 	return grid;
 }
 

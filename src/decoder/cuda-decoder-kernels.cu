@@ -13,8 +13,8 @@
 // See the Apache 2 License for the specific language governing permissions and
 // limitations under the License.
 
+#include "cuda-decoder-kernels.h"
 #include <cub/cub.cuh>
-#include "decoder/cuda-decoder.h"
 
 #define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
@@ -218,12 +218,14 @@ namespace kaldi {
 					const int2 both = params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx];
 					token_state = both.x;
 					token_int_cost = both.y;
+					printf("gogo idx=%i lane=%i, state=%i, cost=%i  \n", aux_q_idx, ilane, token_state, token_int_cost);
 					// Best cost for that token_state
 					// We know we have a token associated with token_state in the queue with the cost state_best_cost
 					const IntegerCostType state_best_int_cost = params.d_state_best_int_cost.lane(ilane)[token_state];
 					// Final cutoff from last ExpandArc execution
 					const IntegerCostType int_cutoff = lane_counters->int_cutoff;
 					// Cutoff may have decreased since the creation of the token
+					printf("int_cutoff is %i \n", int_cutoff);
 					if(token_int_cost < int_cutoff) {
 						// We can have duplicates, ie token associated with the same states
 						// If this token is not the best candidate, get rid of it
@@ -306,6 +308,7 @@ namespace kaldi {
 					// This thread is in charge of a survival token
 					// we will move it to the main_q, at index main_q_idx
 					const int32 main_q_idx = sh_main_q_global_block_offset.y + block_prefix_sum_narcs_and_end.y;
+					printf("writting to %i \n", main_q_idx);
 					// Moving the token to the main q
 					params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx] = {token_state, token_int_cost};
 					params.d_main_q_info.lane(ilane)[main_q_idx] = params.d_aux_q_info.lane(ilane)[aux_q_idx];
@@ -727,6 +730,31 @@ finalize_kernel:
 			}
 		}
 
+	// Initialize initial channel
+	// The initial channel is the state of a channel when 
+	// it will start decoding a new utterance
+	__global__ void initialize_initial_lane_kernel(KernelParams params, StateId init_state, CostType init_cost) {
+		const int init_ichannel = params.init_channel_id;
+		const int init_ilane = 0;
+		ChannelCounters *init_channel_counters = params.d_channels_counters.channel(init_ichannel);
+		LaneCounters *lane_counters = params.d_lanes_counters.lane(init_ilane);
+
+		lane_counters->aux_q_end = 0;
+		lane_counters->post_expand_aux_q_end = 1;
+		lane_counters->main_q_global_offset = 0; 
+		lane_counters->main_q_local_offset = 0;
+		lane_counters->int_cutoff = INT_MAX;
+		lane_counters->min_int_cost = INT_MAX;
+		lane_counters->int_beam = floatToOrderedInt(params.default_beam);
+
+		// Simulate a previously generated aux_q containing init state
+		IntegerCostType int_init_cost = floatToOrderedInt(init_cost);
+		params.d_aux_q_state_and_cost.lane(init_ilane)[0] = {init_state, int_init_cost};
+		params.d_aux_q_info.lane(init_ilane)[0] = {INT_MIN, -1};
+		params.d_state_best_int_cost.lane(init_ilane)[init_state] = int_init_cost;
+	}
+
+
 	// Called when channels will start decoding a new utterance
 	// do everything that's needed to do on the device to start decoding a new utterance with those channels
 	__global__ void init_decoding_on_device_kernel(KernelParams params) {
@@ -781,6 +809,9 @@ finalize_kernel:
 			channel_counters->prev_main_q_global_offset = lane_counters->main_q_global_offset;
 			channel_counters->prev_main_q_narcs_and_end = lane_counters->main_q_narcs_and_end;
 			channel_counters->prev_beam = orderedIntToFloat(lane_counters->int_beam);
+			
+			int2 both = lane_counters->main_q_narcs_and_end;
+			printf("end=%i, narcs=%i \n", both.x, both.y); 
 		}
 	}
 
@@ -1028,8 +1059,10 @@ we do not need inter-block communication (we launch only one CUDA block)
 					aux_q_end = 0; // aux_q is now considered empty
 				}
 finalize_kernel:
-				if(threadIdx.x == 0) 
+				if(threadIdx.x == 0) {
 					lane_counters->main_q_narcs_and_end.y = main_q_end; 
+					lane_counters->main_q_local_offset = 0;
+				}	
 			}
 		}
 
@@ -1059,4 +1092,10 @@ finalize_kernel:
 			}
 		}
 	}
+
+
+template __global__ void expand_arcs_kernel<true>(KernelParams params);
+template __global__ void expand_arcs_kernel<false>(KernelParams params);
+template __global__ void post_expand_kernel<true>(KernelParams params);
+template __global__ void post_expand_kernel<false>(KernelParams params);
 } // end namespace kaldi

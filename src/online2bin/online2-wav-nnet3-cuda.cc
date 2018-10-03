@@ -346,7 +346,7 @@ int main(int argc, char *argv[]) {
     bool do_endpointing = false;
     bool online = true;
     int num_gpus = 1;
-    int num_threads= 8;
+    int num_threads= 1;
     bool write_lattice = true;
     bool replicate=false;
 

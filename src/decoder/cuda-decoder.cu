@@ -21,6 +21,7 @@
 #include <float.h>
 #include <algorithm>
 #include <cub/cub.cuh>
+#include "cuda-decoder-kernels.h"
 
 #define MEMADVISE
 
@@ -139,54 +140,20 @@ namespace kaldi {
 	void CudaDecoder::ComputeInitialChannel() {
 		printf("GOGOGO \n");
 		KALDI_ASSERT(nlanes_ > 0);
-		const int ilane = 0;
-		// Adding the start state to the initial token queue
-
-		//first_token_cost = StdWeight::One().Value(); TODO use this val for init cost
-		const IntegerCostType first_token_int_cost = 0;
-		const StateId first_token_state = fst_.Start();
-		const int2 first_token_state_and_int_cost = {first_token_state,first_token_int_cost};
-		InfoToken first_token_info;
-		first_token_info.prev_token = INT_MIN;
-		first_token_info.arc_idx = -1;
-		KALDI_ASSERT(first_token_state != fst::kNoStateId);
-
-		// We add that initial token to the aux_q
-		// it will be moved to the main_q during the ProcessNonemitting phase 
-		// that will be called in a few lines
-		//
-		// Note : we launch copies in the compute stream here
-		// It means that we want them to be in the main pipeline
-		// compute_st_ is just a name - it's a generic CUDA stream
-		cudaMemcpyAsync(h_kernel_params_->d_aux_q_state_and_cost.lane(ilane), 
-				&first_token_state_and_int_cost, 
-				sizeof(first_token_state_and_int_cost), 
-				cudaMemcpyHostToDevice,
-				compute_st_);
-		cudaMemcpyAsync(h_kernel_params_->d_aux_q_info.lane(ilane), 
-				&first_token_info, 
-				sizeof(first_token_info), 
-				cudaMemcpyHostToDevice,
-				compute_st_);
-
-		// Updating the best state cost lookup table for the initial token state
-		cudaMemcpyAsync(&h_kernel_params_->d_state_best_int_cost.lane(ilane)[first_token_state], 
-				&first_token_int_cost, 
-				sizeof(IntegerCostType),
-				cudaMemcpyHostToDevice,
-				compute_st_);
-
-		// We have one token is the aux_q
-		const int32 aux_q_end = 1;
-		cudaMemcpyAsync(&h_kernel_params_->d_lanes_counters.lane(ilane)->aux_q_end, 
-			&aux_q_end, 
-			sizeof(aux_q_end), 
-			cudaMemcpyHostToDevice,
-			compute_st_);
-
+		const int32 ilane = 0;
+		KALDI_ASSERT(ilane == 0);
 		// Following kernels working channel_id
 		h_kernel_params_->channel_to_compute[ilane] = init_channel_id_;
 		h_kernel_params_->nlanes_used = 1;
+
+		// Adding the start state to the initial token queue
+		const StateId init_state = fst_.Start();
+		const CostType init_cost = StdWeight::One().Value();
+		KALDI_ASSERT(init_state != fst::kNoStateId);
+		initialize_initial_lane_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
+			KALDI_CUDA_DECODER_1D_BLOCK,
+			0,
+			compute_st_>>>(*h_kernel_params_, init_state, init_cost);
 
 		// Initial ProcessNonEmitting
 		preprocess_and_contract_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
@@ -231,6 +198,13 @@ namespace kaldi {
 
 		// Saving initial queue to host
 		h_all_tokens_info_[init_channel_id_].CopyFromDevice(h_kernel_params_->d_main_q_info.lane(ilane), main_q_end);
+
+		// Context switch : saving channel state
+		save_channels_state_from_lanes_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
+						KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+						0,
+						compute_st_>>>(*h_kernel_params_);
+		SaveChannelsStateFromLanesCPU();
 
 		// Waiting for compute to be done 
 		cudaStreamSynchronize(compute_st_);
