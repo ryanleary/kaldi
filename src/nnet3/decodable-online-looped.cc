@@ -255,7 +255,7 @@ BaseFloat DecodableAmNnetLoopedOnline::LogLikelihood(int32 subsampled_frame,
   EnsureFrameIsComputed(subsampled_frame);
   return current_log_post_(
       subsampled_frame - current_log_post_subsampled_offset_,
-      trans_model_.TransitionIdToPdf(index));
+      trans_model_.TransitionIdToPdfFast(index));
 }
 
 void DecodableAmNnetLoopedOnline::ComputeLogLikelihoods(BaseFloat *out, int32 subsampled_frame,
