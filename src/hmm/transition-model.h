@@ -306,7 +306,9 @@ class TransitionModel {
   /// state (indexed by transition-id).
   std::vector<int32> id2state_;
 
+  public:  //quick and dirty hack to access inside decodable.   TODO: Need to expose this properly...
   std::vector<int32> id2pdf_id_;
+  private:
 
   /// For each transition-id, the corresponding log-prob.  Indexed by transition-id.
   Vector<BaseFloat> log_probs_;

@@ -99,7 +99,7 @@ class DecodableNnetLoopedOnlineBase: public DecodableInterface {
 
   // The current log-posteriors that we got from the last time we
   // ran the computation.
-  Matrix<BaseFloat> current_log_post_;
+  CuMatrix<BaseFloat> current_log_post_;
 
   // The number of chunks we have computed so far.
   int32 num_chunks_computed_;
@@ -150,6 +150,7 @@ class DecodableNnetLoopedOnline: public DecodableNnetLoopedOnlineBase {
   // reduced-rate output frame (e.g. a 't' index divided by 3).  'index'
   // represents the pdf-id (or other output of the network) PLUS ONE.
   virtual BaseFloat LogLikelihood(int32 subsampled_frame, int32 index);
+  virtual void ComputeLogLikelihoods(BaseFloat* out, int32 subsampled_frame, int32 count);
 
  private:
   KALDI_DISALLOW_COPY_AND_ASSIGN(DecodableNnetLoopedOnline);
@@ -182,13 +183,40 @@ class DecodableAmNnetLoopedOnline: public DecodableNnetLoopedOnlineBase {
   // reduced-rate output frame (e.g. a 't' index divided by 3).
   virtual BaseFloat LogLikelihood(int32 subsampled_frame,
                                   int32 transition_id);
+  virtual void ComputeLogLikelihoods(BaseFloat* out, int32 subsampled_frame, int32 count);
 
  private:
   const TransitionModel &trans_model_;
-
+  
   KALDI_DISALLOW_COPY_AND_ASSIGN(DecodableAmNnetLoopedOnline);
 
 };
+
+
+class DecodableAmNnetLoopedOnlineCuda: public DecodableNnetLoopedOnlineBase {
+ public:
+  DecodableAmNnetLoopedOnlineCuda(
+      const TransitionModel &trans_model,
+      const DecodableNnetSimpleLoopedInfo &info,
+      OnlineFeatureInterface *input_features,
+      OnlineFeatureInterface *ivector_features);
+
+  ~DecodableAmNnetLoopedOnlineCuda();
+
+  // returns the output-dim of the neural net.
+  virtual int32 NumIndices() const { return trans_model_.NumTransitionIds(); }
+
+  // 'subsampled_frame' is a frame, but if frame-subsampling-factor != 1, it's a
+  // reduced-rate output frame (e.g. a 't' index divided by 3).
+  virtual void ComputeLogLikelihoods(BaseFloat* out, int32 subsampled_frame, int32 count, void* stream);
+  virtual BaseFloat LogLikelihood(int32 subsampled_frame, int32 transition_id) {return 0;} //TODO hack, should probably have a cuda-itf.
+ private:
+  const TransitionModel &trans_model_;
+  int32_t *trans_d_; 
+  KALDI_DISALLOW_COPY_AND_ASSIGN(DecodableAmNnetLoopedOnlineCuda);
+
+};
+
 
 
 

@@ -76,7 +76,7 @@ class FasterDecoder {
   void Decode(DecodableInterface *decodable);
 
   /// Returns true if a final state was active on the last frame.
-  bool ReachedFinal();
+  bool ReachedFinal() const;
 
   /// GetBestPath gets the decoding traceback. If "use_final_probs" is true
   /// AND we reached a final state, it limits itself to final states;
@@ -85,7 +85,7 @@ class FasterDecoder {
   /// FST (will only return false in unusual circumstances where
   /// no tokens survived).
   bool GetBestPath(fst::MutableFst<LatticeArc> *fst_out,
-                   bool use_final_probs = true);
+                   bool use_final_probs = true) const;
 
   /// As a new alternative to Decode(), you can call InitDecoding
   /// and then (possibly multiple times) AdvanceDecoding().

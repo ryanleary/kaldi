@@ -79,6 +79,30 @@ static bool GetCudaContext(int32 num_gpus, std::string *debug_str) {
   return false;
 }
 
+/**
+ * SelectGpuId(use_gpu)
+ *
+ * There are 3 'use_gpu' modes for GPU selection:
+ * "yes"      -- Select GPU automatically (or get one by exclusive mode)
+ *               and die if this fails.
+ * "optional" -- Do as above, but if it fails, back off to CPU.
+ * "no"       -- Run on CPU.
+ *
+ * In case of Compute exclusive mode, the GPU is selected by OS.
+ *
+ * Otherwise GPU selection is based on largest proportion of free memory.
+ * This can eventually lead to multiple processes computing on single GPU,
+ * which is slow. More practical is to use "compute exclusive mode".
+ *
+ * This method is to be called at the very beginning of the program
+ * (before first allocation in cudamatrix), or not at all (default to CPU).
+ *
+ */
+  
+void CuDevice::SelectGpuId(int id) {
+  cudaSetDevice(id);
+  FinalizeActiveGpu();
+}
 
 void CuDevice::Initialize() {
   // This function may be called in the following two situations:
@@ -249,7 +273,11 @@ void CuDevice::FinalizeActiveGpu() {
     CUSPARSE_SAFE_CALL(cusparseCreate(&cusparse_handle_));
     CUSPARSE_SAFE_CALL(cusparseSetStream(cusparse_handle_, cudaStreamPerThread));
 
-    // Notify the user which GPU is being userd.
+    // Using the CUDA stream associated with the CPU thread owning this CuDevice
+    cublasSetStream(cublas_handle_, cudaStreamPerThread);
+    cusparseSetStream(cusparse_handle_,cudaStreamPerThread);
+
+    // Notify user which GPU is finally used
     char name[128];
     DeviceGetName(name,128, device_id);
 
