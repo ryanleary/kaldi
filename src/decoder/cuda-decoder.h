@@ -25,6 +25,8 @@
 #include <tuple>
 
 #include "decoder/cuda-decoder-utils.h"
+			
+// TODO remove cuda code from this header
 
 //
 // To understand the following lines it is important to 
@@ -43,7 +45,7 @@
 
 
 // Number of GPU decoder lanes
-#define KALDI_CUDA_DECODER_MAX_N_LANES 40
+#define KALDI_CUDA_DECODER_MAX_N_LANES 4
 
 // If we're at risk of filling the tokens queue,
 // the beam is reduced to keep only the best candidates in the 
@@ -510,74 +512,87 @@ namespace kaldi {
 				int32 prev_main_q_global_offset;            
 			};
 
-			LaneCounters *h_lanes_counters_, *d_lanes_counters_;	
-			ChannelCounters *h_channels_counters_, *d_channels_counters_;	
+			LaneCounters *h_lanes_counters_;	
+			ChannelCounters *h_channels_counters_;	
 			int32 nlanes_, nchannels_;
+
+			template<typename T> 
+				struct LaneMatrixInterface  {
+					T *data_;	
+					int32 ld_;	 // leading dimension - may use a log2 at some point
+					__host__ __device__ T *lane(const int32 ilane) {
+						return &data_[ilane*ld_];
+					}
+				};
+
+			template<typename T> 
+				struct ChannelMatrixInterface {
+					T *data_;	
+					int32 ld_;	 // leading dimension
+					__host__ __device__ T *channel(const int32 ichannel) {
+						return &data_[ichannel*ld_];
+					}
+				};
 
 			template<typename T>
 				// if necessary, make a version that always use ld_ as the next power of 2
 				class DeviceMatrix {
 					T *data_;	
-					int ld_;	 // leading dimension
-					public:
-					DeviceMatrix(int nrows, int ld) : ld_(ld) {
-						cudaMalloc(&data_, nrows*ld*sizeof(*data_));
+					void Allocate() {
+						KALDI_ASSERT(nrows_ > 0);
+						KALDI_ASSERT(ld_ > 0);
+						KALDI_ASSERT(!data_);
+						cudaMalloc(&data_, nrows_*ld_*sizeof(*data_));
 					}
-
-					virtual ~DeviceMatrix() {
+					void Free() {
+						KALDI_ASSERT(data_);
 						cudaFree(data_);
 					}
+					protected:
+					int32 ld_;	 // leading dimension
+					int32 nrows_;	 // leading dimension
+					public:
+					DeviceMatrix() : data_(NULL), ld_(0), nrows_(0) {}
 
-					__host__ __device__ T *data() {
+					virtual ~DeviceMatrix() {
+						if(data_)
+							Free();
+					}
+
+					void Resize(int32 nrows, int32 ld) {
+						KALDI_ASSERT(nrows > 0);
+						KALDI_ASSERT(ld > 0);
+						nrows_ = nrows;
+						ld_ = ld;
+					}
+
+					T *MutableData() {
+						if(!data_)
+							Allocate();
 						return data_;
 					}
-				protected:
-					__host__ __device__ T *row(const int32 r) {
-						return &data_[r*ld_];
-					}
+					// abstract getInterface... 
 				};
 
-
-			// Wrappers for code clarity
-			template<typename T> 
-				class LaneMatrix : public DeviceMatrix<T> {
+			public:
+			template<typename T>
+				class DeviceLaneMatrix : public DeviceMatrix<T>  {
 					public:
-						LaneMatrix(const int32 nrows, const int32 ld) : DeviceMatrix<T>(nrows, ld) {}
-						__host__ __device__ T *lane(const int32 ilane) {
-							return this->row(ilane);
+						LaneMatrixInterface<T> GetInterface() {	
+							return {this->MutableData(), this->ld_};
 						}
 				};
 
-			template<typename T> 
-				class ChannelMatrix : public DeviceMatrix<T> {
+			template<typename T>
+				class DeviceChannelMatrix : public DeviceMatrix<T> {
 					public:
-						ChannelMatrix(const int32 nrows, const int32 ld) : DeviceMatrix<T>(nrows, ld) {}
-						__host__ __device__ T *channel(const int32 ichannel) {
-							return this->row(ichannel);
+						ChannelMatrixInterface<T> GetInterface() {	
+							return {this->MutableData(), this->ld_};
 						}
 				};
-			public: // TODO
+
+
 			struct KernelParams {
-				KernelParams(const int32 nlanes, 
-						const int32 nchannels, 
-						const int32 max_tokens_per_frame,
-						const int32 nilabels,
-						const int32 num_states) :
-					d_channels_counters(nchannels, 1),
-					d_lanes_counters(nlanes, 1),
-					d_main_q_state_and_cost(nchannels, max_tokens_per_frame),
-					d_main_q_info(nlanes, max_tokens_per_frame),
-					d_aux_q_state_and_cost(nlanes, max_tokens_per_frame),
-					d_aux_q_info(nlanes, max_tokens_per_frame),
-					d_main_q_degrees_prefix_sum(nchannels, max_tokens_per_frame),
-					d_main_q_degrees_block_sums_prefix_sum(nlanes, 
-							KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame, KALDI_CUDA_DECODER_1D_BLOCK) + 1),
-					d_main_q_arc_offsets(nchannels,  max_tokens_per_frame),
-					//d_loglikelihoods(nchannels, nilabels),
-					d_state_best_int_cost(nlanes, num_states),
-					q_capacity(max_tokens_per_frame) {
-						cudaMalloc(&d_loglikelihoods, nilabels*sizeof(*d_loglikelihoods)); // FIXME temp
-					}
 				// In AdvanceDecoding,
 				// the lane lane_id will compute the channel
 				// with channel_id = channel_to_compute[lane_id]
@@ -585,57 +600,21 @@ namespace kaldi {
 				int32 nlanes_used;
 				int32 max_nlanes;
 
-				ChannelMatrix<ChannelCounters> d_channels_counters; 
-				LaneMatrix<LaneCounters> d_lanes_counters; 
+				ChannelMatrixInterface<ChannelCounters> d_channels_counters; 
+				LaneMatrixInterface<LaneCounters> d_lanes_counters; 
 
-				// main_q_* TODO comments
-				ChannelMatrix<int2> d_main_q_state_and_cost; 
+				ChannelMatrixInterface<int2> d_main_q_state_and_cost; 
+				LaneMatrixInterface<InfoToken> d_main_q_info; 
 
-				// d_main_q_info_ is only needed as a buffer when creating the 
-				// tokens. It is not needed by the next frame computation
-				// We send it back to the host, and at the end of a frame's computation,
-				// it can be used by another channel. That's why it's in 
-				// "LaneParams", and not "ChannelParams"
-				LaneMatrix<InfoToken> d_main_q_info; 
+				LaneMatrixInterface<int2> d_aux_q_state_and_cost; // TODO int_cost
+				LaneMatrixInterface<InfoToken> d_aux_q_info; 
+				ChannelMatrixInterface<int32> d_main_q_degrees_prefix_sum; 
+				LaneMatrixInterface<int32> d_main_q_degrees_block_sums_prefix_sum; 
+				ChannelMatrixInterface<int32> d_main_q_arc_offsets; 
+				ChannelMatrixInterface<CostType> d_loglikelihoods;
+				LaneMatrixInterface<IntegerCostType> d_state_best_int_cost; 
 
-				// Same thing for the aux q
-				LaneMatrix<int2> d_aux_q_state_and_cost; // TODO int_cost
-				LaneMatrix<InfoToken> d_aux_q_info; 
-
-				// The load balancing of the Expand kernel relies on the prefix sum of the degrees 
-				// of the state in the queue (more info in the ExpandKernel implementation) 
-				// That array contains that prefix sum. It is set by the "Preprocess*" kernels
-				// and used by the Expand kernel
-				ChannelMatrix<int32> d_main_q_degrees_prefix_sum; 
-
-				// When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
-				// (1) First generate the prefix sum inside each CUDA blocks
-				// (2) then generate the prefix sum of the sums of each CUDA blocks
-				// (3) Use (1) and (2) to generate the global prefix sum
-				// Data from step 1 and 3 is stored in d_main_q_degrees_prefix_sum
-				// Data from step 2 is stored in d_main_q_degrees_block_sums_prefix_sum
-				// Note : this is only used by PreprocessInPlace
-				// PreprocessAndContract uses a trick to compute the global prefix sum in one pass	    
-				LaneMatrix<int32> d_main_q_degrees_block_sums_prefix_sum; 
-
-				// d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
-				// we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
-				// we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
-				ChannelMatrix<int32> d_main_q_arc_offsets; 
-
-				// loglikelihoods computed by the acoustic model
-				// we need it to compute the cost of emitting edges
-				CostType *d_loglikelihoods;
-				//ChannelMatrix<CostType> d_loglikelihoods; 
-			
-
-				// d_state_best_cost[state] -> best cost for that state for the current frame
-				// reset between frames
-				// type int32 to be able to use native atomicMin instruction
-				// we use a 1:1 conversion float <---> sortable int
-				LaneMatrix<IntegerCostType> d_state_best_int_cost; 
-
-				// TODO use the CudaFst datastructure
+				// TODO use the CudaFst struct
 				int32 q_capacity;
 				CostType *d_arc_weights;
 				int32 *d_arc_nextstates;
@@ -647,6 +626,48 @@ namespace kaldi {
 				CostType default_beam;
 				int32 init_channel_id;
 			};
+
+			// Contain the various counters used by lanes/channels, such as main_q_end, main_q_narcs..
+			DeviceChannelMatrix<ChannelCounters> d_channels_counters_; 
+			DeviceLaneMatrix<LaneCounters> d_lanes_counters_; 
+
+			// main_q_* TODO comments
+			DeviceChannelMatrix<int2> d_main_q_state_and_cost_; 
+
+			// d_main_q_info_ is only needed as a buffer when creating the 
+			// tokens. It is not needed by the next frame computation
+			// We send it back to the host, and at the end of a frame's computation,
+			// it can be used by another channel. That's why it's in 
+			// "LaneParams", and not "ChannelParams"
+			DeviceLaneMatrix<InfoToken> d_main_q_info_; 
+
+			// Same thing for the aux q
+			DeviceLaneMatrix<int2> d_aux_q_state_and_cost_; // TODO int_cost
+			DeviceLaneMatrix<InfoToken> d_aux_q_info_; 
+
+			// The load balancing of the Expand kernel relies on the prefix sum of the degrees 
+			// of the state in the queue (more info in the ExpandKernel implementation) 
+			// That array contains that prefix sum. It is set by the "Preprocess*" kernels
+			// and used by the Expand kernel
+			DeviceChannelMatrix<int32> d_main_q_degrees_prefix_sum_; 
+
+			// When generating d_main_q_degrees_prefix_sum we may need to do it in three steps
+			// (1) First generate the prefix sum inside each CUDA blocks
+			// (2) then generate the prefix sum of the sums of each CUDA blocks
+			// (3) Use (1) and (2) to generate the global prefix sum
+			// Data from step 1 and 3 is stored in d_main_q_degrees_prefix_sum
+			// Data from step 2 is stored in d_main_q_degrees_block_sums_prefix_sum
+			// Note : this is only used by PreprocessInPlace
+			// PreprocessAndContract uses a trick to compute the global prefix sum in one pass	    
+			DeviceLaneMatrix<int32> d_main_q_degrees_block_sums_prefix_sum_; 
+
+			// d_main_q_arc_offsets[i] = fst_.arc_offsets[d_main_q_state[i]]
+			// we pay the price for the random memory accesses of fst_.arc_offsets in the preprocess kernel
+			// we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
+			DeviceChannelMatrix<int32> d_main_q_arc_offsets_; 
+
+			DeviceChannelMatrix<CostType> d_loglikelihoods_;
+			DeviceLaneMatrix<IntegerCostType> d_state_best_int_cost_; 
 
 			KernelParams *h_kernel_params_;
 

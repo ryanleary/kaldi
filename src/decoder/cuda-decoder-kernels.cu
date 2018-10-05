@@ -19,12 +19,9 @@
 #define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 namespace kaldi {
-	typedef CudaDecoder::StateId StateId;
-	typedef CudaDecoder::CostType CostType;
 	typedef CudaDecoder::MinCostAndBeamIntegers MinCostAndBeamIntegers;
 	typedef CudaDecoder::MinCostAndBeam MinCostAndBeam;
 	typedef CudaDecoder::IntegerCostType IntegerCostType;
-	typedef CudaDecoder::KernelParams KernelParams;
 	typedef CudaDecoder::LaneCounters LaneCounters;
 	typedef CudaDecoder::ChannelCounters ChannelCounters;
 
@@ -205,6 +202,7 @@ namespace kaldi {
 			// otherwise __syncthreads() would fail
 			LaneCounters *lane_counters = params.d_lanes_counters.lane(ilane);
 			const int32 aux_q_end = lane_counters->post_expand_aux_q_end;
+			printf("aux_q_end=%i \n", aux_q_end);
 			KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(block_offset, thread_idx, aux_q_end) {
 				const int32 aux_q_idx = block_offset + thread_idx;
 				const int32 ichannel = params.channel_to_compute[ilane];
@@ -215,10 +213,11 @@ namespace kaldi {
 				// if aux_q_idx is a valid index in the main_q
 				if(aux_q_idx < aux_q_end) {
 					// Cost and state associated with the token
+					printf("hello\n");
 					const int2 both = params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx];
+					printf("hello\n");
 					token_state = both.x;
 					token_int_cost = both.y;
-					printf("gogo idx=%i lane=%i, state=%i, cost=%i  \n", aux_q_idx, ilane, token_state, token_int_cost);
 					// Best cost for that token_state
 					// We know we have a token associated with token_state in the queue with the cost state_best_cost
 					const IntegerCostType state_best_int_cost = params.d_state_best_int_cost.lane(ilane)[token_state];
@@ -592,8 +591,8 @@ finalize_kernel:
 						CostType total_cost = prev_token_cost + arc_fixed_cost;
 						if(IS_EMITTING) {
 							const int32 arc_ilabel = params.d_arc_ilabels[arc_idx];
-							//total_cost += params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; 
-							total_cost += params.d_loglikelihoods[arc_ilabel]; //FIXME above
+							//total_cost += params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; FIXME 
+							total_cost += params.d_loglikelihoods.channel(0)[arc_ilabel]; //FIXME above
 						}
 						int_total_cost = floatToOrderedInt(total_cost);
 
@@ -734,6 +733,7 @@ finalize_kernel:
 	// The initial channel is the state of a channel when 
 	// it will start decoding a new utterance
 	__global__ void initialize_initial_lane_kernel(KernelParams params, StateId init_state, CostType init_cost) {
+		printf("youhou");
 		const int init_ichannel = params.init_channel_id;
 		const int init_ilane = 0;
 		ChannelCounters *init_channel_counters = params.d_channels_counters.channel(init_ichannel);

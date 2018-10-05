@@ -52,23 +52,54 @@ namespace kaldi {
 
 		++nchannels_; // allocating init_channel_params at the same time
 
+		const int32 num_ilabels = fst_.max_ilabel_;
+		const int32 num_states = fst_.num_states_;
+		d_channels_counters_.Resize(nchannels, 1);
+		d_lanes_counters_.Resize(nlanes, 1);
+		d_main_q_state_and_cost_.Resize(nchannels, max_tokens_per_frame_);
+		d_main_q_info_.Resize(nlanes, max_tokens_per_frame_);
+		d_aux_q_state_and_cost_.Resize(nlanes, max_tokens_per_frame_);
+		d_aux_q_info_.Resize(nlanes, max_tokens_per_frame_);
+		d_main_q_degrees_prefix_sum_.Resize(nchannels, max_tokens_per_frame_);
+		d_main_q_degrees_block_sums_prefix_sum_.Resize(nlanes, 
+				KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_1D_BLOCK) + 1);
+		d_main_q_arc_offsets_.Resize(nchannels,  max_tokens_per_frame_);
+		d_state_best_int_cost_.Resize(nlanes, num_states);
+		d_loglikelihoods_.Resize(1, num_ilabels);
+
 		// Setting Kernel Params
 		// sent to kernels by copy
 		// Making sure we'll be able to send it to the kernels
 		//KALDI_STATIC_ASSERT(sizeof(KernelParams) < KALDI_CUDA_DECODER_MAX_KERNEL_ARGUMENTS_BYTE_SIZE); TODO find include
 
-		h_kernel_params_ = new KernelParams(nlanes_, 
-				nchannels_, 
-				max_tokens_per_frame_,
-				fst_.max_ilabel_,
-				fst_.num_states_);
-
-		cudaMemsetAsync(h_kernel_params_->d_channels_counters.data(), 0, nchannels_*sizeof(h_kernel_params_->d_channels_counters.data()));
-		cudaMemsetAsync(h_kernel_params_->d_lanes_counters.data(), 0, nlanes_*sizeof(h_kernel_params_->d_lanes_counters.data()));
+		cudaMemsetAsync(d_channels_counters_.MutableData(), 0, nchannels_*sizeof(d_channels_counters_.MutableData()));
+		cudaMemsetAsync(d_lanes_counters_.MutableData(), 0, nlanes_*sizeof(d_lanes_counters_.MutableData()));
 		cudaMallocHost(&h_lanes_counters_, nlanes_ * sizeof(*h_lanes_counters_));
 		cudaMallocHost(&h_channels_counters_, nchannels_ * sizeof(*h_channels_counters_));
-		d_lanes_counters_ = h_kernel_params_->d_lanes_counters.data();
-		d_channels_counters_ = h_kernel_params_->d_channels_counters.data();
+
+		h_kernel_params_ = new KernelParams();
+		h_kernel_params_->d_channels_counters = d_channels_counters_.GetInterface();
+		h_kernel_params_->d_lanes_counters =d_lanes_counters_.GetInterface();
+		h_kernel_params_->d_main_q_state_and_cost = d_main_q_state_and_cost_.GetInterface();
+		h_kernel_params_->d_main_q_info = d_main_q_info_.GetInterface();
+		h_kernel_params_->d_aux_q_state_and_cost = d_aux_q_state_and_cost_.GetInterface();
+		h_kernel_params_->d_aux_q_info = d_aux_q_info_.GetInterface();
+		h_kernel_params_->d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_.GetInterface();
+		h_kernel_params_->d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_.GetInterface();
+		h_kernel_params_->d_main_q_arc_offsets = d_main_q_arc_offsets_.GetInterface();
+		h_kernel_params_->d_loglikelihoods = d_loglikelihoods_.GetInterface();
+		h_kernel_params_->d_state_best_int_cost = d_state_best_int_cost_.GetInterface();
+		h_kernel_params_->d_arc_e_offsets = fst_.d_e_offsets_;
+		h_kernel_params_->d_arc_ne_offsets = fst_.d_ne_offsets_;
+		h_kernel_params_->d_arc_ilabels = fst_.d_arc_ilabels_;
+		h_kernel_params_->d_arc_weights = fst_.d_arc_weights_;
+		h_kernel_params_->d_arc_nextstates = fst_.d_arc_nextstates_;
+		h_kernel_params_->d_fst_final_costs = fst_.d_final_;
+		h_kernel_params_->default_beam = default_beam_;
+		h_kernel_params_->q_capacity = max_tokens_per_frame_; 
+		h_kernel_params_->init_channel_id = init_channel_id_; 
+		h_kernel_params_->max_nlanes = nlanes_; 
+		h_kernel_params_->nstates = fst_.num_states_; 
 
 		// Using last one as init_channel_params
 		init_channel_id_ = nchannels_-1;
@@ -83,35 +114,20 @@ namespace kaldi {
 		num_frames_decoded_.resize(nchannels_, 0);
 
 		// Filling all best_state_cost with +INF
-		int32 nstates = fst_.NumStates();
-		init_state_best_cost_lookup_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(nstates, nlanes_),
+		init_state_best_cost_lookup_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(num_states, nlanes_),
 						KALDI_CUDA_DECODER_1D_BLOCK,
 						0,
 						compute_st_>>>(*h_kernel_params_);
-
-		// Making sure that everything is ready to use
-		cudaStreamSynchronize(compute_st_);
-
-		// TODO move to constructor
-		h_kernel_params_->d_arc_e_offsets = fst_.d_e_offsets_;
-		h_kernel_params_->d_arc_ne_offsets = fst_.d_ne_offsets_;
-		h_kernel_params_->d_arc_ilabels = fst_.d_arc_ilabels_;
-		h_kernel_params_->d_arc_weights = fst_.d_arc_weights_;
-		h_kernel_params_->d_arc_nextstates = fst_.d_arc_nextstates_;
-		h_kernel_params_->d_fst_final_costs = fst_.d_final_;
-		h_kernel_params_->default_beam = default_beam_;
-		h_kernel_params_->q_capacity = max_tokens_per_frame_; 
-		h_kernel_params_->init_channel_id = init_channel_id_; 
-		h_kernel_params_->max_nlanes = nlanes_; 
-		h_kernel_params_->nstates = fst_.num_states_; 
-
+		
 		if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
 			KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
-
 			uint32_t debug_buffer_queue_size = max_tokens_per_frame_ + 1;
 			cudaMallocHost(&h_debug_buf1_, std::max(fst_.num_states_, debug_buffer_queue_size) * sizeof(h_debug_buf1_));
 			cudaMallocHost(&h_debug_buf2_, debug_buffer_queue_size * sizeof(h_debug_buf2_));
 		} 
+
+		// Making sure that everything is ready to use
+		cudaStreamSynchronize(compute_st_);
 	}
 
 	CudaDecoder::~CudaDecoder() {
@@ -150,10 +166,11 @@ namespace kaldi {
 		const StateId init_state = fst_.Start();
 		const CostType init_cost = StdWeight::One().Value();
 		KALDI_ASSERT(init_state != fst::kNoStateId);
+	auto params = *h_kernel_params_;
 		initialize_initial_lane_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
 			KALDI_CUDA_DECODER_1D_BLOCK,
 			0,
-			compute_st_>>>(*h_kernel_params_, init_state, init_cost);
+			compute_st_>>>(params, init_state, init_cost);
 
 		// Initial ProcessNonEmitting
 		preprocess_and_contract_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
@@ -192,7 +209,7 @@ namespace kaldi {
 		
 		// Saving init params on host
 		cudaMemcpyAsync(&h_channels_counters_[init_channel_id_], 
-				&d_channels_counters_[init_channel_id_], 
+				&d_channels_counters_.MutableData()[init_channel_id_], 
 				sizeof(*h_channels_counters_), 
 				cudaMemcpyDeviceToHost);
 
@@ -350,7 +367,7 @@ namespace kaldi {
 			// Copying the counters to host,
 			// we need the aux_q_end values
 			cudaMemcpyAsync(h_lanes_counters_,     
-					d_lanes_counters_, 
+					d_lanes_counters_.MutableData(), 
 					nlanes_used*sizeof(h_lanes_counters_), 
 					cudaMemcpyDeviceToHost,
 					compute_st_);
@@ -409,7 +426,7 @@ namespace kaldi {
 				// Moving the lanes_params to host,
 				// to have the main_q_narcs values
 				cudaMemcpyAsync(h_lanes_counters_,     
-						d_lanes_counters_, 
+						d_lanes_counters_.MutableData(), 
 						nlanes_used*sizeof(LaneCounters), 
 						cudaMemcpyDeviceToHost,
 						compute_st_);
@@ -435,7 +452,7 @@ namespace kaldi {
 				// Moving the lanes_params to host,
 				// to have the aux_q_end values
 				cudaMemcpyAsync(h_lanes_counters_,     
-						d_lanes_counters_, 
+						d_lanes_counters_.MutableData(), 
 						nlanes_used*sizeof(LaneCounters), 
 						cudaMemcpyDeviceToHost,
 						compute_st_);
@@ -462,7 +479,7 @@ namespace kaldi {
 			// - main_q_end
 			// - main_q_narcs
 			cudaMemcpyAsync(h_lanes_counters_,     
-					d_lanes_counters_, 
+					d_lanes_counters_.MutableData(), 
 					nlanes_used*sizeof(LaneCounters), 
 					cudaMemcpyDeviceToHost,
 					compute_st_);
@@ -526,7 +543,7 @@ namespace kaldi {
 		const std::vector<ChannelId> channels = {0};  // TODO != channels
 		for(const ChannelId ichannel : channels) {
 			int32 frame = num_frames_decoded_[ichannel];
-			decodable->ComputeLogLikelihoods(h_kernel_params_->d_loglikelihoods, frame, fst_.max_ilabel_+1, compute_st_);
+			decodable->ComputeLogLikelihoods(d_loglikelihoods_.MutableData(), frame, fst_.max_ilabel_+1, compute_st_);
 		}
 	}
 
@@ -571,7 +588,7 @@ namespace kaldi {
 				0,
 				compute_st_>>>(*h_kernel_params_, use_final_costs, StdWeight::Zero().Value());
 		cudaMemcpyAsync(h_lanes_counters_,     
-				d_lanes_counters_, 
+				d_lanes_counters_.MutableData(), 
 				nlanes_used*sizeof(*h_lanes_counters_), 
 				cudaMemcpyDeviceToHost,
 				compute_st_);
