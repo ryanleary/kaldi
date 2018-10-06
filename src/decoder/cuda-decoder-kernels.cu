@@ -19,12 +19,6 @@
 #define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 namespace kaldi {
-	typedef CudaDecoder::MinCostAndBeamIntegers MinCostAndBeamIntegers;
-	typedef CudaDecoder::MinCostAndBeam MinCostAndBeam;
-	typedef CudaDecoder::IntegerCostType IntegerCostType;
-	typedef CudaDecoder::LaneCounters LaneCounters;
-	typedef CudaDecoder::ChannelCounters ChannelCounters;
-
 	// 1:1 Conversion float <---> sortable int
 	// We convert floats to sortable ints in order
 	// to use native atomics operation, which are 
@@ -733,7 +727,7 @@ finalize_kernel:
 	// The initial channel is the state of a channel when 
 	// it will start decoding a new utterance
 	__global__ void initialize_initial_lane_kernel(KernelParams params, StateId init_state, CostType init_cost) {
-		printf("youhou");
+		printf("size device =%i \n", sizeof(params));
 		const int init_ichannel = params.init_channel_id;
 		const int init_ilane = 0;
 		ChannelCounters *init_channel_counters = params.d_channels_counters.channel(init_ichannel);

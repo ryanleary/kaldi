@@ -167,6 +167,7 @@ namespace kaldi {
 		const CostType init_cost = StdWeight::One().Value();
 		KALDI_ASSERT(init_state != fst::kNoStateId);
 	auto params = *h_kernel_params_;
+		printf("size host =%i \n", sizeof(*h_kernel_params_));
 		initialize_initial_lane_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
 			KALDI_CUDA_DECODER_1D_BLOCK,
 			0,
@@ -184,7 +185,7 @@ namespace kaldi {
 
 		int32 main_q_end;
 		cudaMemcpyAsync(&main_q_end, 
-				&h_kernel_params_->d_lanes_counters.lane(ilane)->main_q_narcs_and_end.y, 
+				&d_lanes_counters_.lane(ilane)->main_q_narcs_and_end.y, 
 				sizeof(int32), 
 				cudaMemcpyDeviceToHost, 
 				compute_st_);
@@ -214,7 +215,7 @@ namespace kaldi {
 				cudaMemcpyDeviceToHost);
 
 		// Saving initial queue to host
-		h_all_tokens_info_[init_channel_id_].CopyFromDevice(h_kernel_params_->d_main_q_info.lane(ilane), main_q_end);
+		h_all_tokens_info_[init_channel_id_].CopyFromDevice(d_main_q_info_.lane(ilane), main_q_end);
 
 		// Context switch : saving channel state
 		save_channels_state_from_lanes_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
@@ -516,7 +517,7 @@ namespace kaldi {
 			for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
 				const ChannelId ichannel = h_kernel_params_->channel_to_compute[ilane];
 				const int32 main_q_end = h_lanes_counters_[ilane].main_q_narcs_and_end.y;
-				h_all_tokens_info_[ichannel].CopyFromDevice(h_kernel_params_->d_main_q_info.lane(ilane), main_q_end);
+				h_all_tokens_info_[ichannel].CopyFromDevice(d_main_q_info_.lane(ilane), main_q_end);
 				num_frames_decoded_[ichannel]++; 
 			}
 
