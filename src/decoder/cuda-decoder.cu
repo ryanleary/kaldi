@@ -77,29 +77,35 @@ namespace kaldi {
 		cudaMallocHost(&h_lanes_counters_, nlanes_ * sizeof(*h_lanes_counters_));
 		cudaMallocHost(&h_channels_counters_, nchannels_ * sizeof(*h_channels_counters_));
 
+		h_device_params_ = new DeviceParams();
+		h_device_params_->d_channels_counters = d_channels_counters_.GetInterface();
+		h_device_params_->d_lanes_counters =d_lanes_counters_.GetInterface();
+		h_device_params_->d_main_q_state_and_cost = d_main_q_state_and_cost_.GetInterface();
+		h_device_params_->d_main_q_info = d_main_q_info_.GetInterface();
+		h_device_params_->d_aux_q_state_and_cost = d_aux_q_state_and_cost_.GetInterface();
+		h_device_params_->d_aux_q_info = d_aux_q_info_.GetInterface();
+		h_device_params_->d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_.GetInterface();
+		h_device_params_->d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_.GetInterface();
+		h_device_params_->d_main_q_arc_offsets = d_main_q_arc_offsets_.GetInterface();
+		h_device_params_->d_loglikelihoods = d_loglikelihoods_.GetInterface();
+		h_device_params_->d_state_best_int_cost = d_state_best_int_cost_.GetInterface();
+		h_device_params_->d_arc_e_offsets = fst_.d_e_offsets_;
+		h_device_params_->d_arc_ne_offsets = fst_.d_ne_offsets_;
+		h_device_params_->d_arc_ilabels = fst_.d_arc_ilabels_;
+		h_device_params_->d_arc_weights = fst_.d_arc_weights_;
+		h_device_params_->d_arc_nextstates = fst_.d_arc_nextstates_;
+		h_device_params_->d_fst_final_costs = fst_.d_final_;
+		h_device_params_->default_beam = default_beam_;
+		h_device_params_->q_capacity = max_tokens_per_frame_; 
+		h_device_params_->init_channel_id = init_channel_id_; 
+		h_device_params_->max_nlanes = nlanes_; 
+		h_device_params_->nstates = fst_.num_states_; 
+		h_device_params_->init_state = fst_.Start();
+		KALDI_ASSERT(h_device_params_->init_state != fst::kNoStateId);
+		h_device_params_->init_cost = StdWeight::One().Value();
+		SetDeviceParams(h_device_params_);
+
 		h_kernel_params_ = new KernelParams();
-		h_kernel_params_->d_channels_counters = d_channels_counters_.GetInterface();
-		h_kernel_params_->d_lanes_counters =d_lanes_counters_.GetInterface();
-		h_kernel_params_->d_main_q_state_and_cost = d_main_q_state_and_cost_.GetInterface();
-		h_kernel_params_->d_main_q_info = d_main_q_info_.GetInterface();
-		h_kernel_params_->d_aux_q_state_and_cost = d_aux_q_state_and_cost_.GetInterface();
-		h_kernel_params_->d_aux_q_info = d_aux_q_info_.GetInterface();
-		h_kernel_params_->d_main_q_degrees_prefix_sum = d_main_q_degrees_prefix_sum_.GetInterface();
-		h_kernel_params_->d_main_q_degrees_block_sums_prefix_sum = d_main_q_degrees_block_sums_prefix_sum_.GetInterface();
-		h_kernel_params_->d_main_q_arc_offsets = d_main_q_arc_offsets_.GetInterface();
-		h_kernel_params_->d_loglikelihoods = d_loglikelihoods_.GetInterface();
-		h_kernel_params_->d_state_best_int_cost = d_state_best_int_cost_.GetInterface();
-		h_kernel_params_->d_arc_e_offsets = fst_.d_e_offsets_;
-		h_kernel_params_->d_arc_ne_offsets = fst_.d_ne_offsets_;
-		h_kernel_params_->d_arc_ilabels = fst_.d_arc_ilabels_;
-		h_kernel_params_->d_arc_weights = fst_.d_arc_weights_;
-		h_kernel_params_->d_arc_nextstates = fst_.d_arc_nextstates_;
-		h_kernel_params_->d_fst_final_costs = fst_.d_final_;
-		h_kernel_params_->default_beam = default_beam_;
-		h_kernel_params_->q_capacity = max_tokens_per_frame_; 
-		h_kernel_params_->init_channel_id = init_channel_id_; 
-		h_kernel_params_->max_nlanes = nlanes_; 
-		h_kernel_params_->nstates = fst_.num_states_; 
 
 		// Using last one as init_channel_params
 		init_channel_id_ = nchannels_-1;
@@ -144,7 +150,8 @@ namespace kaldi {
 
 		// Will call the cudaFrees inside destructors 
 		delete h_kernel_params_;
-
+		delete h_device_params_;
+		cudaFree(d_device_params_);
 		if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
 			cudaFreeHost(h_debug_buf1_);
 			cudaFreeHost(h_debug_buf2_);
@@ -154,7 +161,6 @@ namespace kaldi {
 	}
 
 	void CudaDecoder::ComputeInitialChannel() {
-		printf("GOGOGO \n");
 		KALDI_ASSERT(nlanes_ > 0);
 		const int32 ilane = 0;
 		KALDI_ASSERT(ilane == 0);
@@ -163,15 +169,10 @@ namespace kaldi {
 		h_kernel_params_->nlanes_used = 1;
 
 		// Adding the start state to the initial token queue
-		const StateId init_state = fst_.Start();
-		const CostType init_cost = StdWeight::One().Value();
-		KALDI_ASSERT(init_state != fst::kNoStateId);
-	auto params = *h_kernel_params_;
-		printf("size host =%i \n", sizeof(*h_kernel_params_));
 		initialize_initial_lane_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
-			KALDI_CUDA_DECODER_1D_BLOCK,
+			KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
 			0,
-			compute_st_>>>(params, init_state, init_cost);
+			compute_st_>>>();
 
 		// Initial ProcessNonEmitting
 		preprocess_and_contract_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),

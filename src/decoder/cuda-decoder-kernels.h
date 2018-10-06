@@ -10,7 +10,7 @@ namespace kaldi {
 	__global__ void save_channels_state_from_lanes_kernel(KernelParams params);
 	__global__ void load_channels_state_in_lanes_kernel(KernelParams params);
 	__global__ void init_decoding_on_device_kernel(KernelParams params);
-	__global__ void initialize_initial_lane_kernel(KernelParams params, StateId init_state, CostType init_cost);
+	__global__ void initialize_initial_lane_kernel();
 	template<bool IS_EMITTING>
 		__global__ void expand_arcs_kernel(KernelParams params);
 	template<bool IS_EMITTING>
@@ -37,16 +37,7 @@ namespace kaldi {
 			}
 		};
 
-
-
-	struct KernelParams {
-		// In AdvanceDecoding,
-		// the lane lane_id will compute the channel
-		// with channel_id = channel_to_compute[lane_id]
-		ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
-		int32 nlanes_used;
-		int32 max_nlanes;
-
+	struct DeviceParams {
 		ChannelMatrixInterface<ChannelCounters> d_channels_counters; 
 		LaneMatrixInterface<LaneCounters> d_lanes_counters; 
 
@@ -61,6 +52,7 @@ namespace kaldi {
 		ChannelMatrixInterface<CostType> d_loglikelihoods;
 		LaneMatrixInterface<IntegerCostType> d_state_best_int_cost; 
 
+		int32 max_nlanes;
 		// TODO use the CudaFst struct
 		int32 q_capacity;
 		CostType *d_arc_weights;
@@ -72,6 +64,16 @@ namespace kaldi {
 		int32 nstates;
 		CostType default_beam;
 		int32 init_channel_id;
+		StateId init_state; 
+		CostType init_cost;
+	};
+
+	struct KernelParams {
+		// In AdvanceDecoding,
+		// the lane lane_id will compute the channel
+		// with channel_id = channel_to_compute[lane_id]
+		ChannelId channel_to_compute[KALDI_CUDA_DECODER_MAX_N_LANES];
+		int32 nlanes_used;
 	};
 
 } // namespace kaldi

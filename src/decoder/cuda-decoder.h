@@ -52,7 +52,7 @@
 // remaining space
 // We then slowly put the beam back to its default value
 // beam_next_frame = min(default_beam, RECOVER_RATE * beam_previous_frame)
-#define KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE 1.2
+#define KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE 1.2f
 
 // Defines for the cuda decoder kernels
 // It shouldn't be necessary to change the DIMX of the kernels
@@ -157,6 +157,7 @@ namespace kaldi {
 				}	
 		};
 
+	class DeviceParams;
 	class KernelParams;
 
 	struct LaneCounters {
@@ -629,6 +630,7 @@ namespace kaldi {
 			DeviceChannelMatrix<CostType> d_loglikelihoods_;
 			DeviceLaneMatrix<IntegerCostType> d_state_best_int_cost_; 
 
+			DeviceParams *h_device_params_, *d_device_params_;
 			KernelParams *h_kernel_params_;
 
 			// When starting a new utterance,
