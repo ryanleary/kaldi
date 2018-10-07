@@ -122,7 +122,6 @@ namespace kaldi {
 
 		KALDI_DECODER_CUDA_CHECK_ERROR();
 		num_frames_decoded_.resize(nchannels_, 0);
-
 	
 		if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
 			KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
@@ -190,7 +189,6 @@ namespace kaldi {
 				cudaMemcpyDeviceToHost, 
 				compute_st_);
 		cudaStreamSynchronize(compute_st_);
-		printf("main_q_end host = %i \n", main_q_end);
 
 		// Preparing for first frame + reverting back to init state (lookup table, etc.)
 		preprocess_in_place_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(main_q_end, 1),
@@ -376,16 +374,6 @@ namespace kaldi {
 						0,
 						compute_st_>>>(*h_kernel_params_);
 
-			// Copying the counters to host,
-			// we need the aux_q_end values
-			cudaMemcpyAsync(h_lanes_counters_,     
-					d_lanes_counters_.MutableData(), 
-					nlanes_used*sizeof(*h_lanes_counters_), 
-					cudaMemcpyDeviceToHost,
-					compute_st_);
-
-			cudaStreamSynchronize(compute_st_);
-
 			// After ProcessEmitting we won't need the token
 			// associated with the previous frame anymore
 			// At the end of ProcessEmitting the main_q was flushed 
@@ -419,6 +407,15 @@ namespace kaldi {
 			// for next kernels on compute_st_ 
 			cudaStreamWaitEvent(compute_st_, can_write_to_main_q_, 0);
 			while(true) {
+				// Moving the lanes_params to host,
+				// to have the aux_q_end values
+				cudaMemcpyAsync(h_lanes_counters_,     
+						d_lanes_counters_.MutableData(), 
+						nlanes_used*sizeof(LaneCounters), 
+						cudaMemcpyDeviceToHost,
+						compute_st_);
+				cudaStreamSynchronize(compute_st_);
+
 				int32 max_aux_q_end = 0;
 				for(LaneId ilane=0;ilane < nlanes_used;++ilane) {
 					const int32 aux_q_end = h_lanes_counters_[ilane].post_expand_aux_q_end;
@@ -455,13 +452,6 @@ namespace kaldi {
 						compute_st_>>>(*h_kernel_params_);
 
 
-				// Moving the lanes_params to host,
-				// to have the aux_q_end values
-				cudaMemcpyAsync(h_lanes_counters_,     
-						d_lanes_counters_.MutableData(), 
-						nlanes_used*sizeof(LaneCounters), 
-						cudaMemcpyDeviceToHost,
-						compute_st_);
 
 				// false is for non emitting
 				post_expand_kernel<false><<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
@@ -510,12 +500,12 @@ namespace kaldi {
 						compute_st_>>>(*h_kernel_params_);
 
 			exclusive_sum_batched_step2_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-							KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+							KALDI_CUDA_DECODER_1D_BLOCK,
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
 			exclusive_sum_batched_step3_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-							KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+							KALDI_CUDA_DECODER_1D_BLOCK,
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
@@ -535,16 +525,23 @@ namespace kaldi {
 			
 			for(ChannelId ichannel : channels)
 				++num_frames_decoded_[ichannel];
+
+			cudaMemcpyAsync(h_lanes_counters_,     
+					d_lanes_counters_.MutableData(), 
+					nlanes_used*sizeof(LaneCounters), 
+					cudaMemcpyDeviceToHost,
+					compute_st_);
+
+			// Waiting for the copy
+			cudaStreamSynchronize(compute_st_);
 		}   
 
 		// Context switch : saving channels states
 		save_channels_state_from_lanes_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-						KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
-						0,
-						compute_st_>>>(*h_kernel_params_);
+			KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+			0,
+			compute_st_>>>(*h_kernel_params_);
 		SaveChannelsStateFromLanesCPU();
-			cudaStreamSynchronize(compute_st_);
-			KALDI_ASSERT(0);
 
 		nvtxRangePop();
 	}
@@ -582,6 +579,8 @@ namespace kaldi {
 	// not optimized
 	void CudaDecoder::GetBestCost(const std::vector<ChannelId> &channels, bool use_final_costs, std::vector<std::pair<int32,CostType>> *argmins, std::vector<bool> *has_reached_final) {
 		const int nlanes_used = channels.size();
+		if(nlanes_used <= 0)
+			return;
 		// Getting *h_kernel_params ready to use
 		SetChannelsInKernelParams(channels);
 		KALDI_ASSERT(nlanes_used == h_kernel_params_->nlanes_used);
@@ -589,6 +588,7 @@ namespace kaldi {
 		for(ChannelId ichannel : channels)
 			max_main_q_end = std::max(max_main_q_end, h_channels_counters_[ichannel].prev_main_q_narcs_and_end.y); 
 
+		printf("max_main_q_end cost = %i \n", max_main_q_end);
 		// TODO reset counters->reached_final to 0
 
 		// We already know what's the best cost, because we needed it for the cutoff
@@ -613,7 +613,9 @@ namespace kaldi {
 			int32 arg = minarg.y;
 			argmins->push_back({arg,min_cost});
 			has_reached_final->push_back(h_lanes_counters_[ilane].reached_final);
+			printf("best arg=%i>=%i -> %i \n", arg, h_channels_counters_[0].prev_main_q_global_offset, minarg.x);
 		}
+		cudaStreamSynchronize(compute_st_);
 	}
 
 	//
@@ -633,6 +635,7 @@ namespace kaldi {
 		std::vector<std::pair<int32,CostType>> argmins;
 		std::vector<bool> has_reached_final;
 		GetBestCost(channels, use_final_probs, &argmins, &has_reached_final);
+		// TODO handle if a final state was not found
 
 		// We want the copy to host of the last tokens to be done
 		// we're going to read h_all_tokens_info

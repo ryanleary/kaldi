@@ -56,10 +56,6 @@
 
 // Defines for the cuda decoder kernels
 // It shouldn't be necessary to change the DIMX of the kernels
-#define KALDI_CUDA_DECODER_KERNEL_GENERIC_DIMX 256
-#define KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX 256
-#define KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX 256
-#define KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX 1024
 
 // Below that value, we launch the persistent kernel for NonEmitting
 #define KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS 4096

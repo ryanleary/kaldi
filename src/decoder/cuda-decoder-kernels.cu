@@ -63,46 +63,37 @@ namespace kaldi {
 	struct PlusPlus {
 		__device__ int2 operator()(const int2 &a, const int2 &b) const {
 			int2 c;
-			c.x = a.x + b.y;
+			c.x = a.x + b.x;
 			c.y = a.y + b.y;
 			return c;
 		}
 	};
 
-	union Int64UnionInt2{
+	union UInt64UnionInt2{
 		int2 i2;
-		unsigned long long int l;
+		unsigned long long int ull;
 	};
-
-
-	#if __CUDA_ARCH__ < 350
-	__device__ void atomicMinCAS(unsigned long long *addr, unsigned long long value) {
-		unsigned long long old = *addr, assumed;
-		if(old <= value) return;
-		do {
-			assumed = old;
-			old = atomicCAS(addr, assumed, value);
-		} while(old!=assumed && old > value);  
-	}
-	#endif 
 
 	__device__ __inline__ int2 atomicAddI2(int2 *ptr, int2 val) {
 		unsigned long long int *ptr64 = reinterpret_cast<unsigned long long int*>(ptr);
-		Int64UnionInt2 uval, uold;
+		UInt64UnionInt2 uval, uold;
 		uval.i2 = val;
-		uold.l = atomicAdd(ptr64, uval.l); 
+		uold.ull = atomicAdd(ptr64, uval.ull); 
 		return uold.i2;
 	} 	
 
+	// TODO rename we are just sorting by val.x
+	// we could do it using a native atomicmin64 - not used often though
 	__device__ __inline__ void atomicMinI2(int2 *ptr, int2 val) {
 		unsigned long long int *ptr64 = reinterpret_cast<unsigned long long int*>(ptr);
-		Int64UnionInt2 uval;
-		uval.i2 = val;
-		#if __CUDA_ARCH__ < 350
-		atomicMinCAS(ptr64, uval.l); // overloading fails for some reasons (C function?)
-		#else
-		atomicMin(ptr64, uval.l); 
-		#endif 
+		UInt64UnionInt2 old, assumed, value;
+		old.ull = *ptr64;
+		value.i2 = val;
+		if(old.i2.x <= val.x) return;
+		do {
+			assumed = old;
+			old.ull = atomicCAS(ptr64, assumed.ull, value.ull);
+		} while(old.ull!=assumed.ull && old.i2.x > value.i2.x);
 	}
 
 	// GetAdaptiveBeam is used by ExpandArc and FinalizeProcessNonemitting
@@ -128,7 +119,7 @@ namespace kaldi {
 	}
 
 	void SetDeviceParams(DeviceParams *h_device_params) {
-		cudaMemcpyToSymbol(cst_dev_params, h_device_params, sizeof(*h_device_params));
+		cudaMemcpyToSymbol(cst_dev_params, h_device_params, sizeof(*h_device_params)); // TODO stream_
 	}
 
 	// Used to initialize the lane lookup tables in CudaDecoder's constructor
@@ -175,7 +166,7 @@ namespace kaldi {
 
 	// Important : pass the struct PreprocessParams by copy - passing it using a ref will not work (CPU -> GPU)
 	__global__ void preprocess_and_contract_kernel(KernelParams params) {
-		typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
+		typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
 		// We need to move the survival tokens to the main_q
 		// 
@@ -202,6 +193,8 @@ namespace kaldi {
 			// otherwise __syncthreads() would fail
 			LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
 			const int32 aux_q_end = lane_counters->post_expand_aux_q_end;
+				//printf("aux_q_end=%i \n", aux_q_end);
+			const IntegerCostType int_cutoff = lane_counters->int_cutoff;
 			KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(block_offset, thread_idx, aux_q_end) {
 				const int32 aux_q_idx = block_offset + thread_idx;
 				const int32 ichannel = params.channel_to_compute[ilane];
@@ -210,6 +203,7 @@ namespace kaldi {
 				StateId token_state;
 				IntegerCostType token_int_cost;
 				// if aux_q_idx is a valid index in the main_q
+				//printf("aux_q_idx=%i \n", aux_q_idx);
 				if(aux_q_idx < aux_q_end) {
 					// Cost and state associated with the token
 					const int2 both = cst_dev_params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx];
@@ -219,11 +213,12 @@ namespace kaldi {
 					// We know we have a token associated with token_state in the queue with the cost state_best_cost
 					const IntegerCostType state_best_int_cost = cst_dev_params.d_state_best_int_cost.lane(ilane)[token_state];
 					// Final cutoff from last ExpandArc execution
-					const IntegerCostType int_cutoff = lane_counters->int_cutoff;
 					// Cutoff may have decreased since the creation of the token
+						//printf("%i < %i : %i ? %i ?\n", token_int_cost, int_cutoff, (token_int_cost < int_cutoff), (token_int_cost == int_cutoff));
 					if(token_int_cost < int_cutoff) {
 						// We can have duplicates, ie token associated with the same states
 						// If this token is not the best candidate, get rid of it
+						//printf("%i == %i ? \n", token_int_cost, state_best_int_cost);
 						if(token_int_cost == state_best_int_cost) {
 							// Contract is always called for non-emitting
 							// using non-emitting offsets
@@ -273,8 +268,9 @@ namespace kaldi {
 					// We then store the return value, which is the global offset on where to store those tokens,
 					// and the total number of arcs up until that global offset
 					int2 block_offset = atomicAddI2(&lane_counters->main_q_narcs_and_end, block_sum);
-					
-					if(block_offset.x + block_sum.x >= cst_dev_params.q_capacity) {
+					//printf("main_q_offsetx=%i y=%i\n", block_offset.x, block_offset.y); 
+					const int32 new_main_q_end = block_offset.y + block_sum.y;
+					if(new_main_q_end >= cst_dev_params.q_capacity) {
 						// We are overflowing the main_q
 						// We first revert what this CTA has done, ie revert the previous atomicAdd
 						// because all CTAs will revert, we know we will have a valid state after completion of this kernel
@@ -304,7 +300,7 @@ namespace kaldi {
 					// we will move it to the main_q, at index main_q_idx
 					const int32 main_q_idx = sh_main_q_global_block_offset.y + block_prefix_sum_narcs_and_end.y;
 					// Moving the token to the main q
-					printf("main_q_idx=%i, ichannel=%i \n", main_q_idx, ichannel);
+					//printf("main_q_idx=%i, ichannel=%i \n", main_q_idx, ichannel);
 					cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx] = {token_state, token_int_cost};
 					cst_dev_params.d_main_q_info.lane(ilane)[main_q_idx] = cst_dev_params.d_aux_q_info.lane(ilane)[aux_q_idx];
 					// Saving the global prefix sum
@@ -351,7 +347,7 @@ finalize_kernel:
 
 	__global__ void preprocess_in_place_kernel(KernelParams params) {
 		// Operator for the prefix sum inside the CUDA block
-		typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
+		typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
 
 		const int nlanes = params.nlanes_used;
@@ -380,18 +376,12 @@ finalize_kernel:
 					// but the adaptive beam may have lowered the beam
 					const IntegerCostType int_cutoff = lane_counters->int_cutoff;
 
-					if(token_int_cost < int_cutoff) {
-						// Best cost for that token_state
-						// We know we have a token associated with token_state in the queue with the cost state_best_cost
-						const IntegerCostType state_best_int_cost = cst_dev_params.d_state_best_int_cost.lane(ilane)[token_state]; 
-						// Above line was the last time we were using that value
-						// TODO use atomicExch ?
-						// We are closing down TODO rename kernel
-						// d_main_q_state_ contains the list of states that we've considered in the last frame
-						// it corresponds to the list of indexes i such as d_state_best_int_cost[i] < +INF
-						// we just reset those states between frames
+					// Best cost for that token_state
+					// We know we have a token associated with token_state in the queue with the cost state_best_cost
+					const IntegerCostType state_best_int_cost = cst_dev_params.d_state_best_int_cost.lane(ilane)[token_state]; 
+					if(token_int_cost == state_best_int_cost)
 						cst_dev_params.d_state_best_int_cost.lane(ilane)[token_state] = INT_MAX; 
-
+					if(token_int_cost < int_cutoff) {
 						// We can have duplicates, ie token associated with the same states
 						// If this token is not the best candidate, get rid of it
 						if(token_int_cost == state_best_int_cost) {
@@ -404,7 +394,7 @@ finalize_kernel:
 							// avoid a new random memory access
 							cst_dev_params.d_main_q_arc_offsets.channel(ichannel)[main_q_idx] = start;
 						}
-					}
+					} 
 				}
 
 				int32 degree_local_prefix_sum;
@@ -424,7 +414,7 @@ finalize_kernel:
 					// That's necessary to compute the global offset of that CUDA block,
 					// and that offset is what we need to transform the local prefix sum into a global prefix sum
 
-					const int local_sum_index = block_offset/KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+					const int local_sum_index = block_offset/KALDI_CUDA_DECODER_1D_BLOCK;
 					const int local_sum = degree_local_prefix_sum + degree; // the prefix sum was exclusive, adding missing value
 					cst_dev_params.d_main_q_degrees_block_sums_prefix_sum.lane(ilane)[local_sum_index] = local_sum; 
 				}
@@ -477,7 +467,7 @@ finalize_kernel:
 		__global__ void expand_arcs_kernel(KernelParams params) {
 			// BlockScan that we will use to compute token indexes in the output queue, 
 			// and to find the min cost in the block
-			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_EXPAND_ARCS_DIMX> BlockScan;
+			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 			__shared__ typename BlockScan::TempStorage sh_temp_storage_scan;
 
 			// This kernel writes the new token to the output queue aux_q
@@ -588,7 +578,8 @@ finalize_kernel:
 						if(IS_EMITTING) {
 							const int32 arc_ilabel = cst_dev_params.d_arc_ilabels[arc_idx];
 							//total_cost += cst_dev_params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; FIXME 
-							total_cost += cst_dev_params.d_loglikelihoods.channel(0)[arc_ilabel]; //FIXME above
+							CostType acoustic_cost = cst_dev_params.d_loglikelihoods.channel(0)[arc_ilabel]; //FIXME above
+							total_cost += acoustic_cost;
 						}
 						int_total_cost = floatToOrderedInt(total_cost);
 
@@ -644,6 +635,7 @@ finalize_kernel:
 							if(local_min_int_cost < global_min_int_cost) {
 								atomicMin(&lane_counters->min_int_cost, global_min_int_cost);
 								const CostType beam = orderedIntToFloat(lane_counters->int_beam);
+								//printf("BEAMBEAM=%f \n", beam);
 								IntegerCostType new_int_cutoff = floatToOrderedInt(orderedIntToFloat(local_min_int_cost) + beam);
 								atomicMin(&lane_counters->int_cutoff, new_int_cutoff);
 							}
@@ -685,6 +677,7 @@ finalize_kernel:
 							CostType new_beam = GetAdaptiveBeam(cst_dev_params.default_beam, 
 									aux_q_index_block_offset,
 									cst_dev_params.q_capacity);
+							//printf("NEWBEAMBEAM=%f \n", new_beam);
 							if(new_beam < cst_dev_params.default_beam
 									&& new_beam < orderedIntToFloat(lane_counters->int_beam)) 
 								atomicMin(&lane_counters->int_beam, floatToOrderedInt(new_beam));
@@ -720,7 +713,7 @@ finalize_kernel:
 						// we add cst_dev_params.main_q_global_offset
 						const int32 prev_token = lane_counters->main_q_global_offset + main_q_idx;
 						cst_dev_params.d_aux_q_info.lane(ilane)[aux_q_index] = {prev_token, arc_idx};
-						printf("saving %i-->%i \n", prev_token, arc_next_state);
+						//printf("saving %i-->%i \n", prev_token, arc_next_state);
 					}
 				}
 			}
@@ -746,6 +739,7 @@ finalize_kernel:
 		// Simulate a previously generated aux_q containing init state
 		const StateId init_state = cst_dev_params.init_state;
 		const CostType init_cost = cst_dev_params.init_cost;
+		printf("init cost=%f \n", init_cost);
 		IntegerCostType int_init_cost = floatToOrderedInt(init_cost);
 		cst_dev_params.d_aux_q_state_and_cost.lane(init_ilane)[0] = {init_state, int_init_cost};
 		cst_dev_params.d_aux_q_info.lane(init_ilane)[0] = {INT_MIN, -1};
@@ -787,12 +781,9 @@ finalize_kernel:
 			LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
 			const ChannelCounters *channel_counters = cst_dev_params.d_channels_counters.channel(ichannel);
 			lane_counters->main_q_narcs_and_end = channel_counters->prev_main_q_narcs_and_end;
-			const CostType beam = fmin(cst_dev_params.default_beam, 
-					channel_counters->prev_beam*KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE);
-			lane_counters->int_beam = floatToOrderedInt(beam);
+			lane_counters->int_beam = floatToOrderedInt(channel_counters->prev_beam); // TODO rename prev_beam is actually the new frame beam
 			lane_counters->main_q_global_offset = channel_counters->prev_main_q_global_offset; // we'll update it after emitting
-			lane_counters->int_cutoff = INT_MAX;
-			lane_counters->min_int_cost = INT_MAX;
+			lane_counters->min_int_cost_and_arg_with_final.x = INT_MAX; // used by GetBestCost
 		}
 	}
 
@@ -806,9 +797,6 @@ finalize_kernel:
 			channel_counters->prev_main_q_global_offset = lane_counters->main_q_global_offset;
 			channel_counters->prev_main_q_narcs_and_end = lane_counters->main_q_narcs_and_end;
 			channel_counters->prev_beam = orderedIntToFloat(lane_counters->int_beam);
-			
-			int2 both = lane_counters->main_q_narcs_and_end;
-			printf("end=%i, narcs=%i \n", both.y, both.x); 
 		}
 	}
 
@@ -817,7 +805,7 @@ finalize_kernel:
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
-			const int prev_main_q_end = lane_counters->aux_q_end;
+			const int prev_main_q_end = lane_counters->main_q_narcs_and_end.y;
 			const int aux_q_end = lane_counters->aux_q_end;
 			// The next step is the contracting step from aux_q to main_q
 			// It will need the aux_q_end value. But it will also empty the aux_q
@@ -847,12 +835,13 @@ finalize_kernel:
 
 	// Batched scan is not available in CUB
 	__global__ void exclusive_sum_batched_step2_kernel(KernelParams params) {
-		typedef cub::BlockScan<int, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX> BlockScan;
+		typedef cub::BlockScan<int, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
-			const int ntiles = KALDI_CUDA_DECODER_DIV_ROUND_UP(lane_counters->main_q_narcs_and_end.x, KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX);
+			const int main_q_end = lane_counters->main_q_narcs_and_end.y;
+			const int ntiles = KALDI_CUDA_DECODER_DIV_ROUND_UP(main_q_end, KALDI_CUDA_DECODER_1D_BLOCK);
 			// Using block_offset loop to keep entire CTA alive (we're going to use __syncthreads in CUB)
 			int32 sum_so_far = 0;
 			KALDI_CUDA_DECODER_1D_BLOCK_OFFSET_KERNEL_LOOP(offset, thread_idx, ntiles) {
@@ -865,11 +854,23 @@ finalize_kernel:
 				BlockScan(sh_temp_storage).ExclusiveSum(val, prefix_sum, sum);
 				prefix_sum += sum_so_far;
 				sum_so_far += sum;
-				if(itile < ntiles)
+				if(itile < ntiles) {
 					cst_dev_params.d_main_q_degrees_block_sums_prefix_sum.lane(ilane)[itile] = prefix_sum;
+				}
 				if(itile == (ntiles-1)) {
 					const int32 total_narcs = prefix_sum+val; 
 					lane_counters->main_q_narcs_and_end.x = total_narcs;
+				}
+
+				if(itile == 0) {
+					// Last time those were used was in previous kernel
+					lane_counters->min_int_cost = INT_MAX;
+					lane_counters->int_cutoff = INT_MAX;
+					lane_counters->min_int_cost_and_arg_with_final.x = INT_MAX; // used by GetBestCost
+					const CostType current_beam = orderedIntToFloat(lane_counters->int_beam);
+					const CostType new_beam = fmin(cst_dev_params.default_beam, 
+							current_beam*KALDI_CUDA_DECODER_ADAPTIVE_BEAM_RECOVER_RATE);
+					lane_counters->int_beam = floatToOrderedInt(new_beam);
 				}
 			}
 		}
@@ -883,10 +884,9 @@ finalize_kernel:
 			const int32 ichannel = params.channel_to_compute[ilane];
 			const int main_q_end = lane_counters->main_q_narcs_and_end.y;
 			KALDI_CUDA_DECODER_1D_KERNEL_LOOP(main_q_idx, main_q_end) {
-				const int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_KERNEL_PREPROCESS_DIMX;
+				const int32 local_sum_idx = main_q_idx / KALDI_CUDA_DECODER_1D_BLOCK;
 				const int32 local_sum_offset = cst_dev_params.d_main_q_degrees_block_sums_prefix_sum.lane(ilane)[local_sum_idx];
-				cst_dev_params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx] += local_sum_offset;
-				printf("prefix[%i] = %i \n", main_q_idx, cst_dev_params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx]);
+				int val = cst_dev_params.d_main_q_degrees_prefix_sum.channel(ichannel)[main_q_idx] += local_sum_offset;
 			}
 		}
 	}
@@ -920,10 +920,10 @@ we do not need inter-block communication (we launch only one CUDA block)
 	 */
 
 
-	__launch_bounds__(KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX, 1)
+	__launch_bounds__(KALDI_CUDA_DECODER_LARGEST_1D_BLOCK, 1)
 		__global__ void finalize_process_non_emitting_kernel(KernelParams params) {
-			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> Int2BlockScan;
-			typedef cub::BlockScan<int, KALDI_CUDA_DECODER_KERNEL_NONEM_LT_DIMX> IntBlockScan;
+			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_LARGEST_1D_BLOCK> Int2BlockScan;
+			typedef cub::BlockScan<int, KALDI_CUDA_DECODER_LARGEST_1D_BLOCK> IntBlockScan;
 			__shared__ typename IntBlockScan::TempStorage sh_temp_storage_int_scan;
 			__shared__ typename Int2BlockScan::TempStorage sh_temp_storage_int2_scan;
 
@@ -1063,12 +1063,8 @@ we do not need inter-block communication (we launch only one CUDA block)
 finalize_kernel:
 				if(threadIdx.x == 0) {
 					lane_counters->main_q_narcs_and_end.y = main_q_end; 
-printf("out frame =%i \n", main_q_end);
+					//printf("out frame =%i \n", main_q_end);
 					lane_counters->main_q_local_offset = 0;
-					lane_counters->min_int_cost = INT_MAX;
-					// TODO recover_rate
-					lane_counters->int_cutoff = INT_MAX;
-			ldad545ane_counters->main_q_global_offset = channel_counters->prev_main_q_global_offset; // we'll update it after emitting TODO
 				}	
 			}
 		}
@@ -1093,6 +1089,7 @@ printf("out frame =%i \n", main_q_end);
 					cost += final_cost; 
 				}
 				const IntegerCostType int_cost = floatToOrderedInt(cost); 
+				printf("cost=%f, int_cost=%i \n", cost, int_cost);
 				const int32 global_idx = global_offset+idx;
 				const int2 min_and_arg = {int_cost, global_idx}; // sort by cost, put it first
 				atomicMinI2(&lane_counters->min_int_cost_and_arg_with_final, min_and_arg); // TODO maybe reduce locally
