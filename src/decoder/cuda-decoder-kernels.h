@@ -23,7 +23,7 @@ namespace kaldi {
 		struct LaneMatrixInterface  {
 			T *data_;	
 			int32 ld_;	 // leading dimension - may use a log2 at some point
-			__device__ T *lane(const int32 ilane) {
+			__device__ __inline__ T *lane(const int32 ilane) {
 				return &data_[ilane*ld_];
 			}
 		};
@@ -32,7 +32,7 @@ namespace kaldi {
 		struct ChannelMatrixInterface {
 			T *data_;	
 			int32 ld_;	 // leading dimension
-			__device__ T *channel(const int32 ichannel) {
+			__device__ __inline__ T *channel(const int32 ichannel) {
 				return &data_[ichannel*ld_];
 			}
 		};

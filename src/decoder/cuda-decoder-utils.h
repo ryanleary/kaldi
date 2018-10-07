@@ -136,6 +136,7 @@ namespace kaldi {
 
         public:
         InfoTokenVector(int32 initial_capacity, cudaStream_t copy_st_);
+        InfoTokenVector(const InfoTokenVector &other); // TODO refactor
         void Clone(const InfoTokenVector &other);
         void Reset();
         void CopyFromDevice(InfoToken *d_ptr, int32 count);    

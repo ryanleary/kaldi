@@ -158,8 +158,11 @@ namespace kaldi {
 	InfoTokenVector::InfoTokenVector(int32 capacity, cudaStream_t copy_st) : capacity_(capacity), copy_st_(copy_st) {
 		KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_ << " tokens";
 		cudaMallocHost(&h_data_, capacity_ * sizeof(*h_data_)); 
+		printf("data at %p \n", h_data_);
 		Reset();
 	}
+
+        InfoTokenVector::InfoTokenVector(const InfoTokenVector &other) : InfoTokenVector(other.capacity_, other.copy_st_) {}
 
 	void InfoTokenVector::Reset() {
 		size_ = 0;
@@ -174,7 +177,11 @@ namespace kaldi {
 
 	void InfoTokenVector::Clone(const InfoTokenVector &other) {
 		Reserve(other.Size());
-		cudaMemcpyAsync(h_data_, other.GetRawPointer(), other.Size() * sizeof(*h_data_), cudaMemcpyHostToHost, copy_st_);
+		size_ = other.Size();
+		if(size_ == 0)
+			return;
+		const InfoToken *h_data_other = other.GetRawPointer();
+		cudaMemcpyAsync(h_data_, h_data_other, size_ * sizeof(*h_data_), cudaMemcpyHostToHost, copy_st_);
 		cudaStreamSynchronize(copy_st_); // after host2host?
 	};
 
@@ -206,6 +213,7 @@ namespace kaldi {
 	}
 
 	InfoTokenVector::~InfoTokenVector() {
+		printf("DELETE H \n");
 		cudaFreeHost(h_data_);
 	}
 
