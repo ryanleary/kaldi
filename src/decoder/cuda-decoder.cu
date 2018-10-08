@@ -259,6 +259,7 @@ namespace kaldi {
 			// Tokens from initial main_q needed on host
 			h_all_tokens_info_[ichannel].Clone(h_all_tokens_info_[init_channel_id_]);
 			h_channels_counters_[ichannel] = h_channels_counters_[init_channel_id_];
+			num_frames_decoded_[ichannel] = 0;
 		}
 	}
 
@@ -513,7 +514,6 @@ namespace kaldi {
 				const ChannelId ichannel = h_kernel_params_->channel_to_compute[ilane];
 				const int32 main_q_end = h_lanes_counters_[ilane].main_q_narcs_and_end.y;
 				h_all_tokens_info_[ichannel].CopyFromDevice(d_main_q_info_.lane(ilane), main_q_end);
-				num_frames_decoded_[ichannel]++; 
 			}
 
 			// We cannot write to the lanes.d_main_q_info 
@@ -534,6 +534,9 @@ namespace kaldi {
 
 			// Waiting for the copy
 			cudaStreamSynchronize(compute_st_);
+			
+			printf("=========================== FRAME =============================== \n");
+			//if(num_frames_decoded_[0] >= 3)   KALDI_ASSERT(0);
 		}   
 
 		// Context switch : saving channels states

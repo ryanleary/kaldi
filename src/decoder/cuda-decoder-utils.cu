@@ -172,6 +172,7 @@ namespace kaldi {
 		Reserve(size_+count); // making sure we have the space
 
 		cudaMemcpyAsync(&h_data_[size_], d_ptr, count*sizeof(*h_data_), cudaMemcpyDeviceToHost, copy_st_);
+		printf("current global_offset=%i \n", size_);
 		size_ += count;
 	}
 

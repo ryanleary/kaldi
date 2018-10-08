@@ -227,6 +227,7 @@ namespace kaldi {
 							degree = arc_end - arc_start;
 						}
 					}
+
 					// the d_state_best_int_cost lookup table is reset to +INF for all states between frame
 					// for perf. reason we only reset states that are in d_main_q_state
 					// however if state_best_cost >= cutoff, all tokens associated with token_state 
@@ -575,11 +576,13 @@ finalize_kernel:
 						// TODO move q_arc_offset to .x
 						const CostType prev_token_cost  = orderedIntToFloat(cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].y);
 						CostType total_cost = prev_token_cost + arc_fixed_cost;
+						const int32 prev_state = cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].x;
 						if(IS_EMITTING) {
 							const int32 arc_ilabel = cst_dev_params.d_arc_ilabels[arc_idx];
 							//total_cost += cst_dev_params.d_loglikelihoods.channel(ichannel)[arc_ilabel]; FIXME 
-							CostType acoustic_cost = cst_dev_params.d_loglikelihoods.channel(0)[arc_ilabel]; //FIXME above
+							CostType acoustic_cost = -cst_dev_params.d_loglikelihoods.channel(0)[arc_ilabel]; //FIXME above
 							total_cost += acoustic_cost;
+							//printf("from %i --%i--> %i : %f = %f + %f + %f \n", prev_state, arc_idx, arc_next_state, total_cost, prev_token_cost, arc_fixed_cost, acoustic_cost);
 						}
 						int_total_cost = floatToOrderedInt(total_cost);
 
@@ -713,7 +716,13 @@ finalize_kernel:
 						// we add cst_dev_params.main_q_global_offset
 						const int32 prev_token = lane_counters->main_q_global_offset + main_q_idx;
 						cst_dev_params.d_aux_q_info.lane(ilane)[aux_q_index] = {prev_token, arc_idx};
-						//printf("saving %i-->%i \n", prev_token, arc_next_state);
+
+
+						//printf("%i (%i + %i) (wrote at %i) \n", prev_token, lane_counters->main_q_global_offset, main_q_idx, aux_q_index);
+						// Debug
+						//const int32 prev_state  = cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].x;
+						//const CostType prev_cost  = orderedIntToFloat(cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].y);
+						//printf("token %i (%f) --%i--> %i (%f)\n", prev_state, prev_cost, arc_idx, arc_next_state, orderedIntToFloat(int_total_cost));
 					}
 				}
 			}
@@ -774,6 +783,8 @@ finalize_kernel:
 	// THREADS : (WARP_SIZE, 1, 1)
 	// BLOCKS : (1, nchannel_to_compute, 1)
 	__global__ void load_channels_state_in_lanes_kernel(KernelParams params) {
+		if(threadIdx.x != 0)
+			return;
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const int32 ichannel = params.channel_to_compute[ilane];
@@ -789,6 +800,8 @@ finalize_kernel:
 
 	// Context switch : store
 	__global__ void save_channels_state_from_lanes_kernel(KernelParams params) {
+		if(threadIdx.x != 0)
+			return;
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -801,37 +814,40 @@ finalize_kernel:
 	}
 
 	template<bool IS_EMITTING>
-	__global__ void post_expand_kernel(KernelParams params) {
-		const int nlanes = params.nlanes_used;
-		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
-			LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
-			const int prev_main_q_end = lane_counters->main_q_narcs_and_end.y;
-			const int aux_q_end = lane_counters->aux_q_end;
-			// The next step is the contracting step from aux_q to main_q
-			// It will need the aux_q_end value. But it will also empty the aux_q
-			// We're resetting aux_q_end to 0 now, but we're saving its old value 
-			// in another place
-			lane_counters->post_expand_aux_q_end = aux_q_end;
-			lane_counters->aux_q_end = 0;	
-			// When this kernel is called, the host has already read that value 
-			lane_counters->q_overflow = 0;	
-			if(IS_EMITTING) {
-				// the main_q contains the tokens from the previous frame
-				// after emitting, we won't use them anymore to create new tokens
-				// we reset the main_q
-				lane_counters->main_q_narcs_and_end = {0,0};
-				// The main_q was flushed - we need to update the global_offset
-				lane_counters->main_q_global_offset += prev_main_q_end;
-			} else {
-				// Moving local offset. Tokens created by last expand
-				// will be pruned, and survivals will be moved at the end
-				// of the main q. Those tokens will be placed after local_offset 
-				lane_counters->main_q_local_offset = prev_main_q_end;
-				// We are done processing those arcs
-				lane_counters->main_q_narcs_and_end.x = 0;
+		__global__ void post_expand_kernel(KernelParams params) {
+			if(threadIdx.x != 0)
+				return;
+			const int nlanes = params.nlanes_used;
+			KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
+				LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
+				const int prev_main_q_end = lane_counters->main_q_narcs_and_end.y;
+				const int aux_q_end = lane_counters->aux_q_end;
+				// The next step is the contracting step from aux_q to main_q
+				// It will need the aux_q_end value. But it will also empty the aux_q
+				// We're resetting aux_q_end to 0 now, but we're saving its old value 
+				// in another place
+				lane_counters->post_expand_aux_q_end = aux_q_end;
+				lane_counters->aux_q_end = 0;	
+				// When this kernel is called, the host has already read that value 
+				lane_counters->q_overflow = 0;	
+				if(IS_EMITTING) {
+					// the main_q contains the tokens from the previous frame
+					// after emitting, we won't use them anymore to create new tokens
+					// we reset the main_q
+					lane_counters->main_q_narcs_and_end = {0,0};
+					// The main_q was flushed - we need to update the global_offset
+					lane_counters->main_q_global_offset += prev_main_q_end;
+					printf("global_offset=%i \n", lane_counters->main_q_global_offset);
+				} else {
+					// Moving local offset. Tokens created by last expand
+					// will be pruned, and survivals will be moved at the end
+					// of the main q. Those tokens will be placed after local_offset 
+					lane_counters->main_q_local_offset = prev_main_q_end;
+					// We are done processing those arcs
+					lane_counters->main_q_narcs_and_end.x = 0;
+				}
 			}
 		}
-	}
 
 	// Batched scan is not available in CUB
 	__global__ void exclusive_sum_batched_step2_kernel(KernelParams params) {
@@ -939,7 +955,6 @@ we do not need inter-block communication (we launch only one CUDA block)
 				const int32 main_q_global_offset = lane_counters->main_q_global_offset;
 				// aux_q is empty when this kernel is called
 				int32 aux_q_end = 0;
-
 				IntegerCostType int_cutoff = lane_counters->int_cutoff;
 				while(main_q_narcs > 0) {
 					// Step 1 : ExpandArcs
@@ -964,6 +979,8 @@ we do not need inter-block communication (we launch only one CUDA block)
 							CostType arc_weight = cst_dev_params.d_arc_weights[arc_idx];
 							CostType prev_token_cost = orderedIntToFloat(cst_dev_params.d_main_q_state_and_cost.channel(ilane)[main_q_idx].y); 
 							total_int_cost = floatToOrderedInt(arc_weight + prev_token_cost);
+							//const int32 prev_state = cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].x;
+							//printf("from %i to %i : %f = %f + %f \n", prev_state, arc_next_state, orderedIntToFloat(total_int_cost), prev_token_cost, arc_weight);
 
 							if(total_int_cost < int_cutoff) {
 								const IntegerCostType next_state_best_int_cost = cst_dev_params.d_state_best_int_cost.lane(ilane)[arc_next_state];
@@ -995,10 +1012,12 @@ we do not need inter-block communication (we launch only one CUDA block)
 							const int32 prev_token_idx = main_q_global_offset + main_q_idx;
 							cst_dev_params.d_aux_q_state_and_cost.lane(ilane)[aux_q_idx] = {arc_next_state,total_int_cost};
 							cst_dev_params.d_aux_q_info.lane(ilane)[aux_q_idx] = {prev_token_idx,arc_idx};
+							//const int32 prev_state = cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].x;
+							//const CostType prev_cost  = orderedIntToFloat(cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].y);
+							//printf("token-per %i (%f) -->%i (%f)\n", prev_state, prev_cost, arc_next_state, orderedIntToFloat(total_int_cost));
 						}
 
 						aux_q_end += nsuccessors;
-
 						// reusing sh_temp_storage_scan_int TODO double buffering
 						__syncthreads();
 					}
@@ -1018,14 +1037,12 @@ we do not need inter-block communication (we launch only one CUDA block)
 							token_state = both.x; 
 							token_int_cost = both.y; 
 							// beam may have changed since generation
-							if(token_int_cost < int_cutoff) {
-								IntegerCostType best_int_cost = cst_dev_params.d_state_best_int_cost.lane(ilane)[token_state];
-								if(token_int_cost == best_int_cost) {
-									// We are non-emitting in this kernel, using ne offsets
-									start = cst_dev_params.d_arc_ne_offsets[token_state];
-									int32 end = cst_dev_params.d_arc_ne_offsets[token_state+1];
-									degree = end - start;
-								}
+							IntegerCostType best_int_cost = cst_dev_params.d_state_best_int_cost.lane(ilane)[token_state];
+							if(token_int_cost == best_int_cost) {
+								// We are non-emitting in this kernel, using ne offsets
+								start = cst_dev_params.d_arc_ne_offsets[token_state];
+								int32 end = cst_dev_params.d_arc_ne_offsets[token_state+1];
+								degree = end - start;
 							}
 						}
 						int has_valid_nonpruned_token = (start != -1) ? 1 : 0;
@@ -1036,7 +1053,6 @@ we do not need inter-block communication (we launch only one CUDA block)
 								zero2,
 								PlusPlus(),
 								aggregate);
-
 						// Checking if we are not overflowing the main_q
 						const int32 total_ntokens = aggregate.y; 
 						if((main_q_end + total_ntokens) >= cst_dev_params.q_capacity) {
@@ -1062,8 +1078,8 @@ we do not need inter-block communication (we launch only one CUDA block)
 				}
 finalize_kernel:
 				if(threadIdx.x == 0) {
-					lane_counters->main_q_narcs_and_end.y = main_q_end; 
-					//printf("out frame =%i \n", main_q_end);
+					lane_counters->main_q_narcs_and_end = {0,main_q_end}; 
+					printf("out frame =%i \n", main_q_end);
 					lane_counters->main_q_local_offset = 0;
 				}	
 			}
@@ -1089,7 +1105,7 @@ finalize_kernel:
 					cost += final_cost; 
 				}
 				const IntegerCostType int_cost = floatToOrderedInt(cost); 
-				printf("cost=%f, int_cost=%i \n", cost, int_cost);
+				//printf("cost=%f, int_cost=%i, main_q_end=%i, global_offset=%i \n", cost, int_cost, main_q_end, global_offset);
 				const int32 global_idx = global_offset+idx;
 				const int2 min_and_arg = {int_cost, global_idx}; // sort by cost, put it first
 				atomicMinI2(&lane_counters->min_int_cost_and_arg_with_final, min_and_arg); // TODO maybe reduce locally
