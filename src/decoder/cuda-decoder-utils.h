@@ -42,7 +42,7 @@
 
 #define KALDI_CUDA_DECODER_1D_BLOCK 256                      
 #define KALDI_CUDA_DECODER_LARGEST_1D_BLOCK 1024
-#define KALDI_CUDA_DECODER_ONE_THREAD_BLOCK 32                      
+#define KALDI_CUDA_DECODER_ONE_THREAD_BLOCK 1
 
 inline dim3 KALDI_CUDA_DECODER_NUM_BLOCKS(int N, int M) {
 	dim3 grid;

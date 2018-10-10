@@ -273,7 +273,10 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
       decoding_timer.OutputStats(&timing_stats);
 
       if(num_processed>0) {
-	      for(Lattice &lat : lats) {
+	      //for(Lattice &lat : lats) {
+		{
+ 		      // Printing only the first one to compute WER using benchmark script
+		      Lattice &lat = lats[0];
 		      CompactLattice clat;
 		      ConvertLattice(lat, &clat);
 		      //        bool end_of_utterance = true;
