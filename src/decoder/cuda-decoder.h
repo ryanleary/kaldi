@@ -26,8 +26,6 @@
 
 #include "decoder/cuda-decoder-utils.h"
 			
-// TODO remove cuda code from this header
-
 //
 // To understand the following lines it is important to 
 // know the difference between what we call a decoder lane and a decoder 
@@ -45,7 +43,7 @@
 
 
 // Number of GPU decoder lanes
-#define KALDI_CUDA_DECODER_MAX_N_LANES 4
+#define KALDI_CUDA_DECODER_MAX_N_LANES 40
 
 // If we're at risk of filling the tokens queue,
 // the beam is reduced to keep only the best candidates in the 
@@ -301,7 +299,7 @@ namespace kaldi {
 
 			/// Returns the number of frames already decoded.  
 			int32 NumFramesDecoded(ChannelId ichannel) const;
-			int32 NumFramesDecoded() const; // batch size = 1
+			//int32 NumFramesDecoded() const; // batch size = 1
 
 			// GetBestPath gets the decoding traceback. If "use_final_probs" is true
 			// AND we reached a final state, it limits itself to final states;
@@ -311,7 +309,7 @@ namespace kaldi {
 			// If Decode() returned true, it is safe to assume GetBestPath will return true.
 			// It returns true if the output lattice was nonempty (i.e. had states in it);
 			// using the return value is deprecated.
-			bool GetBestPath(const std::vector<ChannelId> &channels, const std::vector<Lattice*> &fst_out_vec, bool use_final_probs=true);
+			bool GetBestPath(const std::vector<ChannelId> &channels, std::vector<Lattice*> &fst_out_vec, bool use_final_probs=true);
 			bool GetBestPath(Lattice* fst_out, bool use_final_probs=true); // batch size = 1
 
 			// GetBestCost sets in *min the token's best cost in the main_q

@@ -26,7 +26,6 @@
 #define MEMADVISE
 
 namespace kaldi {
-
 	CudaDecoder::CudaDecoder(const CudaFst &fst, 
 			const CudaDecoderConfig &config,
 			int32 nlanes,
@@ -36,6 +35,7 @@ namespace kaldi {
 	max_tokens_per_frame_(config.max_tokens_per_frame),
 	nlanes_(nlanes),
 	nchannels_(nchannels) {
+		KALDI_ASSERT(nlanes_ < KALDI_CUDA_DECODER_MAX_N_LANES);
 		//
 		// For a description of the class members, please refer to the cuda-decoder.h file
 		//
@@ -168,7 +168,7 @@ namespace kaldi {
 
 		// Adding the start state to the initial token queue
 		initialize_initial_lane_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
-			KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+			KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 			0,
 			compute_st_>>>();
 
@@ -197,12 +197,12 @@ namespace kaldi {
 			compute_st_>>>(*h_kernel_params_);
 
 		exclusive_sum_batched_step2_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(main_q_end, 1),
-			KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+			KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 			0,
 			compute_st_>>>(*h_kernel_params_);
 
 		exclusive_sum_batched_step3_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(main_q_end, 1),
-			KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+			KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 			0,
 			compute_st_>>>(*h_kernel_params_);
 
@@ -213,7 +213,7 @@ namespace kaldi {
 
 		// Context switch : saving channel state
 		save_channels_state_from_lanes_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, 1),
-						KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+						KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 						0,
 						compute_st_>>>(*h_kernel_params_);
 	
@@ -316,7 +316,7 @@ namespace kaldi {
 
 		// Getting the lanes ready to work with those channels  
 		load_channels_state_in_lanes_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-						KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+						KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 						0,
 						compute_st_>>>(*h_kernel_params_);
 
@@ -371,7 +371,7 @@ namespace kaldi {
 			// Updating a few counters, like resetting aux_q_end to 0...
 			// true is for IS_EMITTING
 			post_expand_kernel<true><<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-						KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+						KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 						0,
 						compute_st_>>>(*h_kernel_params_);
 
@@ -456,12 +456,10 @@ namespace kaldi {
 
 				// false is for non emitting
 				post_expand_kernel<false><<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-							KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+							KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
-				// Waiting for the copy
-				cudaStreamSynchronize(compute_st_);
 			}
 
 			// Finalizing process non emitting. Takes care of the long tail, 
@@ -535,13 +533,12 @@ namespace kaldi {
 			// Waiting for the copy
 			cudaStreamSynchronize(compute_st_);
 			
-			printf("=========================== FRAME =============================== \n");
 			//if(num_frames_decoded_[0] >= 3)   KALDI_ASSERT(0);
 		}   
 
 		// Context switch : saving channels states
 		save_channels_state_from_lanes_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
-			KALDI_CUDA_DECODER_ONE_WARP_BLOCK,
+			KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 			0,
 			compute_st_>>>(*h_kernel_params_);
 		SaveChannelsStateFromLanesCPU();
@@ -633,7 +630,10 @@ namespace kaldi {
 		std::vector<Lattice*> fst_out_vec = {fst_out};	
 		return GetBestPath(channels, fst_out_vec, use_final_probs); 
 	}
-	bool CudaDecoder::GetBestPath(const std::vector<ChannelId> &channels, const std::vector<Lattice*> &fst_out_vec, bool use_final_probs) {
+	bool CudaDecoder::GetBestPath(const std::vector<ChannelId> &channels, std::vector<Lattice*> &fst_out_vec, bool use_final_probs) {
+		KALDI_ASSERT(channels.size() == fst_out_vec.size());
+		KALDI_ASSERT(channels.size() <= nchannels_);
+
 		nvtxRangePushA("GetBestPath");
 		std::vector<std::pair<int32,CostType>> argmins;
 		std::vector<bool> has_reached_final;
@@ -700,6 +700,7 @@ namespace kaldi {
 		return true;
 	}
 	void CudaDecoder::SetChannelsInKernelParams(const std::vector<ChannelId> &channels) {
+		KALDI_ASSERT(channels.size() <= nchannels_);
 		KALDI_ASSERT(channels.size() <= nlanes_);
 		for(LaneId lane_id=0; lane_id<channels.size(); ++lane_id)
 			h_kernel_params_->channel_to_compute[lane_id] = channels[lane_id];
@@ -710,8 +711,9 @@ namespace kaldi {
 		KALDI_ASSERT(ichannel < nchannels_);
 		return num_frames_decoded_[ichannel];	
 	}
-
+/*
 	int32 CudaDecoder::NumFramesDecoded() const {
 		return NumFramesDecoded(0);
 	}
+*/
 } // end namespace kaldi.

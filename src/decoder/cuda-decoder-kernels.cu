@@ -748,7 +748,6 @@ finalize_kernel:
 		// Simulate a previously generated aux_q containing init state
 		const StateId init_state = cst_dev_params.init_state;
 		const CostType init_cost = cst_dev_params.init_cost;
-		printf("init cost=%f \n", init_cost);
 		IntegerCostType int_init_cost = floatToOrderedInt(init_cost);
 		cst_dev_params.d_aux_q_state_and_cost.lane(init_ilane)[0] = {init_state, int_init_cost};
 		cst_dev_params.d_aux_q_info.lane(init_ilane)[0] = {INT_MIN, -1};
@@ -783,8 +782,6 @@ finalize_kernel:
 	// THREADS : (WARP_SIZE, 1, 1)
 	// BLOCKS : (1, nchannel_to_compute, 1)
 	__global__ void load_channels_state_in_lanes_kernel(KernelParams params) {
-		if(threadIdx.x != 0)
-			return;
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const int32 ichannel = params.channel_to_compute[ilane];
@@ -800,8 +797,6 @@ finalize_kernel:
 
 	// Context switch : store
 	__global__ void save_channels_state_from_lanes_kernel(KernelParams params) {
-		if(threadIdx.x != 0)
-			return;
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -815,8 +810,6 @@ finalize_kernel:
 
 	template<bool IS_EMITTING>
 		__global__ void post_expand_kernel(KernelParams params) {
-			if(threadIdx.x != 0)
-				return;
 			const int nlanes = params.nlanes_used;
 			KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 				LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -837,7 +830,6 @@ finalize_kernel:
 					lane_counters->main_q_narcs_and_end = {0,0};
 					// The main_q was flushed - we need to update the global_offset
 					lane_counters->main_q_global_offset += prev_main_q_end;
-					printf("global_offset=%i \n", lane_counters->main_q_global_offset);
 				} else {
 					// Moving local offset. Tokens created by last expand
 					// will be pruned, and survivals will be moved at the end
@@ -1079,7 +1071,6 @@ we do not need inter-block communication (we launch only one CUDA block)
 finalize_kernel:
 				if(threadIdx.x == 0) {
 					lane_counters->main_q_narcs_and_end = {0,main_q_end}; 
-					printf("out frame =%i \n", main_q_end);
 					lane_counters->main_q_local_offset = 0;
 				}	
 			}
