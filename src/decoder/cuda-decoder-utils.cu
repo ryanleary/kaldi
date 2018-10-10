@@ -158,7 +158,6 @@ namespace kaldi {
 	InfoTokenVector::InfoTokenVector(int32 capacity, cudaStream_t copy_st) : capacity_(capacity), copy_st_(copy_st) {
 		KALDI_LOG << "Allocating InfoTokenVector with capacity = " << capacity_ << " tokens";
 		cudaMallocHost(&h_data_, capacity_ * sizeof(*h_data_)); 
-		printf("data at %p \n", h_data_);
 		Reset();
 	}
 

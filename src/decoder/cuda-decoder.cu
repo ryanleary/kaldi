@@ -588,7 +588,6 @@ namespace kaldi {
 		for(ChannelId ichannel : channels)
 			max_main_q_end = std::max(max_main_q_end, h_channels_counters_[ichannel].prev_main_q_narcs_and_end.y); 
 
-		printf("max_main_q_end cost = %i \n", max_main_q_end);
 		// TODO reset counters->reached_final to 0
 
 		// We already know what's the best cost, because we needed it for the cutoff
@@ -613,7 +612,6 @@ namespace kaldi {
 			int32 arg = minarg.y;
 			argmins->push_back({arg,min_cost});
 			has_reached_final->push_back(h_lanes_counters_[ilane].reached_final);
-			printf("best arg=%i>=%i -> %i \n", arg, h_channels_counters_[0].prev_main_q_global_offset, minarg.x);
 		}
 		cudaStreamSynchronize(compute_st_);
 	}

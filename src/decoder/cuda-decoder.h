@@ -91,11 +91,9 @@ namespace kaldi {
 				KALDI_ASSERT(ld_ > 0);
 				KALDI_ASSERT(!data_);
 				cudaMalloc(&data_, nrows_*ld_*sizeof(*data_));
-				printf("allocating %i*%i \n", nrows_, ld_);
 			}
 			void Free() {
 				KALDI_ASSERT(data_);
-				printf("DELETE \n");
 				cudaFree(data_);
 			}
 			protected:
