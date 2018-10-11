@@ -374,6 +374,7 @@ namespace kaldi {
 						KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 						0,
 						compute_st_>>>(*h_kernel_params_);
+			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 			// After ProcessEmitting we won't need the token
 			// associated with the previous frame anymore
@@ -416,6 +417,7 @@ namespace kaldi {
 						cudaMemcpyDeviceToHost,
 						compute_st_);
 				cudaStreamSynchronize(compute_st_);
+			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 				int32 max_aux_q_end = 0;
 				for(LaneId ilane=0;ilane < nlanes_used;++ilane) {
@@ -436,6 +438,7 @@ namespace kaldi {
 						compute_st_);
 				// Waiting for the copy
 				cudaStreamSynchronize(compute_st_);
+			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 				for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
 					const int32 main_q_narcs = h_lanes_counters_[ilane].main_q_narcs_and_end.x;
@@ -460,6 +463,7 @@ namespace kaldi {
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
+			KALDI_DECODER_CUDA_CHECK_ERROR();
 			}
 
 			// Finalizing process non emitting. Takes care of the long tail, 
@@ -481,6 +485,7 @@ namespace kaldi {
 
 			// Waiting for the copy
 			cudaStreamSynchronize(compute_st_);
+			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 			int32 max_main_q_end = 0;
 			for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
@@ -507,6 +512,7 @@ namespace kaldi {
 							KALDI_CUDA_DECODER_1D_BLOCK,
 							0,
 							compute_st_>>>(*h_kernel_params_);
+			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 			for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
 				const ChannelId ichannel = h_kernel_params_->channel_to_compute[ilane];
