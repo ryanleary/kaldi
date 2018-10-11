@@ -359,9 +359,11 @@ namespace kaldi {
 			// Process emitting, expanding arcs
 			// Looking for the channel with max numbers of arcs
 			int32 max_main_q_narcs = 0; // TODO some kind of strided iterator
-			for(LaneId ilane = 0; ilane<nlanes_used; ++ilane)
-				max_main_q_narcs = std::max(max_main_q_narcs, h_lanes_counters_[ilane].main_q_narcs_and_end.x);
-
+			for(LaneId ilane = 0; ilane<nlanes_used; ++ilane) {
+				const int32 main_q_narcs = h_lanes_counters_[ilane].main_q_narcs_and_end.x;
+				printf("narcs=%i lane=%i \n",  main_q_narcs, ilane);
+				max_main_q_narcs = std::max(max_main_q_narcs, main_q_narcs); 
+			}
 			// true is for IS_EMITTING
 			expand_arcs_kernel<true><<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_main_q_narcs, nlanes_used),
 				KALDI_CUDA_DECODER_1D_BLOCK,
@@ -422,6 +424,7 @@ namespace kaldi {
 				int32 max_aux_q_end = 0;
 				for(LaneId ilane=0;ilane < nlanes_used;++ilane) {
 					const int32 aux_q_end = h_lanes_counters_[ilane].post_expand_aux_q_end;
+					printf("ne aux_q_end=%i, lane=%i \n", aux_q_end, ilane);
 					max_aux_q_end = std::max(max_aux_q_end, aux_q_end);
 				}
 				preprocess_and_contract_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_aux_q_end, nlanes_used),
@@ -443,11 +446,14 @@ namespace kaldi {
 				for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
 					const int32 main_q_narcs = h_lanes_counters_[ilane].main_q_narcs_and_end.x;
 					max_main_q_narcs = std::max(max_aux_q_end, main_q_narcs);
+					printf("ne arcs=%i lane=%i \n",  main_q_narcs, ilane);
 				}
 
 				// If we have only a few arcs, jumping to the one-CTA per lane persistent version
-				if(max_main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS)
+				if(max_main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) {
+					printf("breaking \n");
 					break;
+				}
 
 				// false is for non emitting
 				expand_arcs_kernel<false><<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_main_q_narcs, nlanes_used),
