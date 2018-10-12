@@ -53,7 +53,7 @@ class BatchedCudaDecoder {
 
     //allocates reusable objects that are common across all decodings
     void Initialize(std::string fst_rxfilename, std::string nnet3_rxfilename) {
-      printf("NUM_THREADS=%d\n", numThreads_);
+      KALDI_LOG << "BatchedCudaDecoder Initialize with " << numThreads_ << " threads\n";
       nnet3_rxfilename_= nnet3_rxfilename;
       decode_fst_ = fst::ReadFstKaldiGeneric(fst_rxfilename);
       cuda_fst_.Initialize(*decode_fst_); 
@@ -61,13 +61,16 @@ class BatchedCudaDecoder {
       thread_contexts_.resize(numThreads_);
 
       thread_states_ = new std::atomic<ThreadState>[numThreads_];
+      free_threads_ = new std::atomic<int>[numThreads_];
+
       tasks_.resize(numThreads_);
 
       for (int i=0;i<numThreads_;i++) {
         thread_states_[i]=IDLE;
-        free_threads_.push(i);
+        free_threads_[i]=i;
         tasks_[i].reserve(maxBatchSize_);
       }
+      free_threads_count_=numThreads_;
       	
       for (int i=0;i<numThreads_;i++) {
         thread_contexts_[i]=std::thread(&BatchedCudaDecoder::ExecuteWorker,this,i);
@@ -84,7 +87,8 @@ class BatchedCudaDecoder {
       cuda_fst_.Finalize();
 
       delete decode_fst_;
-      delete thread_states_;
+      delete[] thread_states_;
+      delete[] free_threads_;
     }
 
     //query a specific key to see if compute on it is complete
@@ -110,14 +114,18 @@ class BatchedCudaDecoder {
     //Adds a decoding task to the decoder
     void CreateDecodeTask(const std::string &key, const WaveData &wave_data) {
 
-      printf("CreateDecodeTask before wait\n");
-
       //Wait for a thread to be free
-      while (free_threads_.empty());
+      while (free_threads_count_==0) std::this_thread::sleep_for(std::chrono::nanoseconds(50)); 
 
-      printf("CreateDecodeTask after wait\n");
+      //grab a free thread
+      int threadId;
+      free_threads_mutex_.lock();
+      {
+        threadId = free_threads_[free_threads_count_-1];
+        free_threads_count_--;
+      }
+      free_threads_mutex_.unlock();
 
-      int threadId = free_threads_.front();
       auto &tasks = tasks_[threadId];
 
       //Create a new task in lookup map
@@ -132,7 +140,7 @@ class BatchedCudaDecoder {
 
       //If maxBatchSize is reached start work
       if (tasks.size()==maxBatchSize_) {
-				Flush();
+				StartThread(threadId);
       }
     }
 
@@ -141,30 +149,21 @@ class BatchedCudaDecoder {
       //If there are not outstanding tasks then no need to flush
       if (taskCount_==0) return;
 
-      printf("Flush before wait\n");
       //wait for a free thread
-      while (free_threads_.empty()); //Does this need mutex?
-      printf("Flush after wait\n");
+      while (free_threads_count_==0) std::this_thread::sleep_for(std::chrono::nanoseconds(50)); 
 
-      //Not sure if we need a mutex here.  Only this thread will pop off the queue.  Other threads might push but that shouldn't change front().
-      //free_threads_mutex_.lock();
-    	int threadId = free_threads_.front();
-      //free_treads_mutex.unloc();
-
-      KALDI_ASSERT(taskCount_>0);
-       
-      taskCount_=0;
-		  //Start worker thread
-      thread_states_[threadId]=PROCESSING;
-      //Remove thread from free threads list  
+      //grab a free thread
+      int threadId;
       free_threads_mutex_.lock();
       {
-        printf("Remove %d from free thread list\n", threadId);
-        free_threads_.pop();
+        threadId = free_threads_[free_threads_count_-1];
+        free_threads_count_--;
       }
       free_threads_mutex_.unlock();
+
+      StartThread(threadId);
     }
-    
+
     void GetBestPath(const std::string &key, Lattice *lat) {
       auto it=tasks_lookup_.find(key);
       KALDI_ASSERT(it!=tasks_lookup_.end());
@@ -194,11 +193,13 @@ class BatchedCudaDecoder {
       void Init(const WaveData &wave_data_in) { wave_data=wave_data_in; finished=false; };
     };
 
-
+    void StartThread(int threadId) {
+      taskCount_=0;
+		  //Start worker thread
+      thread_states_[threadId]=PROCESSING;
+    }
 
     void ExecuteWorker(int threadId) {
-
-      printf("%d Worker started\n", threadId);
 
       std::atomic<ThreadState> &thread_state=thread_states_[threadId];
 
@@ -238,11 +239,8 @@ class BatchedCudaDecoder {
 
       std::vector<TaskState*> &tasks = tasks_[threadId];
       
-      printf("%d Entering Work Loop\n", threadId);
-
       while (thread_state!=EXIT) {
         if (thread_state==PROCESSING) {
-          printf("%d Processing batch\n", threadId);
 
           int batchSize=tasks.size();
 
@@ -285,13 +283,14 @@ class BatchedCudaDecoder {
           //We are now complete. Clean up datastructures
           tasks.clear();
           thread_state=IDLE;
+          
           //add myself to the free threads list
           free_threads_mutex_.lock();
           {
-            printf("Add %d to free threads\n",threadId);
-            free_threads_.push(threadId);  
+            free_threads_[free_threads_count_++]=threadId;
           }
           free_threads_mutex_.unlock();
+        
         } //end if
         //else { sleep(1); }
       } //End while !EXIT loop
@@ -313,15 +312,17 @@ class BatchedCudaDecoder {
     int maxBatchSize_;
     int numThreads_;
     int taskCount_;
-
+    
     std::mutex free_threads_mutex_;
+    std::atomic<int> *free_threads_;
+    std::atomic<int> free_threads_count_;
+//    std::queue<int> free_threads_;
 
-    std::vector<std::thread> thread_contexts_;
-    std::queue<int> free_threads_;
     //TODO should inner vector be a list?
     std::vector<std::vector<TaskState*> > tasks_;
     std::map<std::string,TaskState> tasks_lookup_;
     std::atomic<ThreadState>* thread_states_;
+    std::vector<std::thread> thread_contexts_;
 
     std::string nnet3_rxfilename_;
 };
