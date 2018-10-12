@@ -506,7 +506,7 @@ namespace kaldi {
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
-			exclusive_sum_batched_step3_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
+			exclusive_sum_batched_step3_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_main_q_end, nlanes_used),
 							KALDI_CUDA_DECODER_1D_BLOCK,
 							0,
 							compute_st_>>>(*h_kernel_params_);
