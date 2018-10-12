@@ -39,6 +39,8 @@
 #include "hmm/posterior.h"
 #include <vector>
 
+#define DECODER_NDUPLICATES 1 //FIXME just used for testing
+
 namespace kaldi {
 /// @addtogroup  onlinedecoding OnlineDecoding
 /// @{
