@@ -122,13 +122,6 @@ namespace kaldi {
 
 		KALDI_DECODER_CUDA_CHECK_ERROR();
 		num_frames_decoded_.resize(nchannels_, 0);
-	
-		if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
-			KALDI_LOG << "Running the decoder in debug level " << KALDI_CUDA_DECODER_DEBUG_LEVEL;
-			uint32_t debug_buffer_queue_size = max_tokens_per_frame_ + 1;
-			cudaMallocHost(&h_debug_buf1_, std::max(fst_.num_states_, debug_buffer_queue_size) * sizeof(h_debug_buf1_));
-			cudaMallocHost(&h_debug_buf2_, debug_buffer_queue_size * sizeof(h_debug_buf2_));
-		} 
 
 		// Making sure that everything is ready to use
 		cudaStreamSynchronize(compute_st_);
@@ -150,10 +143,6 @@ namespace kaldi {
 		delete h_kernel_params_;
 		delete h_device_params_;
 		cudaFree(d_device_params_);
-		if(KALDI_CUDA_DECODER_DEBUG_LEVEL > 0) {
-			cudaFreeHost(h_debug_buf1_);
-			cudaFreeHost(h_debug_buf2_);
-		}
 
 		KALDI_DECODER_CUDA_CHECK_ERROR();
 	}
@@ -189,6 +178,8 @@ namespace kaldi {
 				cudaMemcpyDeviceToHost, 
 				compute_st_);
 		cudaStreamSynchronize(compute_st_);
+
+		KALDI_ASSERT(main_q_end > 0);
 
 		// Preparing for first frame + reverting back to init state (lookup table, etc.)
 		preprocess_in_place_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(main_q_end, 1),
@@ -246,7 +237,7 @@ namespace kaldi {
 		// Size of the initial main_q_size
 		const int32 init_main_q_size = h_channels_counters_[init_channel_id_].prev_main_q_narcs_and_end.y;
 
-
+		KALDI_ASSERT(init_main_q_size > 0);
 		// Getting the channels ready to compute new utterances
 		init_decoding_on_device_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(init_main_q_size, nlanes_used),
 						KALDI_CUDA_DECODER_1D_BLOCK,
@@ -263,6 +254,7 @@ namespace kaldi {
 		}
 	}
 
+	// Context-switch : Load and Store
 	void CudaDecoder::LoadChannelsStateToLanesCPU() {
 		for(LaneId ilane=0; ilane<h_kernel_params_->nlanes_used; ++ilane) {
 			const ChannelId ichannel = h_kernel_params_->channel_to_compute[ilane];
@@ -297,7 +289,7 @@ namespace kaldi {
 			const int32 num_frames_decoded = num_frames_decoded_[ichannel];
 			KALDI_ASSERT(num_frames_decoded >= 0 &&
 					"You must call InitDecoding() before AdvanceDecoding()");
-			int32 num_frames_ready = decodable->NumFramesReady(); // TODO plug the right one
+			int32 num_frames_ready = decodable->NumFramesReady(); // FIXME plug the right one
 			// num_frames_ready must be >= num_frames_decoded, or else
 			// the number of frames ready must have decreased (which doesn't
 			// make sense) or the decodable object changed between calls
@@ -361,9 +353,9 @@ namespace kaldi {
 			int32 max_main_q_narcs = 0; // TODO some kind of strided iterator
 			for(LaneId ilane = 0; ilane<nlanes_used; ++ilane) {
 				const int32 main_q_narcs = h_lanes_counters_[ilane].main_q_narcs_and_end.x;
-				//printf("narcs=%i lane=%i \n",  main_q_narcs, ilane);
 				max_main_q_narcs = std::max(max_main_q_narcs, main_q_narcs); 
 			}
+			KALDI_ASSERT(max_main_q_narcs > 0);
 			// true is for IS_EMITTING
 			expand_arcs_kernel<true><<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_main_q_narcs, nlanes_used),
 				KALDI_CUDA_DECODER_1D_BLOCK,
@@ -376,7 +368,6 @@ namespace kaldi {
 						KALDI_CUDA_DECODER_ONE_THREAD_BLOCK,
 						0,
 						compute_st_>>>(*h_kernel_params_);
-			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 			// After ProcessEmitting we won't need the token
 			// associated with the previous frame anymore
@@ -419,14 +410,15 @@ namespace kaldi {
 						cudaMemcpyDeviceToHost,
 						compute_st_);
 				cudaStreamSynchronize(compute_st_);
-			KALDI_DECODER_CUDA_CHECK_ERROR();
-
 				int32 max_aux_q_end = 0;
 				for(LaneId ilane=0;ilane < nlanes_used;++ilane) {
 					const int32 aux_q_end = h_lanes_counters_[ilane].post_expand_aux_q_end;
 					//printf("ne aux_q_end=%i, lane=%i \n", aux_q_end, ilane);
 					max_aux_q_end = std::max(max_aux_q_end, aux_q_end);
 				}
+				if(max_aux_q_end == 0) // not likely, but possible
+					break; 
+
 				preprocess_and_contract_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_aux_q_end, nlanes_used),
 								KALDI_CUDA_DECODER_1D_BLOCK,
 								0,
@@ -441,7 +433,6 @@ namespace kaldi {
 						compute_st_);
 				// Waiting for the copy
 				cudaStreamSynchronize(compute_st_);
-			KALDI_DECODER_CUDA_CHECK_ERROR();
 
 				max_main_q_narcs = 0;
 				for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
@@ -452,8 +443,8 @@ namespace kaldi {
 
 				// If we have only a few arcs, jumping to the one-CTA per lane persistent version
 				//printf("%i<%i ? \n", max_main_q_narcs, KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS);
+				KALDI_ASSERT(KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS > 0); 
 				if(max_main_q_narcs < KALDI_CUDA_DECODER_NONEM_LT_MAX_NARCS) {
-					//printf("breaking \n");
 					break;
 				}
 
@@ -471,7 +462,7 @@ namespace kaldi {
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
-			KALDI_DECODER_CUDA_CHECK_ERROR();
+				KALDI_DECODER_CUDA_CHECK_ERROR();
 			}
 
 			// Finalizing process non emitting. Takes care of the long tail, 
@@ -497,10 +488,10 @@ namespace kaldi {
 
 			int32 max_main_q_end = 0;
 			for(LaneId ilane=0; ilane<nlanes_used; ++ilane) {
-				max_main_q_end = std::max(max_main_q_end,
-						h_lanes_counters_[ilane].main_q_narcs_and_end.y);
+				const int32 main_q_end = h_lanes_counters_[ilane].main_q_narcs_and_end.y;
+				KALDI_ASSERT(main_q_end > 0);
+				max_main_q_end = std::max(max_main_q_end, main_q_end);
 			}
-
 			// PreprocessInPlace for next ProcessEmitting
 			// We do it here (and not at the beginning of the loop) to 
 			// return the lane back to its original state after this frame computation
@@ -546,8 +537,6 @@ namespace kaldi {
 
 			// Waiting for the copy
 			cudaStreamSynchronize(compute_st_);
-			
-			//if(num_frames_decoded_[0] >= 3)   KALDI_ASSERT(0);
 		}   
 
 		// Context switch : saving channels states

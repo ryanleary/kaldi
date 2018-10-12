@@ -36,7 +36,7 @@ SingleUtteranceNnet3CudaDecoder::SingleUtteranceNnet3CudaDecoder(
     decodable_(trans_model_, info,
                features->InputFeature(), features->IvectorFeature()),
     decoder_(cuda_decoder) {
-    const int32 nchannels = 10;
+    const int32 nchannels = DECODER_NDUPLICATES;
     channels_.resize(nchannels);
     std::iota(channels_.begin(), channels_.end(), 0); // we will compute channels 0, 1, 2...
   decoder_.InitDecoding(channels_);

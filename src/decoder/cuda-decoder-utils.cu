@@ -23,7 +23,6 @@ namespace kaldi {
 
 	void CudaFst::Initialize(const fst::Fst<StdArc> &fst) {
 		nvtxRangePushA("CudaFst constructor");
-
 		//count states since Fst doesn't provide this functionality
 		num_states_=0;
 		for( fst::StateIterator<fst::Fst<StdArc> > iter(fst); !iter.Done(); iter.Next()) {
@@ -121,9 +120,7 @@ namespace kaldi {
 
 		// Making sure the graph is ready
 		cudaDeviceSynchronize();
-
 		KALDI_DECODER_CUDA_CHECK_ERROR();
-
 		nvtxRangePop();
 	}
 

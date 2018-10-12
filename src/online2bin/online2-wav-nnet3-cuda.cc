@@ -37,6 +37,7 @@
 #include <vector>
 
 #define MAX_DEVS 16
+
 using namespace kaldi;
 
 void GetDiagnosticsAndPrintOutput(const std::string &utt,
@@ -142,7 +143,7 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
 
 
   //every thread needs its own decoder state.  Declare that here.
-  CudaDecoder cuda_decoder(params.cuda_fst[gpu_idx],params.decoder_opts, 10, 10); //FIXME temp nchannels nlanes hardcoded
+  CudaDecoder cuda_decoder(params.cuda_fst[gpu_idx],params.decoder_opts, DECODER_NDUPLICATES, DECODER_NDUPLICATES); //FIXME temp nchannels nlanes hardcoded
 
   fst::SymbolTable *word_syms = NULL;
   if (params.word_syms_rxfilename != "")
@@ -262,8 +263,8 @@ void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
         }
         decoder.AdvanceDecoding();
       }
-      std::vector<Lattice> lats(10);
-      std::vector<Lattice*> lats_ptr(10);
+      std::vector<Lattice> lats(DECODER_NDUPLICATES);
+      std::vector<Lattice*> lats_ptr(DECODER_NDUPLICATES);
       for(int i=0;i<lats.size(); ++i)
 	lats_ptr[i] = &lats[i];
       if(num_processed>0) {

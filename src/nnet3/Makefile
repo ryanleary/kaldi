@@ -37,6 +37,10 @@ ifeq ($(CUDA), true)
   OBJFILES += decodable-online-looped-cuda.o
 endif
 
+ifeq ($(CUDA), true)
+  OBJFILES += decodable-online-looped-cuda.o
+endif
+
 
 LIBNAME = kaldi-nnet3
 
@@ -46,6 +50,18 @@ ADDLIBS = ../chain/kaldi-chain.a ../cudamatrix/kaldi-cudamatrix.a \
           ../transform/kaldi-transform.a ../gmm/kaldi-gmm.a \
           ../tree/kaldi-tree.a ../util/kaldi-util.a ../matrix/kaldi-matrix.a \
           ../base/kaldi-base.a 
+
+# Make sure we have CUDA_ARCH from kaldi.mk,
+ifeq ($(CUDA), true)
+  ifndef CUDA_ARCH
+    $(error CUDA_ARCH is undefined, run 'src/configure')
+  endif
+endif
+
+# Implicit rule for kernel compilation,
+%.o : %.cu
+	$(CUDATKDIR)/bin/nvcc -c $< -o $@ $(CUDA_INCLUDE) $(CUDA_FLAGS) $(CUDA_ARCH) -I../ -I$(OPENFSTINC) -Xcompiler \
+	"-pthread -fPIC" -DCUDA_API_PER_THREAD_DEFAULT_STREAM
 
 # Make sure we have CUDA_ARCH from kaldi.mk,
 ifeq ($(CUDA), true)
