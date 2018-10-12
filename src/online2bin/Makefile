@@ -12,7 +12,7 @@ BINFILES = online2-wav-gmm-latgen-faster apply-cmvn-online \
      online2-wav-dump-features ivector-randomize \
      online2-wav-nnet2-am-compute  online2-wav-nnet2-latgen-threaded \
      online2-wav-nnet3-latgen-faster online2-wav-nnet3-cuda online2-wav-nnet3-cpu \
-     online2-wav-nnet3-latgen-grammar
+     online2-wav-nnet3-latgen-grammar batched-wav-nnet3-cuda
 
 OBJFILES =
 
