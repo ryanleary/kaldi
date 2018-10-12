@@ -49,7 +49,7 @@ namespace kaldi {
 		ChannelMatrixInterface<int32> d_main_q_degrees_prefix_sum; 
 		LaneMatrixInterface<int32> d_main_q_degrees_block_sums_prefix_sum; 
 		ChannelMatrixInterface<int32> d_main_q_arc_offsets; 
-		ChannelMatrixInterface<CostType> d_loglikelihoods;
+		LaneMatrixInterface<CostType> d_loglikelihoods;
 		LaneMatrixInterface<IntegerCostType> d_state_best_int_cost; 
 
 		int32 max_nlanes;
