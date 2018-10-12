@@ -324,6 +324,8 @@ class ThreadedBatchedCudaDecoder {
           for (int i=0;i<batchSize;i++) {
             decoders[i]->AdvanceDecoding();
           }
+          //ensure compute is compete before proceeeding
+          cudaStreamSynchronize(cudaStreamPerThread);
           nvtxRangePop();
 
           nvtxRangePushA("GetBestPath");
