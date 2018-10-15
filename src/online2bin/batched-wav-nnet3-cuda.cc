@@ -128,6 +128,7 @@ class ThreadedBatchedCudaDecoder {
       SetDropoutTestMode(true, &(am_nnet_.GetNnet()));
       nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
 
+     decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(decodable_opts_,&am_nnet_);
     }
     void Finalize() {
 
@@ -142,6 +143,7 @@ class ThreadedBatchedCudaDecoder {
 
       delete[] thread_status_;
       delete[] free_threads_;
+      delete decodable_info_;
     }
 
     //query a specific key to see if compute on it is complete
@@ -265,28 +267,17 @@ class ThreadedBatchedCudaDecoder {
 
       //reusable across decodes
       std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos(maxBatchSize_);
-      std::vector<nnet3::AmNnetSimple> am_nnets(maxBatchSize_);  //cannot currently be shared due to writes from DecodableNnetSimpleLoopedInfo
-      std::vector<nnet3::DecodableNnetSimpleLoopedInfo*> decodable_infos(maxBatchSize_);
       std::vector<CudaDecoder*> cuda_decoders(maxBatchSize_);
 
       //reallocated each decode
       std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines(maxBatchSize_);
       std::vector<SingleUtteranceNnet3CudaDecoder*> decoders(maxBatchSize_);
 
-      am_nnets.clear();
-
       //TODO can any of this be shared across multiple decodes?  
       for (int i=0;i<maxBatchSize_;i++) {
         feature_infos[i]=new OnlineNnet2FeaturePipelineInfo(feature_opts_);
-
         feature_infos[i]->ivector_extractor_info.use_most_recent_ivector = true;
         feature_infos[i]->ivector_extractor_info.greedy_ivector_extractor = true;
-     
-        //copy from original nnet.  For some reason we cannot use these concurrently.  It looks like the next constructor
-        //reallocates memory inside of am_nnets which is problematic for concurrency.
-        am_nnets.push_back(am_nnet_);
-  
-        decodable_infos[i]=new nnet3::DecodableNnetSimpleLoopedInfo(decodable_opts_,&am_nnets[i]);
         cuda_decoders[i]=new CudaDecoder(cuda_fst_,decoder_opts_);
       }
 
@@ -300,7 +291,7 @@ class ThreadedBatchedCudaDecoder {
           nvtxRangePushA("Allocation");
           for (int i=0;i<batchSize;i++) {
             feature_pipelines[i] = new OnlineNnet2FeaturePipeline(*feature_infos[i]);
-            decoders[i] = new SingleUtteranceNnet3CudaDecoder(trans_model_, *decodable_infos[i], *cuda_decoders[i], feature_pipelines[i]);
+            decoders[i] = new SingleUtteranceNnet3CudaDecoder(trans_model_, *decodable_info_, *cuda_decoders[i], feature_pipelines[i]);
           }
           nvtxRangePop();
 
@@ -366,7 +357,6 @@ class ThreadedBatchedCudaDecoder {
      
       //cleanup
       for (int i=0;i<maxBatchSize_;i++) {
-        delete decodable_infos[i];
         delete cuda_decoders[i];
         delete feature_infos[i];
       }
@@ -379,11 +369,13 @@ class ThreadedBatchedCudaDecoder {
     CudaDecoderConfig decoder_opts_;                           //constant readonly
     TransitionModel trans_model_;
     nnet3::AmNnetSimple am_nnet_;
+    nnet3::DecodableNnetSimpleLoopedInfo *decodable_info_;
 
     int maxBatchSize_;  //Target CUDA batch size
     int numThreads_;    //The number of CPU threads
     int taskCount_;     //Current number of tasks that have been enqueued but not launched
-    
+   
+    std::mutex debug_mutex;
     //Free threads is a circular queue.  The front points to the current free thread. 
     //The back points to the slot to write a new free thread to.  If font==back then there
     //are no free threads available.  mutex and atomic required here to get a thread safe
