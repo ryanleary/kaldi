@@ -96,7 +96,6 @@ class ThreadedBatchedCudaDecoder {
     void Initialize(const fst::Fst<fst::StdArc> &decode_fst, std::string nnet3_rxfilename) {
       KALDI_LOG << "ThreadedBatchedCudaDecoder Initialize with " << numThreads_ << " threads\n";
       //Storing nnet3_rxfile.  TODO should we take in the nnet instead of reading it?
-      nnet3_rxfilename_= nnet3_rxfilename;
       cuda_fst_.Initialize(decode_fst); 
 
       thread_contexts_.resize(numThreads_);
@@ -119,6 +118,16 @@ class ThreadedBatchedCudaDecoder {
       for (int i=0;i<numThreads_;i++) {
         thread_contexts_[i]=std::thread(&ThreadedBatchedCudaDecoder::ExecuteWorker,this,i);
       }
+     
+      //read transition model and nnet
+		  bool binary;
+      Input ki(nnet3_rxfilename, &binary);
+      trans_model_.Read(ki.Stream(), binary);
+      am_nnet_.Read(ki.Stream(), binary);
+      SetBatchnormTestMode(true, &(am_nnet_.GetNnet()));
+      SetDropoutTestMode(true, &(am_nnet_.GetNnet()));
+      nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
+
     }
     void Finalize() {
 
@@ -256,8 +265,7 @@ class ThreadedBatchedCudaDecoder {
 
       //reusable across decodes
       std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos(maxBatchSize_);
-      std::vector<TransitionModel> trans_models(maxBatchSize_);  //can this be shared across threads/batch?
-      std::vector<nnet3::AmNnetSimple> am_nnets(maxBatchSize_);  //can this be shared across thread/batchs?
+      std::vector<nnet3::AmNnetSimple> am_nnets(maxBatchSize_);  //cannot currently be shared due to writes from DecodableNnetSimpleLoopedInfo
       std::vector<nnet3::DecodableNnetSimpleLoopedInfo*> decodable_infos(maxBatchSize_);
       std::vector<CudaDecoder*> cuda_decoders(maxBatchSize_);
 
@@ -265,6 +273,7 @@ class ThreadedBatchedCudaDecoder {
       std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines(maxBatchSize_);
       std::vector<SingleUtteranceNnet3CudaDecoder*> decoders(maxBatchSize_);
 
+      am_nnets.clear();
 
       //TODO can any of this be shared across multiple decodes?  
       for (int i=0;i<maxBatchSize_;i++) {
@@ -272,17 +281,11 @@ class ThreadedBatchedCudaDecoder {
 
         feature_infos[i]->ivector_extractor_info.use_most_recent_ivector = true;
         feature_infos[i]->ivector_extractor_info.greedy_ivector_extractor = true;
-      
-        //TODO it seems odd to me that we have to read and initialize this repeatedly.  Can this not be shared across concurrent decodes?
-        //read NNET configuration
-        bool binary;
-        Input ki(nnet3_rxfilename_, &binary);
-        trans_models[i].Read(ki.Stream(), binary);
-        am_nnets[i].Read(ki.Stream(), binary);
-        SetBatchnormTestMode(true, &(am_nnets[i].GetNnet()));
-        SetDropoutTestMode(true, &(am_nnets[i].GetNnet()));
-        nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnets[i].GetNnet()));
-
+     
+        //copy from original nnet.  For some reason we cannot use these concurrently.  It looks like the next constructor
+        //reallocates memory inside of am_nnets which is problematic for concurrency.
+        am_nnets.push_back(am_nnet_);
+  
         decodable_infos[i]=new nnet3::DecodableNnetSimpleLoopedInfo(decodable_opts_,&am_nnets[i]);
         cuda_decoders[i]=new CudaDecoder(cuda_fst_,decoder_opts_);
       }
@@ -297,7 +300,7 @@ class ThreadedBatchedCudaDecoder {
           nvtxRangePushA("Allocation");
           for (int i=0;i<batchSize;i++) {
             feature_pipelines[i] = new OnlineNnet2FeaturePipeline(*feature_infos[i]);
-            decoders[i] = new SingleUtteranceNnet3CudaDecoder(trans_models[i], *decodable_infos[i], *cuda_decoders[i], feature_pipelines[i]);
+            decoders[i] = new SingleUtteranceNnet3CudaDecoder(trans_model_, *decodable_infos[i], *cuda_decoders[i], feature_pipelines[i]);
           }
           nvtxRangePop();
 
@@ -324,6 +327,8 @@ class ThreadedBatchedCudaDecoder {
           for (int i=0;i<batchSize;i++) {
             decoders[i]->AdvanceDecoding();
           }
+
+          //decode not currently be shared due to writes from DecodableNnetSimpleLoopedInfo
           //ensure compute is compete before proceeeding
           cudaStreamSynchronize(cudaStreamPerThread);
           nvtxRangePop();
@@ -372,6 +377,8 @@ class ThreadedBatchedCudaDecoder {
     OnlineNnet2FeaturePipelineConfig  feature_opts_;           //constant readonly
     nnet3::NnetSimpleLoopedComputationOptions decodable_opts_; //constant readonly
     CudaDecoderConfig decoder_opts_;                           //constant readonly
+    TransitionModel trans_model_;
+    nnet3::AmNnetSimple am_nnet_;
 
     int maxBatchSize_;  //Target CUDA batch size
     int numThreads_;    //The number of CPU threads
@@ -390,8 +397,6 @@ class ThreadedBatchedCudaDecoder {
     std::vector<std::vector<TaskState*> > tasks_;  //List of tasks assigned to each thread.  The list contains pointers to the TaskState.
     std::atomic<ThreadStatus>* thread_status_;      //A list of thread status
     std::vector<std::thread> thread_contexts_;     //A list of thread contexts
-
-    std::string nnet3_rxfilename_;
 };
 
 
