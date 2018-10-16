@@ -51,6 +51,41 @@ using namespace kaldi;
  */
 
 
+/*************************************************
+ * BatchedCudaDecoderConfig
+ * This class is a common configuration class for the various components
+ * of a batched cuda multi-threaded pipeline.  It defines a single place
+ * to control all operations and ensures that the various componets
+ * match configurations
+ * **********************************************/
+//configuration options common to the BatchedCudaDecoder and BatchedCudaDecodable
+class BatchedCudaDecoderConfig {
+  public:
+    BatchedCudaDecoderConfig() : maxBatchSize_(20) {};
+    void Register(ParseOptions *po) {
+      feature_opts_.Register(po);
+      decodable_opts_.Register(po);
+      decoder_opts_.Register(po);
+      po->Register("max-batch-size",&maxBatchSize_, "The maximum batch size to be used by the decoder.");
+      po->Register("num-threads",&numThreads_, "The number of workpool threads to use in the ThreadedBatchedCudaDecoder");
+    }
+    int maxBatchSize_;
+    int numThreads_;
+    
+    OnlineNnet2FeaturePipelineConfig  feature_opts_;           //constant readonly
+    nnet3::NnetSimpleLoopedComputationOptions decodable_opts_; //constant readonly
+    CudaDecoderConfig decoder_opts_;                           //constant readonly
+};
+
+
+
+//class for computing ivectors and posteriors in batches
+class BatchedCudaDecodable {
+  public:
+  //ComputeIvectors()
+  //ComputePosteriors()
+};
+
 /*
  *  ThreadedBatchedCudaDecoder uses multiple levels of parallelism in order to decode quickly on CUDA GPUs.
  *  It's API is utterance centric using deferred execution.  That is a user submits work one utterance at a time
@@ -82,40 +117,32 @@ using namespace kaldi;
 class ThreadedBatchedCudaDecoder {
   public:
 
-    ThreadedBatchedCudaDecoder() : maxBatchSize_(10), numThreads_(1), taskCount_(0) {};
-
-    void Register(ParseOptions *po) {
-      feature_opts_.Register(po);
-      decodable_opts_.Register(po);
-      decoder_opts_.Register(po);
-      po->Register("max-batch-size",&maxBatchSize_, "The maximum batch size to be used by the decoder.");
-      po->Register("num-threads",&numThreads_, "The number of workpool threads to use in the ThreadedBatchedCudaDecoder");
-    };
+    ThreadedBatchedCudaDecoder(const BatchedCudaDecoderConfig &config) : config_(config), taskCount_(0) {};
 
     //allocates reusable objects that are common across all decodings
     void Initialize(const fst::Fst<fst::StdArc> &decode_fst, std::string nnet3_rxfilename) {
-      KALDI_LOG << "ThreadedBatchedCudaDecoder Initialize with " << numThreads_ << " threads\n";
+      KALDI_LOG << "ThreadedBatchedCudaDecoder Initialize with " << config_.numThreads_ << " threads\n";
       //Storing nnet3_rxfile.  TODO should we take in the nnet instead of reading it?
       cuda_fst_.Initialize(decode_fst); 
 
-      thread_contexts_.resize(numThreads_);
+      thread_contexts_.resize(config_.numThreads_);
 
-      thread_status_ = new std::atomic<ThreadStatus>[numThreads_];
-      free_threads_ = new std::atomic<int>[numThreads_+1];
+      thread_status_ = new std::atomic<ThreadStatus>[config_.numThreads_];
+      free_threads_ = new std::atomic<int>[config_.numThreads_+1];
 
-      tasks_.resize(numThreads_);
+      tasks_.resize(config_.numThreads_);
 
       //create per thread state
-      for (int i=0;i<numThreads_;i++) {
+      for (int i=0;i<config_.numThreads_;i++) {
         thread_status_[i]=IDLE;
         free_threads_[i]=i;
-        tasks_[i].reserve(maxBatchSize_);
+        tasks_[i].reserve(config_.maxBatchSize_);
       }
       free_threads_front_=0;
-      free_threads_back_=numThreads_;
+      free_threads_back_=config_.numThreads_;
       	
       //initialize threads and save their contexts so we can join them later
-      for (int i=0;i<numThreads_;i++) {
+      for (int i=0;i<config_.numThreads_;i++) {
         thread_contexts_[i]=std::thread(&ThreadedBatchedCudaDecoder::ExecuteWorker,this,i);
       }
      
@@ -128,12 +155,12 @@ class ThreadedBatchedCudaDecoder {
       SetDropoutTestMode(true, &(am_nnet_.GetNnet()));
       nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
 
-     decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(decodable_opts_,&am_nnet_);
+     decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(config_.decodable_opts_,&am_nnet_);
     }
     void Finalize() {
 
       //Tell threads to exit and join them
-      for(int i=0;i<numThreads_;i++) {
+      for(int i=0;i<config_.numThreads_;i++) {
         while(thread_status_[i]==PROCESSING);
         thread_status_[i]=EXIT;
         thread_contexts_[i].join();
@@ -192,7 +219,7 @@ class ThreadedBatchedCudaDecoder {
       taskCount_++;
 
       //If maxBatchSize is reached start work
-      if (tasks.size()==maxBatchSize_) {
+      if (tasks.size()==config_.maxBatchSize_) {
 				StartThread(threadId);
       }
     }
@@ -252,7 +279,7 @@ class ThreadedBatchedCudaDecoder {
       //Reset task count
       taskCount_=0;
       //Remove thread from free list
-      free_threads_front_=(free_threads_front_+1)%(numThreads_+1);
+      free_threads_front_=(free_threads_front_+1)%(config_.numThreads_+1);
 		  //Notifiy worker thread to start processing
       thread_status_[threadId]=PROCESSING;
     }
@@ -266,19 +293,19 @@ class ThreadedBatchedCudaDecoder {
       CuDevice::Instantiate().AllowMultithreading();
 
       //reusable across decodes
-      std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos(maxBatchSize_);
-      std::vector<CudaDecoder*> cuda_decoders(maxBatchSize_);
+      std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos(config_.maxBatchSize_);
+      std::vector<CudaDecoder*> cuda_decoders(config_.maxBatchSize_);
 
       //reallocated each decode
-      std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines(maxBatchSize_);
-      std::vector<SingleUtteranceNnet3CudaDecoder*> decoders(maxBatchSize_);
+      std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines(config_.maxBatchSize_);
+      std::vector<SingleUtteranceNnet3CudaDecoder*> decoders(config_.maxBatchSize_);
 
       //TODO can any of this be shared across multiple decodes?  
-      for (int i=0;i<maxBatchSize_;i++) {
-        feature_infos[i]=new OnlineNnet2FeaturePipelineInfo(feature_opts_);
+      for (int i=0;i<config_.maxBatchSize_;i++) {
+        feature_infos[i]=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
         feature_infos[i]->ivector_extractor_info.use_most_recent_ivector = true;
         feature_infos[i]->ivector_extractor_info.greedy_ivector_extractor = true;
-        cuda_decoders[i]=new CudaDecoder(cuda_fst_,decoder_opts_);
+        cuda_decoders[i]=new CudaDecoder(cuda_fst_,config_.decoder_opts_);
       }
 
       //This threads task list
@@ -308,11 +335,19 @@ class ThreadedBatchedCudaDecoder {
           }
           nvtxRangePop();
 
+          //We need some sort of batched decodable interface...
+
           //feature extract
           //TODO pull out of AdvanceDecoding/AdvanceChunk
+          //for (int i=0;i<batchSize;i++) {
+          //  decoders[i]->AdvanceIvectors();
+          //}
 
-          //nnet3
+          //acoustic model
           //TODO pull out of AdvanceDecoding/AdvanceChunk
+          //for (int i=0;i<batchSize;i++) {
+          //  decoders[i]->AdvanceAM();
+          //}
 
           nvtxRangePushA("AdvanceDecoding");
           for (int i=0;i<batchSize;i++) {
@@ -347,7 +382,7 @@ class ThreadedBatchedCudaDecoder {
           free_threads_mutex_.lock();
           {
             free_threads_[free_threads_back_]=threadId;
-            free_threads_back_=(free_threads_back_+1)%(numThreads_+1);
+            free_threads_back_=(free_threads_back_+1)%(config_.numThreads_+1);
           }
           free_threads_mutex_.unlock();
         
@@ -356,23 +391,20 @@ class ThreadedBatchedCudaDecoder {
       } //End while !EXIT loop
      
       //cleanup
-      for (int i=0;i<maxBatchSize_;i++) {
+      for (int i=0;i<config_.maxBatchSize_;i++) {
         delete cuda_decoders[i];
         delete feature_infos[i];
       }
     }
+
+    const BatchedCudaDecoderConfig &config_;
     
     CudaFst cuda_fst_;
 
-    OnlineNnet2FeaturePipelineConfig  feature_opts_;           //constant readonly
-    nnet3::NnetSimpleLoopedComputationOptions decodable_opts_; //constant readonly
-    CudaDecoderConfig decoder_opts_;                           //constant readonly
     TransitionModel trans_model_;
     nnet3::AmNnetSimple am_nnet_;
     nnet3::DecodableNnetSimpleLoopedInfo *decodable_info_;
 
-    int maxBatchSize_;  //Target CUDA batch size
-    int numThreads_;    //The number of CPU threads
     int taskCount_;     //Current number of tasks that have been enqueued but not launched
    
     std::mutex debug_mutex;
@@ -463,11 +495,12 @@ int main(int argc, char *argv[]) {
     po.Register("word-symbol-table", &word_syms_rxfilename, "Symbol table for words [for debug output]");
     po.Register("file-limit", &num_todo, "Limits the number of files that are processed by this driver.  After N files are processed the remaing files are ignored.  Useful for profiling.");
     //Multi-threaded CPU and batched GPU decoder
-    ThreadedBatchedCudaDecoder CudaDecoder;
-    OnlineEndpointConfig endpoint_opts;  //TODO is this even used?  Config seems to need it but we never seem to use it.
+    BatchedCudaDecoderConfig batchedDecoderConfig;
 
-    CudaDecoder.Register(&po);
+    OnlineEndpointConfig endpoint_opts;  //TODO is this even used?  Config seems to need it but we never seem to use it.
     endpoint_opts.Register(&po);
+
+    batchedDecoderConfig.Register(&po);
 
     po.Read(argc, argv);
 
@@ -481,6 +514,8 @@ int main(int argc, char *argv[]) {
 
     nvtxRangePush("Global Timer");
     auto start = std::chrono::high_resolution_clock::now();
+    
+    ThreadedBatchedCudaDecoder CudaDecoder(batchedDecoderConfig);
 
     std::string nnet3_rxfilename = po.GetArg(1),
       fst_rxfilename = po.GetArg(2),
