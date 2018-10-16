@@ -143,9 +143,11 @@ class BatchedOnlineNnet2FeaturePipeline {
     }
     OnlineNnet2FeaturePipeline* getFeaturePipeline(int i) { return feature_pipelines_[i]; }
 
-    void AcceptWaveform(int i, BaseFloat samp_freq, const SubVector<BaseFloat> &data) {
-      feature_pipelines_[i]->AcceptWaveform(samp_freq,data);
-      feature_pipelines_[i]->InputFinished();
+    void AcceptWaveforms(const std::vector<BaseFloat> &samp_freqs, const std::vector<SubVector<BaseFloat> > &data) {
+      for(int i=0;i<batchSize_;i++) {
+        feature_pipelines_[i]->AcceptWaveform(samp_freqs[i],data[i]);
+        feature_pipelines_[i]->InputFinished();
+      }
     }
   private:
     int batchSize_;
@@ -411,15 +413,19 @@ class ThreadedBatchedCudaDecoder {
 
           //process waveform
           nvtxRangePushA("Process Waveform");
+          std::vector<BaseFloat> samp_freqs(batchSize);
+          std::vector<SubVector<BaseFloat> > data;
+          data.reserve(batchSize);
+
+          //gather inputs into vectors for batched interface
           for (int i=0;i<batchSize;i++) {
             TaskState &state = *tasks[i];
 
-            BaseFloat samp_freq = state.wave_data.SampFreq();
-            SubVector<BaseFloat> data(state.wave_data.Data(), 0); 
-
-            //Set input for each feature pipeline
-            feature_pipelines.AcceptWaveform(i,samp_freq,data);
+            samp_freqs[i]=state.wave_data.SampFreq();
+            data.push_back(SubVector<BaseFloat>(state.wave_data.Data(), 0));
           }
+
+          feature_pipelines.AcceptWaveforms(samp_freqs,data);
           nvtxRangePop();
 
           //We need some sort of batched decodable interface...
