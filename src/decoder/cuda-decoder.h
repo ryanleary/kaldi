@@ -135,8 +135,8 @@ namespace kaldi {
 					return {this->MutableData(), this->ld_};
 				}
 
-				T *lane(const int32 ichannel) {
-					return &this->MutableData()[ichannel*this->ld_];
+				T *lane(const int32 ilane) {
+					return &this->MutableData()[ilane*this->ld_];
 				}	
 		};
 
@@ -146,8 +146,8 @@ namespace kaldi {
 				ChannelMatrixInterface<T> GetInterface() {	
 					return {this->MutableData(), this->ld_};
 				}
-				T *channel(const int32 ilane) {
-					return &this->MutableData()[ilane*this->ld_];
+				T *channel(const int32 ichannel) {
+					return &this->MutableData()[ichannel*this->ld_];
 				}	
 		};
 
@@ -289,8 +289,8 @@ namespace kaldi {
 			/// object, but if max_num_frames is >= 0 it will decode no more than
 			/// that many frames.  If it returns false, then no tokens are alive,
 			/// which is a kind of error state.
-			void AdvanceDecoding(DecodableInterface *decodable,
-					const std::vector<ChannelId> &channels,
+			void AdvanceDecoding(const std::vector<ChannelId> &channels,
+					std::vector<DecodableInterface*> &decodables,
 					int32 max_num_frames = -1);
 			void AdvanceDecoding(DecodableInterface *decodable,
 					int32 max_num_frames = -1); // batch size = 1
@@ -518,7 +518,7 @@ namespace kaldi {
 			void ResetStateBestCostLookupAndFinalizePreprocessInPlace(int main_q_size_estimate);
 
 			// Pre-computes log likelihoods for the current frame 
-			void ComputeLogLikelihoods(DecodableInterface *decodable);
+			void ComputeLogLikelihoods(std::vector<DecodableInterface*> &decodables_vec);
 
 			// CheckOverflow
 			// If a kernel sets the flag h_q_overflow, we send a warning to stderr 
@@ -621,7 +621,7 @@ namespace kaldi {
 			// we cache the results in d_main_q_arc_offsets which will be read in a coalesced fashion in expand
 			DeviceChannelMatrix<int32> d_main_q_arc_offsets_; 
 
-			DeviceChannelMatrix<CostType> d_loglikelihoods_;
+			DeviceLaneMatrix<CostType> d_loglikelihoods_;
 			DeviceLaneMatrix<IntegerCostType> d_state_best_int_cost_; 
 
 			DeviceParams *h_device_params_, *d_device_params_;

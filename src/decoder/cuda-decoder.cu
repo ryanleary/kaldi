@@ -65,7 +65,7 @@ namespace kaldi {
 				KALDI_CUDA_DECODER_DIV_ROUND_UP(max_tokens_per_frame_, KALDI_CUDA_DECODER_1D_BLOCK) + 1);
 		d_main_q_arc_offsets_.Resize(nchannels_,  max_tokens_per_frame_);
 		d_state_best_int_cost_.Resize(nlanes, num_states);
-		d_loglikelihoods_.Resize(1, fst_.max_ilabel_+1);
+		d_loglikelihoods_.Resize(nlanes, fst_.max_ilabel_+1);
 
 		// Setting Kernel Params
 		// sent to kernels by copy
@@ -273,11 +273,12 @@ namespace kaldi {
 	void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
 			int32 max_num_frames) {
 		std::vector<ChannelId> channels = {0};	
-		AdvanceDecoding(decodable, channels, max_num_frames);
+		std::vector<DecodableInterface*> decodables = {decodable};	
+		AdvanceDecoding(channels, decodables, max_num_frames);
 	}
 
-	void CudaDecoder::AdvanceDecoding(DecodableInterface *decodable,
-			const std::vector<ChannelId> &channels,
+	void CudaDecoder::AdvanceDecoding(const std::vector<ChannelId> &channels,
+			std::vector<DecodableInterface*> &decodables,
 			int32 max_num_frames) {
 		const int nlanes_used = channels.size();
 		if(nlanes_used <= 0)
@@ -285,11 +286,12 @@ namespace kaldi {
 		
 		// How many frames should we decode ?
 		int32 nframes_to_decode = INT_MAX;
-		for(ChannelId ichannel : channels) {
+		for(int32 ilane=0; ilane<nlanes_used; ++ilane) {
+			const ChannelId ichannel = channels[ilane];
 			const int32 num_frames_decoded = num_frames_decoded_[ichannel];
 			KALDI_ASSERT(num_frames_decoded >= 0 &&
 					"You must call InitDecoding() before AdvanceDecoding()");
-			int32 num_frames_ready = decodable->NumFramesReady(); // FIXME plug the right one
+			int32 num_frames_ready = decodables[ilane]->NumFramesReady(); // FIXME plug the right one
 			// num_frames_ready must be >= num_frames_decoded, or else
 			// the number of frames ready must have decreased (which doesn't
 			// make sense) or the decodable object changed between calls
@@ -318,11 +320,8 @@ namespace kaldi {
 			// Computing a new frame
 
 			// Loglikelihoods from the acoustic model
-			// FIXME for now we duplicate the loglikelihoods 
-			// to all channels for perf. measurement. 
-			// We must decide which design to adopt
 			nvtxRangePop(); // Decoding
-			ComputeLogLikelihoods(decodable);
+			ComputeLogLikelihoods(decodables);
 			nvtxRangePushA("Decoding");
 
 			// ProcessEmitting 
@@ -507,7 +506,7 @@ namespace kaldi {
 							0,
 							compute_st_>>>(*h_kernel_params_);
 
-			exclusive_sum_batched_step3_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(1, nlanes_used),
+			exclusive_sum_batched_step3_kernel<<<KALDI_CUDA_DECODER_NUM_BLOCKS(max_main_q_end, nlanes_used),
 							KALDI_CUDA_DECODER_1D_BLOCK,
 							0,
 							compute_st_>>>(*h_kernel_params_);
@@ -550,11 +549,12 @@ namespace kaldi {
 	}
 
 
-	void CudaDecoder::ComputeLogLikelihoods(DecodableInterface *decodable) {
-		const std::vector<ChannelId> channels = {0};  // TODO != channels
-		for(const ChannelId ichannel : channels) {
+	void CudaDecoder::ComputeLogLikelihoods(std::vector<DecodableInterface*> &decodables) {
+		KALDI_ASSERT(decodables.size() == h_kernel_params_->nlanes_used);
+		for(LaneId ilane=0; ilane<h_kernel_params_->nlanes_used; ++ilane) {
+			ChannelId ichannel = h_kernel_params_->channel_to_compute[ilane];
 			int32 frame = num_frames_decoded_[ichannel];
-			decodable->ComputeLogLikelihoods(d_loglikelihoods_.MutableData(), frame, fst_.max_ilabel_+1, compute_st_);
+			decodables[ilane]->ComputeLogLikelihoods(d_loglikelihoods_.lane(ilane), frame, fst_.max_ilabel_+1, compute_st_); // TODO batch
 		}
 	}
 
