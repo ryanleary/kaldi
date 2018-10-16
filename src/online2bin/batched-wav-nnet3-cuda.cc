@@ -77,13 +77,112 @@ class BatchedCudaDecoderConfig {
     CudaDecoderConfig decoder_opts_;                           //constant readonly
 };
 
-
-
-//class for computing ivectors and posteriors in batches
-class BatchedCudaDecodable {
+/***************************************************
+ * Placeholder for a batched pipeline info class
+ * *************************************************/
+class BatchedNnet2FeaturePipelineInfo {
   public:
-  //ComputeIvectors()
-  //ComputePosteriors()
+    BatchedNnet2FeaturePipelineInfo(const BatchedCudaDecoderConfig &config) : config_(config) {
+      feature_infos_.resize(config_.maxBatchSize_);
+      for(int i=0;i<config_.maxBatchSize_;i++) {
+        feature_infos_[i]=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
+        feature_infos_[i]->ivector_extractor_info.use_most_recent_ivector = true;
+        feature_infos_[i]->ivector_extractor_info.greedy_ivector_extractor = true;
+      }
+    }
+    ~BatchedNnet2FeaturePipelineInfo() {
+      for(int i=0;i<config_.maxBatchSize_;i++) {
+        delete feature_infos_[i];
+      }
+    }
+      
+    OnlineNnet2FeaturePipelineInfo* getFeatureInfo(int i) { return feature_infos_[i]; }
+  private:
+    const BatchedCudaDecoderConfig &config_;
+    std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos_;
+};
+
+/***************************************************
+ * Placeholder for a batched cuda decoder class
+ * *************************************************/
+class BatchedCudaDecoder {
+  public:
+    BatchedCudaDecoder(const BatchedCudaDecoderConfig &config, const CudaFst &cuda_fst) : config_(config) {
+      cuda_decoders_.resize(config_.maxBatchSize_);
+      for(int i=0;i<config_.maxBatchSize_;i++) {
+        cuda_decoders_[i]=new CudaDecoder(cuda_fst,config_.decoder_opts_);
+      }
+    }
+    ~BatchedCudaDecoder() {
+      for(int i=0;i<config_.maxBatchSize_;i++) {
+        delete cuda_decoders_[i];
+      }
+    }
+    CudaDecoder* getCudaDecoder(int i) { return cuda_decoders_[i]; }
+  private:
+    const BatchedCudaDecoderConfig &config_;
+    std::vector<CudaDecoder*> cuda_decoders_;
+};
+
+/***************************************************
+ * Placeholder for a batched feature pipeline
+ * *************************************************/
+class BatchedOnlineNnet2FeaturePipeline {
+  public:
+    BatchedOnlineNnet2FeaturePipeline(const BatchedCudaDecoderConfig &config, int batchSize, BatchedNnet2FeaturePipelineInfo &feature_infos) 
+      : batchSize_(batchSize), config_(config){
+      feature_pipelines_.resize(batchSize_);
+      for(int i=0;i<batchSize_;i++) {
+        feature_pipelines_[i]=new OnlineNnet2FeaturePipeline(*feature_infos.getFeatureInfo(i));
+      }
+    }
+    ~BatchedOnlineNnet2FeaturePipeline() {
+      for(int i=0;i<batchSize_;i++) {
+        delete feature_pipelines_[i];
+      }
+    }
+    OnlineNnet2FeaturePipeline* getFeaturePipeline(int i) { return feature_pipelines_[i]; }
+
+    void AcceptWaveform(int i, BaseFloat samp_freq, const SubVector<BaseFloat> &data) {
+      feature_pipelines_[i]->AcceptWaveform(samp_freq,data);
+      feature_pipelines_[i]->InputFinished();
+    }
+  private:
+    int batchSize_;
+    const BatchedCudaDecoderConfig &config_;
+    std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines_;
+};
+
+/***************************************************
+ * Placeholder for a batched utterance decoder
+ * *************************************************/
+class BatchedSingleUtteranceNnet3CudaDecoder {
+  public:
+    BatchedSingleUtteranceNnet3CudaDecoder(const BatchedCudaDecoderConfig &config, int batchSize, const TransitionModel &trans_model, 
+        const nnet3::DecodableNnetSimpleLoopedInfo &decodable_info, BatchedCudaDecoder &cuda_decoders, 
+        BatchedOnlineNnet2FeaturePipeline &feature_pipelines) : batchSize_(batchSize), config_(config) {
+      decoders_.resize(batchSize_);
+      for(int i=0;i<batchSize_;i++) {
+        decoders_[i]= new SingleUtteranceNnet3CudaDecoder(trans_model, decodable_info, *cuda_decoders.getCudaDecoder(i), feature_pipelines.getFeaturePipeline(i));
+      }
+    }
+    ~BatchedSingleUtteranceNnet3CudaDecoder() {
+      for(int i=0;i<batchSize_;i++) {
+        delete decoders_[i];
+      }
+    }
+    void AdvanceDecoding() {
+      for(int i=0;i<batchSize_;i++) {
+        decoders_[i]->AdvanceDecoding();
+      }
+    }
+    void GetBestPath(int i, Lattice *lat) {
+      decoders_[i]->GetBestPath(true,lat);
+    }
+  private:
+    int batchSize_;
+    const BatchedCudaDecoderConfig &config_;
+    std::vector<SingleUtteranceNnet3CudaDecoder*> decoders_;
 };
 
 /*
@@ -119,10 +218,11 @@ class ThreadedBatchedCudaDecoder {
 
     ThreadedBatchedCudaDecoder(const BatchedCudaDecoderConfig &config) : config_(config), taskCount_(0) {};
 
+    //TODO should this take an nnet instead of a string?
     //allocates reusable objects that are common across all decodings
     void Initialize(const fst::Fst<fst::StdArc> &decode_fst, std::string nnet3_rxfilename) {
       KALDI_LOG << "ThreadedBatchedCudaDecoder Initialize with " << config_.numThreads_ << " threads\n";
-      //Storing nnet3_rxfile.  TODO should we take in the nnet instead of reading it?
+
       cuda_fst_.Initialize(decode_fst); 
 
       thread_contexts_.resize(config_.numThreads_);
@@ -140,14 +240,14 @@ class ThreadedBatchedCudaDecoder {
       }
       free_threads_front_=0;
       free_threads_back_=config_.numThreads_;
-      	
+
       //initialize threads and save their contexts so we can join them later
       for (int i=0;i<config_.numThreads_;i++) {
         thread_contexts_[i]=std::thread(&ThreadedBatchedCudaDecoder::ExecuteWorker,this,i);
       }
-     
+
       //read transition model and nnet
-		  bool binary;
+      bool binary;
       Input ki(nnet3_rxfilename, &binary);
       trans_model_.Read(ki.Stream(), binary);
       am_nnet_.Read(ki.Stream(), binary);
@@ -155,13 +255,14 @@ class ThreadedBatchedCudaDecoder {
       SetDropoutTestMode(true, &(am_nnet_.GetNnet()));
       nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
 
-     decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(config_.decodable_opts_,&am_nnet_);
+      decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(config_.decodable_opts_,&am_nnet_);
     }
     void Finalize() {
 
       //Tell threads to exit and join them
-      for(int i=0;i<config_.numThreads_;i++) {
-        while(thread_status_[i]==PROCESSING);
+      for (int i=0;i<config_.numThreads_;i++) {
+        while (thread_status_[i]==PROCESSING);
+        
         thread_status_[i]=EXIT;
         thread_contexts_[i].join();
       }
@@ -249,7 +350,7 @@ class ThreadedBatchedCudaDecoder {
 
       //Note it is assumed that the user has called Flush().  If they have not then this could deadlock.
 
-      while(state->finished==false);
+      while (state->finished==false);
       
       //Store off the lattice
       *lat=state->lat;
@@ -293,20 +394,8 @@ class ThreadedBatchedCudaDecoder {
       CuDevice::Instantiate().AllowMultithreading();
 
       //reusable across decodes
-      std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos(config_.maxBatchSize_);
-      std::vector<CudaDecoder*> cuda_decoders(config_.maxBatchSize_);
-
-      //reallocated each decode
-      std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines(config_.maxBatchSize_);
-      std::vector<SingleUtteranceNnet3CudaDecoder*> decoders(config_.maxBatchSize_);
-
-      //TODO can any of this be shared across multiple decodes?  
-      for (int i=0;i<config_.maxBatchSize_;i++) {
-        feature_infos[i]=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
-        feature_infos[i]->ivector_extractor_info.use_most_recent_ivector = true;
-        feature_infos[i]->ivector_extractor_info.greedy_ivector_extractor = true;
-        cuda_decoders[i]=new CudaDecoder(cuda_fst_,config_.decoder_opts_);
-      }
+      BatchedNnet2FeaturePipelineInfo feature_infos(config_);
+      BatchedCudaDecoder cuda_decoders(config_,cuda_fst_);
 
       //This threads task list
       std::vector<TaskState*> &tasks = tasks_[threadId];
@@ -315,11 +404,9 @@ class ThreadedBatchedCudaDecoder {
         if (thread_state==PROCESSING) {  //check if master has told us to process
           int batchSize=tasks.size();
           
-          nvtxRangePushA("Allocation");
-          for (int i=0;i<batchSize;i++) {
-            feature_pipelines[i] = new OnlineNnet2FeaturePipeline(*feature_infos[i]);
-            decoders[i] = new SingleUtteranceNnet3CudaDecoder(trans_model_, *decodable_info_, *cuda_decoders[i], feature_pipelines[i]);
-          }
+          nvtxRangePushA("Decoder Instantiation");
+          BatchedOnlineNnet2FeaturePipeline feature_pipelines(config_, batchSize, feature_infos);
+          BatchedSingleUtteranceNnet3CudaDecoder decoders(config_, batchSize, trans_model_, *decodable_info_, cuda_decoders, feature_pipelines);
           nvtxRangePop();
 
           //process waveform
@@ -330,8 +417,8 @@ class ThreadedBatchedCudaDecoder {
             BaseFloat samp_freq = state.wave_data.SampFreq();
             SubVector<BaseFloat> data(state.wave_data.Data(), 0); 
 
-            feature_pipelines[i]->AcceptWaveform(samp_freq, data);
-            feature_pipelines[i]->InputFinished();
+            //Set input for each feature pipeline
+            feature_pipelines.AcceptWaveform(i,samp_freq,data);
           }
           nvtxRangePop();
 
@@ -339,41 +426,26 @@ class ThreadedBatchedCudaDecoder {
 
           //feature extract
           //TODO pull out of AdvanceDecoding/AdvanceChunk
-          //for (int i=0;i<batchSize;i++) {
-          //  decoders[i]->AdvanceIvectors();
-          //}
+          //decoders.ComputeFeatures();
 
           //acoustic model
-          //TODO pull out of AdvanceDecoding/AdvanceChunk
-          //for (int i=0;i<batchSize;i++) {
-          //  decoders[i]->AdvanceAM();
-          //}
+          //decoders.ComputeLogLikelihoods();
 
           nvtxRangePushA("AdvanceDecoding");
-          for (int i=0;i<batchSize;i++) {
-            decoders[i]->AdvanceDecoding();
-          }
-
-          //decode not currently be shared due to writes from DecodableNnetSimpleLoopedInfo
+          decoders.AdvanceDecoding();
+          nvtxRangePop();
+          
           //ensure compute is compete before proceeeding
           cudaStreamSynchronize(cudaStreamPerThread);
-          nvtxRangePop();
 
           nvtxRangePushA("GetBestPath");
           for (int i=0;i<batchSize;i++) {
             TaskState &state = *tasks[i];
-            decoders[i]->GetBestPath(true,&state.lat);
+            decoders.GetBestPath(i,&state.lat);
             state.finished=true;
           } 
           nvtxRangePop();
           
-          nvtxRangePushA("Deallocate");
-          for (int i=0;i<batchSize;i++) {
-            delete feature_pipelines[i];
-            delete decoders[i];
-          }
-          nvtxRangePop();
-
           //We are now complete. Clean up data structures
           tasks.clear();
           thread_state=IDLE;
@@ -389,12 +461,6 @@ class ThreadedBatchedCudaDecoder {
         } //end if
         //else { sleep(1); }
       } //End while !EXIT loop
-     
-      //cleanup
-      for (int i=0;i<config_.maxBatchSize_;i++) {
-        delete cuda_decoders[i];
-        delete feature_infos[i];
-      }
     }
 
     const BatchedCudaDecoderConfig &config_;
