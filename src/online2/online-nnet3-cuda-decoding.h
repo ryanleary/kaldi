@@ -37,6 +37,9 @@
 #include "decoder/cuda-decoder.h"
 #include "hmm/transition-model.h"
 #include "hmm/posterior.h"
+#include <vector>
+
+#define DECODER_NDUPLICATES 1 //FIXME used for testing
 
 namespace kaldi {
 /// @addtogroup  onlinedecoding OnlineDecoding
@@ -48,6 +51,7 @@ namespace kaldi {
    utterance using the online-decoding setup for neural nets.
 */
 class SingleUtteranceNnet3CudaDecoder {
+ std::vector<ChannelId> channels_;  //FIXME temp
  public:
 
   // Constructor. The pointer 'features' is not being given to this class to own
@@ -68,7 +72,7 @@ class SingleUtteranceNnet3CudaDecoder {
   /// the graph then it will include those as final-probs, else it will treat
   /// all final-probs as one.
   void GetBestPath(bool end_of_utterance,
-                   Lattice *best_path) const;
+                   std::vector<Lattice*> &best_paths) const;
 
   const CudaDecoder &Decoder() const { return decoder_; }
 

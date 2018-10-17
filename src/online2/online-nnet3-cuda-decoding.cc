@@ -22,6 +22,8 @@
 #include "lat/lattice-functions.h"
 #include "lat/determinize-lattice-pruned.h"
 
+#include <numeric>
+
 namespace kaldi {
 
 SingleUtteranceNnet3CudaDecoder::SingleUtteranceNnet3CudaDecoder(
@@ -34,21 +36,26 @@ SingleUtteranceNnet3CudaDecoder::SingleUtteranceNnet3CudaDecoder(
     decodable_(trans_model_, info,
                features->InputFeature(), features->IvectorFeature()),
     decoder_(cuda_decoder) {
-  decoder_.InitDecoding();
+    KALDI_ASSERT(DECODER_NDUPLICATES == 1); // FIXME we have only one decodable to use
+    const int32 nchannels = DECODER_NDUPLICATES;
+    channels_.resize(nchannels);
+    std::iota(channels_.begin(), channels_.end(), 0); // we will compute channels 0, 1, 2...
+  decoder_.InitDecoding(channels_);
 }
 
 
 void SingleUtteranceNnet3CudaDecoder::AdvanceDecoding() {
-  decoder_.AdvanceDecoding(&decodable_);
+  std::vector<DecodableInterface*> decodables = {&decodable_};
+  decoder_.AdvanceDecoding(channels_, decodables);
 }
 
 int32 SingleUtteranceNnet3CudaDecoder::NumFramesDecoded() const {
-  return decoder_.NumFramesDecoded();
+  return decoder_.NumFramesDecoded(0); // FIXME 0 hardcoded
 }
 
 void SingleUtteranceNnet3CudaDecoder::GetBestPath(bool end_of_utterance,
-                                              Lattice *best_path) const {
-  decoder_.GetBestPath(best_path, end_of_utterance);
+                                              std::vector<Lattice*> &best_paths) const {
+  decoder_.GetBestPath(channels_, best_paths, end_of_utterance);
 }
 
 }  // namespace kaldi
