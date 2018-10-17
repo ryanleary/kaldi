@@ -103,7 +103,8 @@ struct DecodeParams {
 };
 
 void decode_function(DecodeParams &params, int th_idx) {
-   auto start = std::chrono::high_resolution_clock::now();
+  double total_audio=0;
+  auto start = std::chrono::high_resolution_clock::now();
   // feature_opts includes configuration for the iVector adaptation,
   // as well as the basic features.
   KALDI_LOG << "Thread " << th_idx << " of " << params.num_threads << std::endl;
@@ -196,6 +197,7 @@ void decode_function(DecodeParams &params, int th_idx) {
         continue;
       }
       const WaveData &wave_data = wav_reader.Value(utt);
+      total_audio+=wave_data.Duration();
       // get the data for channel zero (if the signal is not mono, we only
       // take the first channel).
       SubVector<BaseFloat> data(wave_data.Data(), 0);
@@ -287,20 +289,17 @@ void decode_function(DecodeParams &params, int th_idx) {
       }
     } //end for
   } //end while
+  auto finish = std::chrono::high_resolution_clock::now();
+  std::chrono::duration<double> total_time = finish-start;
   if(num_processed > 0 ) {
-    //timing_stats.Print(online);
-    double total_time;
-    timing_stats.GetStats(total_time, params.total_audio[th_idx]);
-
     KALDI_LOG << "Thread: " << th_idx << " Decoded " << num_done << " utterances, "
       << num_err << " with errors.";
     KALDI_LOG << "Thread: " << th_idx << " Overall likelihood per frame was " << (tot_like / num_frames)
       << " per frame over " << num_frames << " frames.";
   }
   delete word_syms; // will delete if non-NULL.
-  auto finish = std::chrono::high_resolution_clock::now();
-   std::chrono::duration<double> total_time = finish-start;
-  params.total_time[th_idx]= total_time.count();
+  params.total_time[th_idx]=total_time.count();
+  params.total_audio[th_idx]=total_audio;
 }
 
 int main(int argc, char *argv[]) {
