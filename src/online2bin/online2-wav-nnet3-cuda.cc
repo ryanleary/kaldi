@@ -108,16 +108,9 @@ struct DecodeParams {
 };
 
 void decode_function(DecodeParams &params, int th_idx, int gpu_idx) {
-<<<<<<< HEAD
-  
-   nvtxRangePushA("Thread Timer");  
-   auto start = std::chrono::high_resolution_clock::now();
-=======
-
   nvtxRangePushA("Thread Timer");  
-  double total_audio=0;
   auto start = std::chrono::high_resolution_clock::now();
->>>>>>> 0-decoder-stable
+  double total_audio=0;
   // feature_opts includes configuration for the iVector adaptation,
   // as well as the basic features.
   KALDI_LOG << "Thread " << th_idx << " of " << params.num_threads << " on device " << gpu_idx << std::endl;

@@ -178,8 +178,12 @@ class BatchedSingleUtteranceNnet3CudaDecoder {
         decoders_[i]->AdvanceDecoding();
       }
     }
-    void GetBestPath(int i, Lattice *lat) {
-      decoders_[i]->GetBestPath(true,lat);
+    void GetBestPath(std::vector<Lattice*>lattices) {
+      std::vector<Lattice*> lattice(1);
+      for(int i=0;i<batchSize_;i++) {
+        lattice[0]=lattices[i];
+        decoders_[i]->GetBestPath(true,lattice);
+      }
     }
   private:
     int batchSize_;
@@ -445,11 +449,13 @@ class ThreadedBatchedCudaDecoder {
           cudaStreamSynchronize(cudaStreamPerThread);
 
           nvtxRangePushA("GetBestPath");
+          std::vector<Lattice*> lattices(batchSize);
           for (int i=0;i<batchSize;i++) {
             TaskState &state = *tasks[i];
-            decoders.GetBestPath(i,&state.lat);
+            lattices[i]=&state.lat;
             state.finished=true;
           } 
+          decoders.GetBestPath(lattices);
           nvtxRangePop();
           
           //We are now complete. Clean up data structures
