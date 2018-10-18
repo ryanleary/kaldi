@@ -37,6 +37,7 @@
 
 #define REPLICATE_IN_BATCH
 
+std::mutex debug_mutex;
 using namespace kaldi;
 /**************************************************
  * Things that are not currenlty working/designed or may need improvements
@@ -216,7 +217,19 @@ class ThreadedBatchedCudaDecoder {
       KALDI_LOG << "ThreadedBatchedCudaDecoder Initialize with " << config_.numThreads_ << " threads\n";
 
       cuda_fst_.Initialize(decode_fst); 
+      
+      //read transition model and nnet
+      bool binary;
+      Input ki(nnet3_rxfilename, &binary);
+      trans_model_.Read(ki.Stream(), binary);
+      am_nnet_.Read(ki.Stream(), binary);
+      SetBatchnormTestMode(true, &(am_nnet_.GetNnet()));
+      SetDropoutTestMode(true, &(am_nnet_.GetNnet()));
+      nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
 
+      decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(config_.decodable_opts_,&am_nnet_);
+      
+      //initialize threads and save their contexts so we can join them later
       thread_contexts_.resize(config_.numThreads_);
 
       thread_status_ = new std::atomic<ThreadStatus>[config_.numThreads_];
@@ -233,21 +246,12 @@ class ThreadedBatchedCudaDecoder {
       free_threads_front_=0;
       free_threads_back_=config_.numThreads_;
 
-      //initialize threads and save their contexts so we can join them later
+      //ensure all allocations/kernels above are complete before launching threads in different streams.
+      cudaStreamSynchronize(cudaStreamPerThread);
+
       for (int i=0;i<config_.numThreads_;i++) {
         thread_contexts_[i]=std::thread(&ThreadedBatchedCudaDecoder::ExecuteWorker,this,i);
       }
-
-      //read transition model and nnet
-      bool binary;
-      Input ki(nnet3_rxfilename, &binary);
-      trans_model_.Read(ki.Stream(), binary);
-      am_nnet_.Read(ki.Stream(), binary);
-      SetBatchnormTestMode(true, &(am_nnet_.GetNnet()));
-      SetDropoutTestMode(true, &(am_nnet_.GetNnet()));
-      nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
-
-      decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(config_.decodable_opts_,&am_nnet_);
     }
     void Finalize() {
 
@@ -375,6 +379,13 @@ class ThreadedBatchedCudaDecoder {
       free_threads_front_=(free_threads_front_+1)%(config_.numThreads_+1);
 		  //Notifiy worker thread to start processing
       thread_status_[threadId]=PROCESSING;
+
+#if 0
+      printf("HACK WAIT\n");
+      //HACK for debugging
+      while(thread_status_[threadId]!=IDLE);
+      printf("HACK DONE\n");
+#endif
     }
 
     void ExecuteWorker(int threadId) {
@@ -388,10 +399,11 @@ class ThreadedBatchedCudaDecoder {
       //reusable across decodes
       BatchedNnet2FeaturePipelineInfo feature_infos(config_);
       CudaDecoder cuda_decoders(cuda_fst_,config_.decoder_opts_,config_.maxBatchSize_,config_.maxBatchSize_);
-
+      
+      
       //This threads task list
       std::vector<TaskState*> &tasks = tasks_[threadId];
-      
+
       while (thread_state!=EXIT) {   //check if master as asked us to exit
         if (thread_state==PROCESSING) {  //check if master has told us to process
           int batchSize=tasks.size();
@@ -462,10 +474,11 @@ class ThreadedBatchedCudaDecoder {
           }
           free_threads_mutex_.unlock();
           printf("%d:  done\n",threadId);
-        
         } //end if
         //else { sleep(1); }
       } //End while !EXIT loop
+      //ensure all work is done before exiting
+      cudaStreamSynchronize(cudaStreamPerThread);
     }
 
     const BatchedCudaDecoderConfig &config_;
@@ -478,7 +491,6 @@ class ThreadedBatchedCudaDecoder {
 
     int taskCount_;     //Current number of tasks that have been enqueued but not launched
    
-    std::mutex debug_mutex;
     //Free threads is a circular queue.  The front points to the current free thread. 
     //The back points to the slot to write a new free thread to.  If font==back then there
     //are no free threads available.  mutex and atomic required here to get a thread safe
