@@ -35,7 +35,8 @@
 #include <thread>
 #include <chrono>
 
-#define MAX_DEVS 16
+#define REPLICATE_IN_BATCH
+
 using namespace kaldi;
 /**************************************************
  * Things that are not currenlty working/designed or may need improvements
@@ -68,6 +69,9 @@ class BatchedCudaDecoderConfig {
       decoder_opts_.Register(po);
       po->Register("max-batch-size",&maxBatchSize_, "The maximum batch size to be used by the decoder.");
       po->Register("num-threads",&numThreads_, "The number of workpool threads to use in the ThreadedBatchedCudaDecoder");
+      decoder_opts_.nlanes=maxBatchSize_;
+      decoder_opts_.nchannels=maxBatchSize_;
+
     }
     int maxBatchSize_;
     int numThreads_;
@@ -100,28 +104,6 @@ class BatchedNnet2FeaturePipelineInfo {
   private:
     const BatchedCudaDecoderConfig &config_;
     std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos_;
-};
-
-/***************************************************
- * Placeholder for a batched cuda decoder class
- * *************************************************/
-class BatchedCudaDecoder {
-  public:
-    BatchedCudaDecoder(const BatchedCudaDecoderConfig &config, const CudaFst &cuda_fst) : config_(config) {
-      cuda_decoders_.resize(config_.maxBatchSize_);
-      for(int i=0;i<config_.maxBatchSize_;i++) {
-        cuda_decoders_[i]=new CudaDecoder(cuda_fst,config_.decoder_opts_);
-      }
-    }
-    ~BatchedCudaDecoder() {
-      for(int i=0;i<config_.maxBatchSize_;i++) {
-        delete cuda_decoders_[i];
-      }
-    }
-    CudaDecoder* getCudaDecoder(int i) { return cuda_decoders_[i]; }
-  private:
-    const BatchedCudaDecoderConfig &config_;
-    std::vector<CudaDecoder*> cuda_decoders_;
 };
 
 /***************************************************
@@ -161,34 +143,38 @@ class BatchedOnlineNnet2FeaturePipeline {
 class BatchedSingleUtteranceNnet3CudaDecoder {
   public:
     BatchedSingleUtteranceNnet3CudaDecoder(const BatchedCudaDecoderConfig &config, int batchSize, const TransitionModel &trans_model, 
-        const nnet3::DecodableNnetSimpleLoopedInfo &decodable_info, BatchedCudaDecoder &cuda_decoders, 
-        BatchedOnlineNnet2FeaturePipeline &feature_pipelines) : batchSize_(batchSize), config_(config) {
-      decoders_.resize(batchSize_);
-      for(int i=0;i<batchSize_;i++) {
-        decoders_[i]= new SingleUtteranceNnet3CudaDecoder(trans_model, decodable_info, *cuda_decoders.getCudaDecoder(i), feature_pipelines.getFeaturePipeline(i));
+        const nnet3::DecodableNnetSimpleLoopedInfo &decodable_info, CudaDecoder &cuda_decoders, 
+        BatchedOnlineNnet2FeaturePipeline &feature_pipelines) : batchSize_(batchSize), config_(config), cuda_decoders_(cuda_decoders), 
+        cuda_decodables_(batchSize), channels_(batchSize) {
+
+      //Allocate decodables and intialize channels
+      for (int i=0;i<batchSize_;i++) {
+        OnlineNnet2FeaturePipeline *features = feature_pipelines.getFeaturePipeline(i);
+        cuda_decodables_[i] = new nnet3::DecodableAmNnetLoopedOnlineCuda(trans_model, decodable_info, features->InputFeature(), features->IvectorFeature());
+        channels_[i]=i;
       }
+
+      //initialize the decoders
+      cuda_decoders_.InitDecoding(channels_);
     }
+
     ~BatchedSingleUtteranceNnet3CudaDecoder() {
-      for(int i=0;i<batchSize_;i++) {
-        delete decoders_[i];
+      for (int i=0;i<batchSize_;i++) {
+        delete cuda_decodables_[i];
       }
     }
     void AdvanceDecoding() {
-      for(int i=0;i<batchSize_;i++) {
-        decoders_[i]->AdvanceDecoding();
-      }
+      cuda_decoders_.AdvanceDecoding(channels_,cuda_decodables_);
     }
-    void GetBestPath(std::vector<Lattice*>lattices) {
-      std::vector<Lattice*> lattice(1);
-      for(int i=0;i<batchSize_;i++) {
-        lattice[0]=lattices[i];
-        decoders_[i]->GetBestPath(true,lattice);
-      }
+    void GetBestPath(std::vector<Lattice*> lattices) {
+      cuda_decoders_.GetBestPath(channels_,lattices,true);
     }
   private:
     int batchSize_;
     const BatchedCudaDecoderConfig &config_;
-    std::vector<SingleUtteranceNnet3CudaDecoder*> decoders_;
+    CudaDecoder &cuda_decoders_;
+    std::vector<DecodableInterface*> cuda_decodables_;
+    std::vector<ChannelId> channels_;
 };
 
 /*
@@ -401,7 +387,7 @@ class ThreadedBatchedCudaDecoder {
 
       //reusable across decodes
       BatchedNnet2FeaturePipelineInfo feature_infos(config_);
-      BatchedCudaDecoder cuda_decoders(config_,cuda_fst_);
+      CudaDecoder cuda_decoders(cuda_fst_,config_.decoder_opts_,config_.maxBatchSize_,config_.maxBatchSize_);
 
       //This threads task list
       std::vector<TaskState*> &tasks = tasks_[threadId];
@@ -409,12 +395,14 @@ class ThreadedBatchedCudaDecoder {
       while (thread_state!=EXIT) {   //check if master as asked us to exit
         if (thread_state==PROCESSING) {  //check if master has told us to process
           int batchSize=tasks.size();
+          //printf("%d:  Starting new task batch size: %d\n",threadId,batchSize);
           
           nvtxRangePushA("Decoder Instantiation");
           BatchedOnlineNnet2FeaturePipeline feature_pipelines(config_, batchSize, feature_infos);
           BatchedSingleUtteranceNnet3CudaDecoder decoders(config_, batchSize, trans_model_, *decodable_info_, cuda_decoders, feature_pipelines);
           nvtxRangePop();
 
+          //printf("%d:  process waveform\n",threadId);
           //process waveform
           nvtxRangePushA("Process Waveform");
           std::vector<BaseFloat> samp_freqs(batchSize);
@@ -432,6 +420,7 @@ class ThreadedBatchedCudaDecoder {
           feature_pipelines.AcceptWaveforms(samp_freqs,data);
           nvtxRangePop();
 
+          //printf("%d:  AdvanceDecoding\n",threadId);
           //We need some sort of batched decodable interface...
 
           //feature extract
@@ -445,9 +434,11 @@ class ThreadedBatchedCudaDecoder {
           decoders.AdvanceDecoding();
           nvtxRangePop();
           
+          //printf("%d:  sync\n",threadId);
           //ensure compute is compete before proceeeding
           cudaStreamSynchronize(cudaStreamPerThread);
 
+          //printf("%d:  GetBestPath\n",threadId);
           nvtxRangePushA("GetBestPath");
           std::vector<Lattice*> lattices(batchSize);
           for (int i=0;i<batchSize;i++) {
@@ -457,6 +448,7 @@ class ThreadedBatchedCudaDecoder {
           } 
           decoders.GetBestPath(lattices);
           nvtxRangePop();
+          //printf("%d:  cleanup\n",threadId);
           
           //We are now complete. Clean up data structures
           tasks.clear();
@@ -469,6 +461,7 @@ class ThreadedBatchedCudaDecoder {
             free_threads_back_=(free_threads_back_+1)%(config_.numThreads_+1);
           }
           free_threads_mutex_.unlock();
+          printf("%d:  done\n",threadId);
         
         } //end if
         //else { sleep(1); }
@@ -650,6 +643,16 @@ int main(int argc, char *argv[]) {
         CudaDecoder.OpenDecodeHandle(utt,wave_data);
         processed.push_back(utt);
         num_done++;
+       
+#ifdef REPLICATE_IN_BATCH
+      //HACK to replicate across batch, need to remove
+        for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) {
+          total_audio+=wave_data.Duration();
+          num_done++;
+          std::string key=utt+std::to_string(i);
+          CudaDecoder.OpenDecodeHandle(key,wave_data);
+        }
+#endif
         nvtxRangePop();
         if (num_done>num_todo) break;
       } //end utterance loop
@@ -675,6 +678,15 @@ int main(int argc, char *argv[]) {
       }
 
       CudaDecoder.CloseDecodeHandle(utt);
+
+#ifdef REPLICATE_IN_BATCH
+      //HACK to replicate across batch, need to remove
+      for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
+        std::string key=utt+std::to_string(i);
+        CudaDecoder.CloseDecodeHandle(key);
+      }
+#endif
+      
     } //end for
     nvtxRangePop();
 
