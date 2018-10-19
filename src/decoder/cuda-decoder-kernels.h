@@ -2,21 +2,21 @@
 #define KALDI_DECODER_CUDA_DECODER_KERNELS_H_
 #include "cuda-decoder.h"
 namespace kaldi {
-	__global__ void init_state_best_cost_lookup_kernel(KernelParams params);
-	__global__ void get_best_cost_kernel(KernelParams params, bool isfinal, CostType fst_zero);
-	__global__ void finalize_process_non_emitting_kernel(KernelParams params);
-	__global__ void exclusive_sum_batched_step3_kernel(KernelParams params);
-	__global__ void exclusive_sum_batched_step2_kernel(KernelParams params);
-	__global__ void save_channels_state_from_lanes_kernel(KernelParams params);
-	__global__ void load_channels_state_in_lanes_kernel(KernelParams params);
-	__global__ void init_decoding_on_device_kernel(KernelParams params);
-	__global__ void initialize_initial_lane_kernel();
+	__global__ void init_state_best_cost_lookup_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void get_best_cost_kernel(DeviceParams cst_dev_params,KernelParams params, bool isfinal, CostType fst_zero);
+	__global__ void finalize_process_non_emitting_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void exclusive_sum_batched_step3_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void exclusive_sum_batched_step2_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void save_channels_state_from_lanes_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void load_channels_state_in_lanes_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void init_decoding_on_device_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void initialize_initial_lane_kernel(DeviceParams cst_dev_params);
 	template<bool IS_EMITTING>
-		__global__ void expand_arcs_kernel(KernelParams params);
+		__global__ void expand_arcs_kernel(DeviceParams cst_dev_params,KernelParams params);
 	template<bool IS_EMITTING>
-		__global__ void post_expand_kernel(KernelParams params);
-	__global__ void preprocess_in_place_kernel(KernelParams params);
-	__global__ void preprocess_and_contract_kernel(KernelParams params);
+		__global__ void post_expand_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void preprocess_in_place_kernel(DeviceParams cst_dev_params,KernelParams params);
+	__global__ void preprocess_and_contract_kernel(DeviceParams cst_dev_params,KernelParams params);
 
 
 	template<typename T> 

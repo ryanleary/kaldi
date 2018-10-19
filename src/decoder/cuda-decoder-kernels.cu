@@ -19,7 +19,6 @@
 #define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 namespace kaldi {
-	__constant__ DeviceParams cst_dev_params; 
 
 	// 1:1 Conversion float <---> sortable int
 	// We convert floats to sortable ints in order
@@ -118,12 +117,8 @@ namespace kaldi {
 		return beam;
 	}
 
-	void SetDeviceParams(DeviceParams *h_device_params) {
-		cudaMemcpyToSymbol(cst_dev_params, h_device_params, sizeof(*h_device_params)); // TODO stream_
-	}
-
 	// Used to initialize the lane lookup tables in CudaDecoder's constructor
-	__global__ void init_state_best_cost_lookup_kernel(KernelParams params) {
+	__global__ void init_state_best_cost_lookup_kernel(DeviceParams cst_dev_params, KernelParams params) {
 		const int max_nlanes = cst_dev_params.max_nlanes;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, max_nlanes) {
 			const int num_states = cst_dev_params.nstates;
@@ -165,7 +160,7 @@ namespace kaldi {
 	 */
 
 	// Important : pass the struct PreprocessParams by copy - passing it using a ref will not work (CPU -> GPU)
-	__global__ void preprocess_and_contract_kernel(KernelParams params) {
+	__global__ void preprocess_and_contract_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
 		// We need to move the survival tokens to the main_q
@@ -346,7 +341,7 @@ finalize_kernel:
 
 	 */
 
-	__global__ void preprocess_in_place_kernel(KernelParams params) {
+	__global__ void preprocess_in_place_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		// Operator for the prefix sum inside the CUDA block
 		typedef cub::BlockScan<int32, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
@@ -465,7 +460,7 @@ finalize_kernel:
 	// FinalizeProcessNonemitting contains a simplified version of expand for only one CUDA block
 	//
 	template<bool IS_EMITTING>
-		__global__ void expand_arcs_kernel(KernelParams params) {
+		__global__ void expand_arcs_kernel(DeviceParams cst_dev_params,KernelParams params) {
 			// BlockScan that we will use to compute token indexes in the output queue, 
 			// and to find the min cost in the block
 			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
@@ -729,7 +724,7 @@ finalize_kernel:
 	// Initialize initial channel
 	// The initial channel is the state of a channel when 
 	// it will start decoding a new utterance
-	__global__ void initialize_initial_lane_kernel() {
+	__global__ void initialize_initial_lane_kernel(DeviceParams cst_dev_params) {
 		const int init_ichannel = cst_dev_params.init_channel_id;
 		const int init_ilane = 0;
 		ChannelCounters *init_channel_counters = cst_dev_params.d_channels_counters.channel(init_ichannel);
@@ -755,7 +750,7 @@ finalize_kernel:
 
 	// Called when channels will start decoding a new utterance
 	// do everything that's needed to do on the device to start decoding a new utterance with those channels
-	__global__ void init_decoding_on_device_kernel(KernelParams params) {
+	__global__ void init_decoding_on_device_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		const int init_ichannel = cst_dev_params.init_channel_id;
 		const ChannelCounters *init_channel_counters = cst_dev_params.d_channels_counters.channel(init_ichannel);
 		const int32 init_main_q_end = init_channel_counters->prev_main_q_narcs_and_end.y;
@@ -779,7 +774,7 @@ finalize_kernel:
 	// Context switch : load
 	// THREADS : (WARP_SIZE, 1, 1)
 	// BLOCKS : (1, nchannel_to_compute, 1)
-	__global__ void load_channels_state_in_lanes_kernel(KernelParams params) {
+	__global__ void load_channels_state_in_lanes_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const int32 ichannel = params.channel_to_compute[ilane];
@@ -794,7 +789,7 @@ finalize_kernel:
 	}
 
 	// Context switch : store
-	__global__ void save_channels_state_from_lanes_kernel(KernelParams params) {
+	__global__ void save_channels_state_from_lanes_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -807,7 +802,7 @@ finalize_kernel:
 	}
 
 	template<bool IS_EMITTING>
-		__global__ void post_expand_kernel(KernelParams params) {
+		__global__ void post_expand_kernel(DeviceParams cst_dev_params,KernelParams params) {
 			const int nlanes = params.nlanes_used;
 			KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 				LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -840,7 +835,7 @@ finalize_kernel:
 		}
 
 	// Batched scan is not available in CUB
-	__global__ void exclusive_sum_batched_step2_kernel(KernelParams params) {
+	__global__ void exclusive_sum_batched_step2_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		typedef cub::BlockScan<int, KALDI_CUDA_DECODER_1D_BLOCK> BlockScan;
 		__shared__ typename BlockScan::TempStorage sh_temp_storage;
 		const int nlanes = params.nlanes_used;
@@ -883,7 +878,7 @@ finalize_kernel:
 	}
 
 	// Batched scan is not available in CUB
-	__global__ void exclusive_sum_batched_step3_kernel(KernelParams params) {
+	__global__ void exclusive_sum_batched_step3_kernel(DeviceParams cst_dev_params,KernelParams params) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			const LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -927,7 +922,7 @@ we do not need inter-block communication (we launch only one CUDA block)
 
 
 	__launch_bounds__(KALDI_CUDA_DECODER_LARGEST_1D_BLOCK, 1)
-		__global__ void finalize_process_non_emitting_kernel(KernelParams params) {
+		__global__ void finalize_process_non_emitting_kernel(DeviceParams cst_dev_params,KernelParams params) {
 			typedef cub::BlockScan<int2, KALDI_CUDA_DECODER_LARGEST_1D_BLOCK> Int2BlockScan;
 			typedef cub::BlockScan<int, KALDI_CUDA_DECODER_LARGEST_1D_BLOCK> IntBlockScan;
 			__shared__ typename IntBlockScan::TempStorage sh_temp_storage_int_scan;
@@ -1074,7 +1069,7 @@ finalize_kernel:
 			}
 		}
 
-	__global__ void get_best_cost_kernel(KernelParams params, bool isfinal, CostType fst_zero) {
+	__global__ void get_best_cost_kernel(DeviceParams cst_dev_params,KernelParams params, bool isfinal, CostType fst_zero) {
 		const int nlanes = params.nlanes_used;
 		KALDI_CUDA_DECODER_BATCH_KERNEL_LOOP(ilane, nlanes) {
 			LaneCounters *lane_counters = cst_dev_params.d_lanes_counters.lane(ilane);
@@ -1103,8 +1098,8 @@ finalize_kernel:
 	}
 
 
-template __global__ void expand_arcs_kernel<true>(KernelParams params);
-template __global__ void expand_arcs_kernel<false>(KernelParams params);
-template __global__ void post_expand_kernel<true>(KernelParams params);
-template __global__ void post_expand_kernel<false>(KernelParams params);
+template __global__ void expand_arcs_kernel<true>(DeviceParams cst_dev_params,KernelParams params);
+template __global__ void expand_arcs_kernel<false>(DeviceParams cst_dev_params,KernelParams params);
+template __global__ void post_expand_kernel<true>(DeviceParams cst_dev_params,KernelParams params);
+template __global__ void post_expand_kernel<false>(DeviceParams cst_dev_params,KernelParams params);
 } // end namespace kaldi
