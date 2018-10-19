@@ -19,6 +19,7 @@
 // limitations under the License.
 
 #include "feat/wave-reader.h"
+#include "cudamatrix/cu-allocator.h"
 #include "online2/online-nnet3-cuda-decoding.h"
 #include "online2/online-nnet2-feature-pipeline.h"
 #include "online2/onlinebin-util.h"
@@ -35,7 +36,7 @@
 #include <thread>
 #include <chrono>
 
-#define REPLICATE_IN_BATCH
+//#define REPLICATE_IN_BATCH
 
 std::mutex debug_mutex;
 using namespace kaldi;
@@ -292,6 +293,9 @@ class ThreadedBatchedCudaDecoder {
     //Adds a decoding task to the decoder
     void OpenDecodeHandle(const std::string &key, const WaveData &wave_data) {
 
+      //ensure key is unique
+      KALDI_ASSERT(tasks_lookup_.end()==tasks_lookup_.find(key));
+      
       //Wait for a thread to be free
       while (free_threads_front_==free_threads_back_) {
         //std::this_thread::sleep_for(std::chrono::nanoseconds(50)); 
@@ -456,13 +460,16 @@ class ThreadedBatchedCudaDecoder {
           for (int i=0;i<batchSize;i++) {
             TaskState &state = *tasks[i];
             lattices[i]=&state.lat;
-            state.finished=true;
           } 
           decoders.GetBestPath(lattices);
           nvtxRangePop();
           //printf("%d:  cleanup\n",threadId);
           
           //We are now complete. Clean up data structures
+          for (int i=0;i<batchSize;i++) {
+            TaskState &state = *tasks[i];
+            state.finished=true;
+          }
           tasks.clear();
           thread_state=IDLE;
           
@@ -473,7 +480,7 @@ class ThreadedBatchedCudaDecoder {
             free_threads_back_=(free_threads_back_+1)%(config_.numThreads_+1);
           }
           free_threads_mutex_.unlock();
-          printf("%d:  done\n",threadId);
+          //printf("%d:  done\n",threadId);
         } //end if
         //else { sleep(1); }
       } //End while !EXIT loop
@@ -582,6 +589,7 @@ int main(int argc, char *argv[]) {
 
     OnlineEndpointConfig endpoint_opts;  //TODO is this even used?  Config seems to need it but we never seem to use it.
     endpoint_opts.Register(&po);
+    kaldi::g_allocator_options.Register(&po);
 
     batchedDecoderConfig.Register(&po);
 
@@ -689,6 +697,7 @@ int main(int argc, char *argv[]) {
         clat_writer.Write(utt, clat);
       }
 
+#if 1
       CudaDecoder.CloseDecodeHandle(utt);
 
 #ifdef REPLICATE_IN_BATCH
@@ -697,6 +706,7 @@ int main(int argc, char *argv[]) {
         std::string key=utt+std::to_string(i);
         CudaDecoder.CloseDecodeHandle(key);
       }
+#endif
 #endif
       
     } //end for
