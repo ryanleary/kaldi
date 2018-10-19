@@ -645,8 +645,8 @@ namespace kaldi {
 		cudaEventSynchronize(can_write_to_main_q_);
 		for(int32 i=0; i<channels.size(); ++i) {
 			const ChannelId ichannel = channels[i];
-			const int32 token_with_best_cost = argmins[ichannel].first;
-			const bool isfinal = has_reached_final[ichannel];
+			const int32 token_with_best_cost = argmins[i].first;
+			const bool isfinal = has_reached_final[i];
 			int32 token_idx = token_with_best_cost;
 
 			// Backtracking
