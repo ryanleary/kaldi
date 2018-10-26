@@ -19,7 +19,6 @@
 #define KALDI_CUDA_DECODER_DIV_ROUND_UP(a,b) ((a+b-1)/b)
 
 namespace kaldi {
-
 	// 1:1 Conversion float <---> sortable int
 	// We convert floats to sortable ints in order
 	// to use native atomics operation, which are 
