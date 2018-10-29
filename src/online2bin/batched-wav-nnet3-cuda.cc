@@ -36,7 +36,7 @@
 #include <thread>
 #include <chrono>
 
-#define REPLICATE_IN_BATCH  
+//#define REPLICATE_IN_BATCH  
 //#define WAR
 
 using namespace kaldi;
@@ -445,16 +445,18 @@ class ThreadedBatchedCudaDecoder {
           } 
 
 #ifdef REPLICATE_IN_BATCH
-        KALDI_ASSERT(free_channels.size()==0);
-        KALDI_ASSERT(init_channels.size()==config_.maxBatchSize_);
-        KALDI_ASSERT(channels.size()==config_.maxBatchSize_);
+          KALDI_ASSERT(free_channels.size()==0);
+          KALDI_ASSERT(init_channels.size()==config_.maxBatchSize_);
+          KALDI_ASSERT(channels.size()==config_.maxBatchSize_);
 #endif
 
-        //printf("Init %d channels\n", init_channels.size());
+          //printf("Init %d channels\n", init_channels.size());
 
-          //init decoding on new channels_
-          cuda_decoders.InitDecoding(init_channels);   
-          init_channels.clear();
+          if(init_channels.size()>0) {
+            //init decoding on new channels_
+            cuda_decoders.InitDecoding(init_channels);   
+            init_channels.clear();
+          }
 
           //TODO batch IVECTOR and NNET3     
 
