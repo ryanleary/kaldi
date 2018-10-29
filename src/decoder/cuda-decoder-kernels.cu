@@ -961,7 +961,7 @@ we do not need inter-block communication (we launch only one CUDA block)
 
 							arc_next_state = cst_dev_params.d_arc_nextstates[arc_idx];
 							CostType arc_weight = cst_dev_params.d_arc_weights[arc_idx];
-							CostType prev_token_cost = orderedIntToFloat(cst_dev_params.d_main_q_state_and_cost.channel(ilane)[main_q_idx].y); 
+							CostType prev_token_cost = orderedIntToFloat(cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].y); 
 							total_int_cost = floatToOrderedInt(arc_weight + prev_token_cost);
 							//const int32 prev_state = cst_dev_params.d_main_q_state_and_cost.channel(ichannel)[main_q_idx].x;
 							//printf("from %i to %i : %f = %f + %f \n", prev_state, arc_next_state, orderedIntToFloat(total_int_cost), prev_token_cost, arc_weight);
