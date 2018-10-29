@@ -306,9 +306,6 @@ class ThreadedBatchedCudaDecoder {
 
       //insert into pending task queue
       tasks_mutex_.lock();  //TODO do we need to lock/unlock?  Only this thread should write to back_ //remove if possible
-      //int front=tasks_front_;
-      //int back=tasks_back_;
-      //int size=(back+maxPendingTasks_-front)%maxPendingTasks_;
       pending_task_queue_[tasks_back_]=t;
       //printf("New task: %p:%s, loc: %d\n", t, key.c_str(), (int)tasks_back_);
       tasks_back_=(tasks_back_+1)%(maxPendingTasks_+1);
@@ -480,17 +477,14 @@ class ThreadedBatchedCudaDecoder {
             ChannelId channel=channels[cur];
             TaskState &state = *tasks[cur];
             int numDecoded=cuda_decoders.NumFramesDecoded(channel);
-            int toDecode=decodables[i]->NumFramesReady();
+            int toDecode=decodables[cur]->NumFramesReady();
 
             //printf("i: %d, %p, numDecoded: %d, toDecode: %d\n", i, &state, numDecoded, toDecode);
             if(toDecode==numDecoded) {  //if current task is completed  //TODO fix this to be a query
               lattices.push_back(&state.lat);
-
               completed_channels.push_back(channel);
-              
               free_channels.push_back(channel);
 
-              //TODO these maybe could just be writes?
               //move last element to this location
               std::swap(tasks[cur],tasks[back]);
               std::swap(channels[cur],channels[back]);
