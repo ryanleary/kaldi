@@ -37,7 +37,7 @@
 #include <chrono>
 
 #define REPLICATE_IN_BATCH  
-#define WAR
+//#define WAR
 
 using namespace kaldi;
 /**************************************************
@@ -373,9 +373,7 @@ class ThreadedBatchedCudaDecoder {
 
       //add all channels to free channel list
       for(int i=0;i<config_.maxBatchSize_;i++) {
-        //enqueuing backwards so they get handed out in order
-        free_channels.push_back(config_.maxBatchSize_-1-i);
-        //free_channels.push_back(i);
+        free_channels.push_back(i);
       }      
 
       //main control loop.  Check if master has asked us to exit.
@@ -732,10 +730,10 @@ int main(int argc, char *argv[]) {
         }
 #endif
         nvtxRangePop();
-        if (num_done>num_todo) break;
+        if (num_done>=num_todo) break;
       } //end utterance loop
       nvtxRangePop();
-      if (num_done>num_todo) break;
+      if (num_done>=num_todo) break;
     } //end speaker loop
 
     nvtxRangePushA("Lattice Write");
