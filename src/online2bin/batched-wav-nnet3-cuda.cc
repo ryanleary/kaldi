@@ -520,7 +520,7 @@ int main(int argc, char *argv[]) {
     std::string word_syms_rxfilename;
 
     bool write_lattice = true;
-    int num_todo = INT_MAX;
+    int num_todo = -1;
     int iterations=1;
     int max_queue_length=2000;
     ParseOptions po(usage);
@@ -647,10 +647,10 @@ int main(int argc, char *argv[]) {
           }
 
           nvtxRangePop();
-          if (num_done>=num_todo) break;
+          if (num_todo!=-1 && num_done>=num_todo) break;
         } //end utterance loop
         nvtxRangePop();
-        if (num_done>=num_todo) break;
+        if (num_todo!=-1 && num_done>=num_todo) break;
       } //end speaker loop
 
       nvtxRangePushA("Lattice Write");
