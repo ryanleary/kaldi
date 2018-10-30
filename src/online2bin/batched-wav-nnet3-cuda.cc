@@ -71,7 +71,6 @@ class BatchedCudaDecoderConfig {
       decoder_opts_.Register(po);
       po->Register("max-batch-size",&maxBatchSize_, "The maximum batch size to be used by the decoder.");
       po->Register("num-threads",&numThreads_, "The number of workpool threads to use in the ThreadedBatchedCudaDecoder");
-      po->Register("flush-frequency", &flushFrequency_, "Number of files to enqueue before actively flushing and cleaning up memory."); //TODO implement this
       decoder_opts_.nlanes=maxBatchSize_;
       decoder_opts_.nchannels=maxBatchSize_;
 
@@ -251,10 +250,15 @@ class ThreadedBatchedCudaDecoder {
       cudaStreamSynchronize(cudaStreamPerThread);
 
       exit_=false;
+      numStarted_=0;
       //start workers
       for (int i=0;i<config_.numThreads_;i++) {
         thread_contexts_[i]=std::thread(&ThreadedBatchedCudaDecoder::ExecuteWorker,this,i);
       }
+
+      //wait for threads to start to ensure allocation time isn't in the timings
+      while(numStarted_<config_.numThreads_) {};
+
     }
     void Finalize() {
 
@@ -305,11 +309,11 @@ class ThreadedBatchedCudaDecoder {
       while (tasksPending()==maxPendingTasks_);
 
       //insert into pending task queue
-      tasks_mutex_.lock();  //TODO do we need to lock/unlock?  Only this thread should write to back_ //remove if possible
+      //tasks_mutex_.lock();  //TODO do we need to lock/unlock?  Only this thread should write to back_ //remove if possible
       pending_task_queue_[tasks_back_]=t;
       //printf("New task: %p:%s, loc: %d\n", t, key.c_str(), (int)tasks_back_);
       tasks_back_=(tasks_back_+1)%(maxPendingTasks_+1);
-      tasks_mutex_.unlock();
+      //tasks_mutex_.unlock();
     }
 
     void GetBestPath(const std::string &key, Lattice *lat) {
@@ -372,6 +376,8 @@ class ThreadedBatchedCudaDecoder {
       for(int i=0;i<config_.maxBatchSize_;i++) {
         free_channels.push_back(i);
       }      
+
+      numStarted_++;
 
       //main control loop.  Check if master has asked us to exit.
       while (!exit_) {
@@ -447,8 +453,6 @@ class ThreadedBatchedCudaDecoder {
           KALDI_ASSERT(channels.size()==config_.maxBatchSize_);
 #endif
 
-          //printf("Init %d channels\n", init_channels.size());
-
           if(init_channels.size()>0) {
             //init decoding on new channels_
             cuda_decoders.InitDecoding(init_channels);   
@@ -458,6 +462,7 @@ class ThreadedBatchedCudaDecoder {
           //TODO batch IVECTOR and NNET3     
 
           nvtxRangePushA("AdvanceDecoding");
+          //printf("Advance Decoding size: %d\n", channels.size());
           //Advance decoding on all open channels
           cuda_decoders.AdvanceDecoding(channels,decodables);
           nvtxRangePop();
@@ -560,6 +565,7 @@ class ThreadedBatchedCudaDecoder {
       TaskState** pending_task_queue_;
 
       std::atomic<bool> exit_;
+      std::atomic<int> numStarted_;
 
       std::map<std::string,TaskState> tasks_lookup_; //Contains a map of utterance to TaskState
       std::vector<std::thread> thread_contexts_;     //A list of thread contexts
@@ -631,11 +637,16 @@ int main(int argc, char *argv[]) {
 
     bool write_lattice = true;
     int num_todo = INT_MAX;
+    int iterations=1;
+    int max_queue_length=2000;
     ParseOptions po(usage);
 
     po.Register("write-lattice",&write_lattice, "Output lattice to a file.  Setting to false is useful when benchmarking.");
     po.Register("word-symbol-table", &word_syms_rxfilename, "Symbol table for words [for debug output]");
     po.Register("file-limit", &num_todo, "Limits the number of files that are processed by this driver.  After N files are processed the remaing files are ignored.  Useful for profiling.");
+    po.Register("iterations", &iterations, "Number of times to decode the corpus.  Output will be written only once.");
+    po.Register("max-outstanding-queue-length", &max_queue_length, "Number of files to allow to be outstanding at a time.  When the number of files is larger than this handles will be closed before opening new ones in FIFO order.");
+    
     //Multi-threaded CPU and batched GPU decoder
     BatchedCudaDecoderConfig batchedDecoderConfig;
 
@@ -655,8 +666,6 @@ int main(int argc, char *argv[]) {
     CuDevice::Instantiate().SelectGpuId(0);
     CuDevice::Instantiate().AllowMultithreading();
 
-    nvtxRangePush("Global Timer");
-    auto start = std::chrono::high_resolution_clock::now();
     
     ThreadedBatchedCudaDecoder CudaDecoder(batchedDecoderConfig);
 
@@ -683,85 +692,118 @@ int main(int argc, char *argv[]) {
     int32 num_done = 0, num_err = 0;
     double tot_like = 0.0;
     int64 num_frames = 0;
-
-    SequentialTokenVectorReader spk2utt_reader(spk2utt_rspecifier);
-    RandomAccessTableReader<WaveHolder> wav_reader(wav_rspecifier);
-    OnlineTimingStats timing_stats;
-
-    std::vector<std::string> processed;
-
     double total_audio=0;
-    for (; !spk2utt_reader.Done(); spk2utt_reader.Next()) {
-      nvtxRangePushA("Speaker Iteration");
-      std::string spk = spk2utt_reader.Key();
-      printf("Speaker: %s\n",spk.c_str());
+    
+    nvtxRangePush("Global Timer");
+    auto start = std::chrono::high_resolution_clock::now();
 
-      const std::vector<std::string> &uttlist = spk2utt_reader.Value();
+    std::queue<std::string> processed;
+    for(int iter=0;iter<iterations;iter++) {
+      SequentialTokenVectorReader spk2utt_reader(spk2utt_rspecifier);
+      RandomAccessTableReader<WaveHolder> wav_reader(wav_rspecifier);
 
-      for (size_t i = 0; i < uttlist.size(); i++) {
-        nvtxRangePushA("Utterance Iteration");
+      for (; !spk2utt_reader.Done(); spk2utt_reader.Next()) {
+        nvtxRangePushA("Speaker Iteration");
+        std::string spk = spk2utt_reader.Key();
+        printf("Speaker: %s\n",spk.c_str());
 
-        std::string utt = uttlist[i];
-        printf("Utterance: %s\n", utt.c_str());
-        if (!wav_reader.HasKey(utt)) {
-          KALDI_WARN << "Did not find audio for utterance " << utt;
-          num_err++;
-          continue;
-        }
+        const std::vector<std::string> &uttlist = spk2utt_reader.Value();
 
-        const WaveData &wave_data = wav_reader.Value(utt);
-        total_audio+=wave_data.Duration();
+        for (size_t i = 0; i < uttlist.size(); i++) {
+          nvtxRangePushA("Utterance Iteration");
 
-        CudaDecoder.OpenDecodeHandle(utt,wave_data);
-        processed.push_back(utt);
-        num_done++;
-       
-#ifdef REPLICATE_IN_BATCH
-      //HACK to replicate across batch, need to remove
-        for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) {
+          std::string utt = uttlist[i];
+          printf("Utterance: %s\n", utt.c_str());
+          if (!wav_reader.HasKey(utt)) {
+            KALDI_WARN << "Did not find audio for utterance " << utt;
+            num_err++;
+            continue;
+          }
+
+          const WaveData &wave_data = wav_reader.Value(utt);
           total_audio+=wave_data.Duration();
+
+          CudaDecoder.OpenDecodeHandle(utt,wave_data);
+          processed.push(utt);
           num_done++;
-          std::string key=utt+std::to_string(i);
-          CudaDecoder.OpenDecodeHandle(key,wave_data);
-        }
+
+#ifdef REPLICATE_IN_BATCH
+          //HACK to replicate across batch, need to remove
+          for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) {
+            total_audio+=wave_data.Duration();
+            num_done++;
+            std::string key=utt+std::to_string(i);
+            CudaDecoder.OpenDecodeHandle(key,wave_data);
+          }
 #endif
+
+         while(processed.size()>max_queue_length) {
+            std::string &utt = processed.front();
+            Lattice lat;
+            CompactLattice clat;
+        
+            CudaDecoder.GetBestPath(utt,&lat);
+            ConvertLattice(lat, &clat);
+
+            GetDiagnosticsAndPrintOutput(utt, word_syms, clat, &num_frames, &tot_like);
+
+            if (write_lattice && iter==0 ) {
+              clat_writer.Write(utt, clat);
+            }
+        
+            CudaDecoder.CloseDecodeHandle(utt);
+
+#ifdef REPLICATE_IN_BATCH
+            //HACK to replicate across batch, need to remove
+            for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
+              std::string key=utt+std::to_string(i);
+              CudaDecoder.CloseDecodeHandle(key);
+            }
+#endif
+            processed.pop();
+          }
+
+          nvtxRangePop();
+          if (num_done>=num_todo) break;
+        } //end utterance loop
         nvtxRangePop();
         if (num_done>=num_todo) break;
-      } //end utterance loop
-      nvtxRangePop();
-      if (num_done>=num_todo) break;
-    } //end speaker loop
+      } //end speaker loop
 
-    nvtxRangePushA("Lattice Write");
-    for (int i=0;i<processed.size();i++) {
-      std::string &utt = processed[i];
-      Lattice lat;
-      CompactLattice clat;
+      nvtxRangePushA("Lattice Write");
+      while(processed.size()>0) {
+        std::string &utt = processed.front();
+        Lattice lat;
+        CompactLattice clat;
 
-      CudaDecoder.GetBestPath(utt,&lat);
-      ConvertLattice(lat, &clat);
+        CudaDecoder.GetBestPath(utt,&lat);
+        ConvertLattice(lat, &clat);
 
-      GetDiagnosticsAndPrintOutput(utt, word_syms, clat, &num_frames, &tot_like);
+        GetDiagnosticsAndPrintOutput(utt, word_syms, clat, &num_frames, &tot_like);
 
-      if (write_lattice) {
-        clat_writer.Write(utt, clat);
-      }
+        if (write_lattice && iter==0 ) {
+          clat_writer.Write(utt, clat);
+        }
 
-#if 1
-      CudaDecoder.CloseDecodeHandle(utt);
+        CudaDecoder.CloseDecodeHandle(utt);
 
 #ifdef REPLICATE_IN_BATCH
-      //HACK to replicate across batch, need to remove
-      for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
-        std::string key=utt+std::to_string(i);
-        CudaDecoder.CloseDecodeHandle(key);
-      }
+        //HACK to replicate across batch, need to remove
+        for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
+          std::string key=utt+std::to_string(i);
+          CudaDecoder.CloseDecodeHandle(key);
+        }
 #endif
-#endif
-      
-    } //end for
-    nvtxRangePop();
+        processed.pop();
 
+      } //end for
+      nvtxRangePop();
+      auto finish = std::chrono::high_resolution_clock::now();
+      std::chrono::duration<double> total_time = finish-start;
+      KALDI_LOG << "Iteration: " << iter << " Aggregate Total Time: " << total_time.count()
+        << " Total Audio: " << total_audio 
+        << " RealTimeX: " << total_audio/total_time.count() << std::endl;
+    }
     KALDI_LOG << "Decoded " << num_done << " utterances, "
       << num_err << " with errors.";
     KALDI_LOG << "Overall likelihood per frame was " << (tot_like / num_frames)
@@ -779,7 +821,7 @@ int main(int argc, char *argv[]) {
 
     std::chrono::duration<double> total_time = finish-start;
 
-    KALDI_LOG << "Aggregate Total Time: " << total_time.count()
+    KALDI_LOG << "Overall: " << " Aggregate Total Time: " << total_time.count()
       << " Total Audio: " << total_audio 
       << " RealTimeX: " << total_audio/total_time.count() << std::endl;
 
