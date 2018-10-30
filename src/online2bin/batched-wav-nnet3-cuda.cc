@@ -22,9 +22,6 @@
 #include "cudamatrix/cu-allocator.h"
 #include "online2/online-nnet3-cuda-decoding.h"
 #include "online2/online-nnet2-feature-pipeline.h"
-#include "online2/onlinebin-util.h"
-#include "online2/online-timing.h"
-#include "online2/online-endpoint.h"
 #include "fstext/fstext-lib.h"
 #include "lat/lattice-functions.h"
 #include "util/kaldi-thread.h"
@@ -37,22 +34,8 @@
 #include <chrono>
 
 //#define REPLICATE_IN_BATCH  
-//#define WAR
 
 using namespace kaldi;
-/**************************************************
- * Things that are not currenlty working/designed or may need improvements
- *
- * Reentrant/Online decoding. Currently API is enter once per file
- * 
- * Data duplication.  WaveData and Lattice are duplicated and copied.  This keeps the API simple at the cost of memory and performance
- *  An alternative design could have the user provide a reference to both the WaveData and Lattice and we use that directly.  This avoids
- *  redundant memory and copies and also may be useful for online processing
- *
- * Ivector and nnet processing must be extracted from the Kaldi decoder.  Currently it all happens under AdvanceDecoding/AdvanceChunk.  Ideally
- * these steps would be exposed directly to this class so that we could batch them up and execute seperately.
- */
-
 
 /*************************************************
  * BatchedCudaDecoderConfig
@@ -84,7 +67,6 @@ class BatchedCudaDecoderConfig {
     CudaDecoderConfig decoder_opts_;                           //constant readonly
 };
 
-#if 1
 /***************************************************
  * Placeholder for a batched pipeline info class
  * *************************************************/
@@ -92,14 +74,14 @@ class BatchedNnet2FeaturePipelineInfo {
   public:
     BatchedNnet2FeaturePipelineInfo(const BatchedCudaDecoderConfig &config) : config_(config) {
       feature_infos_.resize(config_.maxBatchSize_);
-      for(int i=0;i<config_.maxBatchSize_;i++) {
+      for (int i=0;i<config_.maxBatchSize_;i++) {
         feature_infos_[i]=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
         feature_infos_[i]->ivector_extractor_info.use_most_recent_ivector = true;
         feature_infos_[i]->ivector_extractor_info.greedy_ivector_extractor = true;
       }
     }
     ~BatchedNnet2FeaturePipelineInfo() {
-      for(int i=0;i<config_.maxBatchSize_;i++) {
+      for (int i=0;i<config_.maxBatchSize_;i++) {
         delete feature_infos_[i];
       }
     }
@@ -109,92 +91,13 @@ class BatchedNnet2FeaturePipelineInfo {
     const BatchedCudaDecoderConfig &config_;
     std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos_;
 };
-#endif
-
-#if 0
-/***************************************************
- * Placeholder for a batched feature pipeline
- * *************************************************/
-class BatchedOnlineNnet2FeaturePipeline {
-  public:
-    BatchedOnlineNnet2FeaturePipeline(const BatchedCudaDecoderConfig &config, int batchSize, BatchedNnet2FeaturePipelineInfo &feature_infos) 
-      : batchSize_(batchSize), config_(config){
-      feature_pipelines_.resize(batchSize_);
-      for(int i=0;i<batchSize_;i++) {
-        feature_pipelines_[i]=new OnlineNnet2FeaturePipeline(*feature_infos.getFeatureInfo(i));
-      }
-    }
-    ~BatchedOnlineNnet2FeaturePipeline() {
-      for(int i=0;i<batchSize_;i++) {
-        delete feature_pipelines_[i];
-      }
-    }
-    OnlineNnet2FeaturePipeline* getFeaturePipeline(int i) { return feature_pipelines_[i]; }
-
-    void AcceptWaveforms(const std::vector<BaseFloat> &samp_freqs, const std::vector<SubVector<BaseFloat> > &data) {
-      for(int i=0;i<batchSize_;i++) {
-        feature_pipelines_[i]->AcceptWaveform(samp_freqs[i],data[i]);
-        feature_pipelines_[i]->InputFinished();
-      }
-    }
-  private:
-    int batchSize_;
-    const BatchedCudaDecoderConfig &config_;
-    std::vector<OnlineNnet2FeaturePipeline*> feature_pipelines_;
-};
-#endif
-
-#if 0
-/***************************************************
- * Placeholder for a batched utterance decoder
- * *************************************************/
-class BatchedSingleUtteranceNnet3CudaDecoder {
-  public:
-    BatchedSingleUtteranceNnet3CudaDecoder(const BatchedCudaDecoderConfig &config, int batchSize, const TransitionModel &trans_model, 
-        const nnet3::DecodableNnetSimpleLoopedInfo &decodable_info, CudaDecoder &cuda_decoders, 
-        BatchedOnlineNnet2FeaturePipeline &feature_pipelines) : batchSize_(batchSize), config_(config), cuda_decoders_(cuda_decoders), 
-        cuda_decodables_(batchSize), channels_(batchSize) {
-
-      //Allocate decodables and intialize channels
-      for (int i=0;i<batchSize_;i++) {
-        OnlineNnet2FeaturePipeline *features = feature_pipelines.getFeaturePipeline(i);
-        cuda_decodables_[i] = new nnet3::DecodableAmNnetLoopedOnlineCuda(trans_model, decodable_info, features->InputFeature(), features->IvectorFeature());
-        channels_[i]=i;
-      }
-
-      //initialize the decoders
-      cuda_decoders_.InitDecoding(channels_);
-    }
-
-    ~BatchedSingleUtteranceNnet3CudaDecoder() {
-      for (int i=0;i<batchSize_;i++) {
-        delete cuda_decodables_[i];
-      }
-    }
-    void AdvanceDecoding() {
-      cuda_decoders_.AdvanceDecoding(channels_,cuda_decodables_);
-    }
-    void GetBestPath(std::vector<Lattice*> lattices) {
-      cuda_decoders_.GetBestPath(channels_,lattices,true);
-    }
-  private:
-    int batchSize_;
-    const BatchedCudaDecoderConfig &config_;
-    CudaDecoder &cuda_decoders_;
-    std::vector<DecodableInterface*> cuda_decodables_;
-    std::vector<ChannelId> channels_;
-};
-#endif
 
 /*
  *  ThreadedBatchedCudaDecoder uses multiple levels of parallelism in order to decode quickly on CUDA GPUs.
  *  It's API is utterance centric using deferred execution.  That is a user submits work one utterance at a time
  *  and the class batches that work behind the sceen. Utterance are passed into the API with a unqiue key of type string.
- *  The user must ensure this name is unique.  APIs are provided to enque work, query the best path, and flush compute.
- *  Compute is flushed automatically when the desired batch size is reached or when a user manually calls Flush. Flush must
- *  be called manually prior to querying the best path.  After querying the best path a user should call CloseDecodeHandle 
- *  for that utterance.  At that point the utterance is no longer valid, can no longer be queried, and the utterance key can 
- *  be reused.
+ *  The user must ensure this name is unique.  APIs are provided to enque work, query the best path, and cleanup enqueued work.
+ *  Once a user closes a decode handle they are free to use that key again.
  *  
  *  Example Usage is as follows:
  *  ThreadedBatchedCudaDecoder decoder;
@@ -204,7 +107,6 @@ class BatchedSingleUtteranceNnet3CudaDecoder {
  *    std::string utt_key = ...
  *    decoder.OpenDecodeHandle(utt_key,wave_data);
  *
- *  decoder.Flush();
  *
  *  //some loop
  *    Lattice lat;
@@ -225,7 +127,7 @@ class ThreadedBatchedCudaDecoder {
       KALDI_LOG << "ThreadedBatchedCudaDecoder Initialize with " << config_.numThreads_ << " threads\n";
 
       cuda_fst_.Initialize(decode_fst); 
-      
+
       //read transition model and nnet
       bool binary;
       Input ki(nnet3_rxfilename, &binary);
@@ -236,7 +138,7 @@ class ThreadedBatchedCudaDecoder {
       nnet3::CollapseModel(nnet3::CollapseModelConfig(), &(am_nnet_.GetNnet()));
 
       decodable_info_=new nnet3::DecodableNnetSimpleLoopedInfo(config_.decodable_opts_,&am_nnet_);
-      
+
       //initialize threads and save their contexts so we can join them later
       thread_contexts_.resize(config_.numThreads_);
 
@@ -244,8 +146,7 @@ class ThreadedBatchedCudaDecoder {
       pending_task_queue_ = new TaskState*[maxPendingTasks_+1]; 
       tasks_front_ =0;
       tasks_back_ =0;
-      
-      
+
       //ensure all allocations/kernels above are complete before launching threads in different streams.
       cudaStreamSynchronize(cudaStreamPerThread);
 
@@ -257,14 +158,14 @@ class ThreadedBatchedCudaDecoder {
       }
 
       //wait for threads to start to ensure allocation time isn't in the timings
-      while(numStarted_<config_.numThreads_) {};
+      while (numStarted_<config_.numThreads_);
 
     }
     void Finalize() {
 
       //Tell threads to exit and join them
       exit_=true;
-      
+
       for (int i=0;i<config_.numThreads_;i++) {
         thread_contexts_[i].join();
       }
@@ -288,9 +189,10 @@ class ThreadedBatchedCudaDecoder {
       KALDI_ASSERT(it!=tasks_lookup_.end());
 
       TaskState &state = it->second;
-      
+
       //wait for task to finish processing
-      while(state.finished!=true);
+      while (state.finished!=true);
+
       tasks_lookup_.erase(it);
     }
 
@@ -304,16 +206,15 @@ class ThreadedBatchedCudaDecoder {
       //Create a new task in lookup map
       TaskState* t=&tasks_lookup_[key];
       t->Init(wave_data); 
-      
+
       //Wait for pending task queue to have room
       while (tasksPending()==maxPendingTasks_);
 
       //insert into pending task queue
-      //tasks_mutex_.lock();  //TODO do we need to lock/unlock?  Only this thread should write to back_ //remove if possible
+      //locking should not be necessary as only the master thread writes to the queue and tasks_back_.  
       pending_task_queue_[tasks_back_]=t;
       //printf("New task: %p:%s, loc: %d\n", t, key.c_str(), (int)tasks_back_);
       tasks_back_=(tasks_back_+1)%(maxPendingTasks_+1);
-      //tasks_mutex_.unlock();
     }
 
     void GetBestPath(const std::string &key, Lattice *lat) {
@@ -324,7 +225,7 @@ class ThreadedBatchedCudaDecoder {
 
       //wait for task to finish.  This should happens automatically without intervention from the master thread.
       while (state->finished==false);
-      
+
       //Store off the lattice
       *lat=state->lat;
     }
@@ -333,11 +234,10 @@ class ThreadedBatchedCudaDecoder {
   private:
 
     //State needed for each decode task.  
-    //WaveData is duplicated,  a reference may be necessary for online decoding.  This would allow wave data to populate while running.  //TODO figure this out
     struct TaskState {
       WaveData wave_data;   //Wave data input
       Lattice lat;          //Lattice output
-      std::atomic<bool> finished;
+      std::atomic<bool> finished;  //Tells master thread if task has finished execution
 
       TaskState() : finished(false) {};
       void Init(const WaveData &wave_data_in) { wave_data=wave_data_in; finished=false; };
@@ -354,14 +254,18 @@ class ThreadedBatchedCudaDecoder {
 
       //This threads task list
       std::vector<TaskState*> tasks;
+      //channel vectors
+      std::vector<ChannelId> channels;        //active channels
+      std::vector<ChannelId> free_channels;   //channels that are inactive
+      std::vector<ChannelId> init_channels;   //channels that have yet to be initialized
 
-      std::vector<ChannelId> channels;
-      std::vector<ChannelId> free_channels;      
-      std::vector<ChannelId> init_channels;
+      //channel state vectors
       std::vector<BaseFloat> samp_freqs;
       std::vector<SubVector<BaseFloat>* > data;
       std::vector<OnlineNnet2FeaturePipeline*> features;
       std::vector<DecodableInterface*> decodables;
+      std::vector<int> completed_channels;         
+      std::vector<Lattice*> lattices;        
 
       tasks.reserve(config_.maxBatchSize_);
       channels.reserve(config_.maxBatchSize_);
@@ -371,13 +275,15 @@ class ThreadedBatchedCudaDecoder {
       data.reserve(config_.maxBatchSize_);
       features.reserve(config_.maxBatchSize_);
       decodables.reserve(config_.maxBatchSize_);
-
+      completed_channels.reserve(config_.maxBatchSize_);
+      lattices.reserve(config_.maxBatchSize_);
+      
       //add all channels to free channel list
-      for(int i=0;i<config_.maxBatchSize_;i++) {
+      for (int i=0;i<config_.maxBatchSize_;i++) {
         free_channels.push_back(i);
       }      
 
-      numStarted_++;
+      numStarted_++;  //Tell master I have started
 
       //main control loop.  Check if master has asked us to exit.
       while (!exit_) {
@@ -396,7 +302,7 @@ class ThreadedBatchedCudaDecoder {
             while(tasksPending()<config_.maxBatchSize_);
 #endif
 
-            tasks_mutex_.lock(); //lock required because front might change
+            tasks_mutex_.lock(); //lock required because front might change from other workers
 
             //compute number of tasks to grab
             int tasksAvailable = tasksPending();
@@ -412,22 +318,22 @@ class ThreadedBatchedCudaDecoder {
             }
 
             tasks_mutex_.unlock();
+
 #ifdef REPLICATE_IN_BATCH 
             KALDI_ASSERT(free_channels.size()==config_.maxBatchSize_);
 #endif
-            //allocate new data structures
+            //allocate new data structures.  New decodes are in the range of [start,tasks.size())
             for (int i=start;i<tasks.size();i++) {
               TaskState &state = *tasks[i];
 
               //assign a free channel
               ChannelId channel=free_channels.back();
-              //printf("Channel: %d, %d\n", channels.size(), channel);
-              channels.push_back(channel);
-              init_channels.push_back(channel);
               free_channels.pop_back();
 
+              channels.push_back(channel);      //add channel to processing list
+              init_channels.push_back(channel); //add new channel to initialization list
+
               //create decoding state
-              //TODO can this be allcoated earlier?  neeed to check...
               OnlineNnet2FeaturePipeline *feature=new OnlineNnet2FeaturePipeline(*feature_infos.getFeatureInfo(i));
               features.push_back(feature);
 
@@ -435,15 +341,13 @@ class ThreadedBatchedCudaDecoder {
               data.push_back(new SubVector<BaseFloat>(state.wave_data.Data(), 0));
               samp_freqs.push_back(state.wave_data.SampFreq());
 
-              //TODO this call could be batched (start to tasks.size())
               //Accept waveforms
               feature->AcceptWaveform(samp_freqs[i],*data[i]);
               feature->InputFinished();
             }
           } //end if(tasks_front_!=tasks_back_)
 
-          if(tasks.size()==0) {
-            //possibly sleep to minimize lock contention?  Probably not necessary since master can modify back_ without contention
+          if (tasks.size()==0) {
             break;  //no work so exit loop and try to get more work
           } 
 
@@ -453,39 +357,31 @@ class ThreadedBatchedCudaDecoder {
           KALDI_ASSERT(channels.size()==config_.maxBatchSize_);
 #endif
 
-          if(init_channels.size()>0) {
+          if (init_channels.size()>0) {  //Except for the first iteration the size of this is typically 1 and rarely 2.
             //init decoding on new channels_
             cuda_decoders.InitDecoding(init_channels);   
             init_channels.clear();
           }
 
-          //TODO batch IVECTOR and NNET3     
-
           nvtxRangePushA("AdvanceDecoding");
-          //printf("Advance Decoding size: %d\n", channels.size());
           //Advance decoding on all open channels
           cuda_decoders.AdvanceDecoding(channels,decodables);
           nvtxRangePop();
-
-          //wait for decoder to finish     //TODO check if this is necessary, probably is not
-          cudaStreamSynchronize(cudaStreamPerThread);
-
-          //TODo move out?
-          std::vector<int> completed_channels;         
-          std::vector<Lattice*> lattices;        
 
           //reorder arrays to put finished at the end      
           int cur=0;     //points to the last unfinished decode
           int back=tasks.size()-1;  //points to the last unchecked decode
 
-          for(int i=0;i<tasks.size();i++) {
+          completed_channels.clear();
+          lattices.clear();
+
+          for (int i=0;i<tasks.size();i++) {
             ChannelId channel=channels[cur];
-            TaskState &state = *tasks[cur];
+            TaskState &state=*tasks[cur];
             int numDecoded=cuda_decoders.NumFramesDecoded(channel);
             int toDecode=decodables[cur]->NumFramesReady();
 
-            //printf("i: %d, %p, numDecoded: %d, toDecode: %d\n", i, &state, numDecoded, toDecode);
-            if(toDecode==numDecoded) {  //if current task is completed  //TODO fix this to be a query
+            if (toDecode==numDecoded) {  //if current task is completed  
               lattices.push_back(&state.lat);
               completed_channels.push_back(channel);
               free_channels.push_back(channel);
@@ -508,24 +404,16 @@ class ThreadedBatchedCudaDecoder {
               cur++;
             }  //end if completed[cur]
           } //end for loop
-           
+
 #ifdef REPLICATE_IN_BATCH
           KALDI_ASSERT(free_channels.size()==config_.maxBatchSize_);
-#ifdef WAR
-          //WAR put free channels back to the identity matrix
-          for(int i=0;i<free_channels.size();i++) {
-            free_channels[i]=config_.maxBatchSize_-1-i;
-          }
-#endif
 #endif
 
           //Get best path for completed tasks
           cuda_decoders.GetBestPath(completed_channels,lattices,true);
 
-          cudaStreamSynchronize(cudaStreamPerThread); //this may not be necessary //TODO check this
-          //TODO check what we need to clean up
           //clean up
-          for(int i=cur;i<tasks.size();i++) {
+          for (int i=cur;i<tasks.size();i++) {
             delete decodables[i];
             delete features[i];
             delete data[i];
@@ -540,35 +428,31 @@ class ThreadedBatchedCudaDecoder {
           data.resize(cur);
 
         } while (tasks.size()>0);  //more work to process don't check exit condition
-
       } //end while(!exit_)
     }  //end ExecuteWorker
 
+    const BatchedCudaDecoderConfig &config_;
 
+    inline int tasksPending() {
+      return (tasks_back_ - tasks_front_ + maxPendingTasks_+1) % (maxPendingTasks_+1); 
+    };
 
-      const BatchedCudaDecoderConfig &config_;
-    
-      inline int tasksPending() {
-        return (tasks_back_ - tasks_front_ + maxPendingTasks_+1) % (maxPendingTasks_+1); 
-      };
+    int maxPendingTasks_; 
 
-      int maxPendingTasks_; //TODO move to config?
+    CudaFst cuda_fst_;
+    TransitionModel trans_model_;
+    nnet3::AmNnetSimple am_nnet_;
+    nnet3::DecodableNnetSimpleLoopedInfo *decodable_info_;
 
-      CudaFst cuda_fst_;
+    std::mutex tasks_mutex_;                      //protects tasks_front_ and pending_task_queue_ for workers
+    std::atomic<int> tasks_front_, tasks_back_;
+    TaskState** pending_task_queue_;
 
-      TransitionModel trans_model_;
-      nnet3::AmNnetSimple am_nnet_;
-      nnet3::DecodableNnetSimpleLoopedInfo *decodable_info_;
+    std::atomic<bool> exit_;                      //signals threads to exit
+    std::atomic<int> numStarted_;                 //signals master how many threads have started
 
-      std::mutex tasks_mutex_;
-      std::atomic<int> tasks_front_, tasks_back_;
-      TaskState** pending_task_queue_;
-
-      std::atomic<bool> exit_;
-      std::atomic<int> numStarted_;
-
-      std::map<std::string,TaskState> tasks_lookup_; //Contains a map of utterance to TaskState
-      std::vector<std::thread> thread_contexts_;     //A list of thread contexts
+    std::map<std::string,TaskState> tasks_lookup_; //Contains a map of utterance to TaskState
+    std::vector<std::thread> thread_contexts_;     //A list of thread contexts
 };
 
 
@@ -643,15 +527,15 @@ int main(int argc, char *argv[]) {
 
     po.Register("write-lattice",&write_lattice, "Output lattice to a file.  Setting to false is useful when benchmarking.");
     po.Register("word-symbol-table", &word_syms_rxfilename, "Symbol table for words [for debug output]");
-    po.Register("file-limit", &num_todo, "Limits the number of files that are processed by this driver.  After N files are processed the remaing files are ignored.  Useful for profiling.");
+    po.Register("file-limit", &num_todo, 
+        "Limits the number of files that are processed by this driver.  After N files are processed the remaing files are ignored.  Useful for profiling.");
     po.Register("iterations", &iterations, "Number of times to decode the corpus.  Output will be written only once.");
-    po.Register("max-outstanding-queue-length", &max_queue_length, "Number of files to allow to be outstanding at a time.  When the number of files is larger than this handles will be closed before opening new ones in FIFO order.");
+    po.Register("max-outstanding-queue-length", &max_queue_length, 
+        "Number of files to allow to be outstanding at a time.  When the number of files is larger than this handles will be closed before opening new ones in FIFO order.");
     
     //Multi-threaded CPU and batched GPU decoder
     BatchedCudaDecoderConfig batchedDecoderConfig;
 
-    OnlineEndpointConfig endpoint_opts;  //TODO is this even used?  Config seems to need it but we never seem to use it.
-    endpoint_opts.Register(&po);
     kaldi::g_allocator_options.Register(&po);
 
     batchedDecoderConfig.Register(&po);
@@ -665,7 +549,6 @@ int main(int argc, char *argv[]) {
 
     CuDevice::Instantiate().SelectGpuId(0);
     CuDevice::Instantiate().AllowMultithreading();
-
     
     ThreadedBatchedCudaDecoder CudaDecoder(batchedDecoderConfig);
 
@@ -695,10 +578,10 @@ int main(int argc, char *argv[]) {
     double total_audio=0;
     
     nvtxRangePush("Global Timer");
-    auto start = std::chrono::high_resolution_clock::now();
+    auto start = std::chrono::high_resolution_clock::now(); //starting timer here so we can measure throughput without allocation overheads
 
     std::queue<std::string> processed;
-    for(int iter=0;iter<iterations;iter++) {
+    for (int iter=0;iter<iterations;iter++) {
       SequentialTokenVectorReader spk2utt_reader(spk2utt_rspecifier);
       RandomAccessTableReader<WaveHolder> wav_reader(wav_rspecifier);
 
@@ -729,7 +612,7 @@ int main(int argc, char *argv[]) {
 
 #ifdef REPLICATE_IN_BATCH
           //HACK to replicate across batch, need to remove
-          for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) {
+          for (int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) {
             total_audio+=wave_data.Duration();
             num_done++;
             std::string key=utt+std::to_string(i);
@@ -737,7 +620,7 @@ int main(int argc, char *argv[]) {
           }
 #endif
 
-         while(processed.size()>max_queue_length) {
+         while (processed.size()>max_queue_length) {
             std::string &utt = processed.front();
             Lattice lat;
             CompactLattice clat;
@@ -755,7 +638,7 @@ int main(int argc, char *argv[]) {
 
 #ifdef REPLICATE_IN_BATCH
             //HACK to replicate across batch, need to remove
-            for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
+            for (int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
               std::string key=utt+std::to_string(i);
               CudaDecoder.CloseDecodeHandle(key);
             }
@@ -771,7 +654,7 @@ int main(int argc, char *argv[]) {
       } //end speaker loop
 
       nvtxRangePushA("Lattice Write");
-      while(processed.size()>0) {
+      while (processed.size()>0) {
         std::string &utt = processed.front();
         Lattice lat;
         CompactLattice clat;
@@ -789,7 +672,7 @@ int main(int argc, char *argv[]) {
 
 #ifdef REPLICATE_IN_BATCH
         //HACK to replicate across batch, need to remove
-        for(int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
+        for (int i=1;i<batchedDecoderConfig.maxBatchSize_;i++) { 
           std::string key=utt+std::to_string(i);
           CudaDecoder.CloseDecodeHandle(key);
         }
@@ -803,7 +686,7 @@ int main(int argc, char *argv[]) {
       KALDI_LOG << "Iteration: " << iter << " Aggregate Total Time: " << total_time.count()
         << " Total Audio: " << total_audio 
         << " RealTimeX: " << total_audio/total_time.count() << std::endl;
-    }
+    } //End iterations loop
     KALDI_LOG << "Decoded " << num_done << " utterances, "
       << num_err << " with errors.";
     KALDI_LOG << "Overall likelihood per frame was " << (tot_like / num_frames)
@@ -828,7 +711,7 @@ int main(int argc, char *argv[]) {
     return 0;
 
     //return (num_done != 0 ? 0 : 1);
-  } catch(const std::exception& e) {
+  } catch (const std::exception& e) {
     std::cerr << e.what();
     return -1;
   }
