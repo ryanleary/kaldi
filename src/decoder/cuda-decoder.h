@@ -236,7 +236,7 @@ namespace kaldi {
 		int32 nchannels;
 
 		CudaDecoderConfig(): default_beam(15.0),
-		max_tokens(50000000),
+		max_tokens(2000000),
 		max_tokens_per_frame(1000000) {}
 
 		void Register(OptionsItf *opts) {
