@@ -67,29 +67,6 @@ class BatchedCudaDecoderConfig {
     CudaDecoderConfig decoder_opts_;                           //constant readonly
 };
 
-/***************************************************
- * Placeholder for a batched pipeline info class
- * *************************************************/
-
-class BatchedNnet2FeaturePipelineInfo {
-  public:
-    BatchedNnet2FeaturePipelineInfo(const BatchedCudaDecoderConfig &config) : config_(config) {
-        feature_infos_=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
-        feature_infos_->ivector_extractor_info.use_most_recent_ivector = true;
-        feature_infos_->ivector_extractor_info.greedy_ivector_extractor = true;
-    }
-    ~BatchedNnet2FeaturePipelineInfo() {
-      delete feature_infos_;
-    }
-      
-    OnlineNnet2FeaturePipelineInfo* getFeatureInfo(int i) { return feature_infos_; }
-  private:
-    const BatchedCudaDecoderConfig &config_;
-    OnlineNnet2FeaturePipelineInfo* feature_infos_;
-};
-
-
-
 /*
  *  ThreadedBatchedCudaDecoder uses multiple levels of parallelism in order to decode quickly on CUDA GPUs.
  *  It's API is utterance centric using deferred execution.  That is a user submits work one utterance at a time
@@ -247,7 +224,9 @@ class ThreadedBatchedCudaDecoder {
       CuDevice::Instantiate().AllowMultithreading();
 
       //reusable across decodes
-      BatchedNnet2FeaturePipelineInfo feature_infos(config_);
+      OnlineNnet2FeaturePipelineInfo feature_info(config_.feature_opts_);
+      feature_info.ivector_extractor_info.use_most_recent_ivector = true;
+      feature_info.ivector_extractor_info.greedy_ivector_extractor = true;
       CudaDecoder cuda_decoders(cuda_fst_,config_.decoder_opts_,config_.maxBatchSize_,config_.maxBatchSize_);
 
       //This threads task list
@@ -332,7 +311,7 @@ class ThreadedBatchedCudaDecoder {
               init_channels.push_back(channel); //add new channel to initialization list
 
               //create decoding state
-              OnlineNnet2FeaturePipeline *feature=new OnlineNnet2FeaturePipeline(*feature_infos.getFeatureInfo(i));
+              OnlineNnet2FeaturePipeline *feature = new OnlineNnet2FeaturePipeline(feature_info);
               features.push_back(feature);
 
               decodables.push_back(new nnet3::DecodableAmNnetLoopedOnlineCuda(trans_model_, *decodable_info_, feature->InputFeature(), feature->IvectorFeature()));
