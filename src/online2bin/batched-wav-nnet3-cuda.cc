@@ -70,27 +70,25 @@ class BatchedCudaDecoderConfig {
 /***************************************************
  * Placeholder for a batched pipeline info class
  * *************************************************/
+
 class BatchedNnet2FeaturePipelineInfo {
   public:
     BatchedNnet2FeaturePipelineInfo(const BatchedCudaDecoderConfig &config) : config_(config) {
-      feature_infos_.resize(config_.maxBatchSize_);
-      for (int i=0;i<config_.maxBatchSize_;i++) {
-        feature_infos_[i]=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
-        feature_infos_[i]->ivector_extractor_info.use_most_recent_ivector = true;
-        feature_infos_[i]->ivector_extractor_info.greedy_ivector_extractor = true;
-      }
+        feature_infos_=new OnlineNnet2FeaturePipelineInfo(config_.feature_opts_);
+        feature_infos_->ivector_extractor_info.use_most_recent_ivector = true;
+        feature_infos_->ivector_extractor_info.greedy_ivector_extractor = true;
     }
     ~BatchedNnet2FeaturePipelineInfo() {
-      for (int i=0;i<config_.maxBatchSize_;i++) {
-        delete feature_infos_[i];
-      }
+      delete feature_infos_;
     }
       
-    OnlineNnet2FeaturePipelineInfo* getFeatureInfo(int i) { return feature_infos_[i]; }
+    OnlineNnet2FeaturePipelineInfo* getFeatureInfo(int i) { return feature_infos_; }
   private:
     const BatchedCudaDecoderConfig &config_;
-    std::vector<OnlineNnet2FeaturePipelineInfo*> feature_infos_;
+    OnlineNnet2FeaturePipelineInfo* feature_infos_;
 };
+
+
 
 /*
  *  ThreadedBatchedCudaDecoder uses multiple levels of parallelism in order to decode quickly on CUDA GPUs.
@@ -513,9 +511,7 @@ int main(int argc, char *argv[]) {
       "set via config files whose filenames are passed as options\n"
       "\n"
       "Usage: online2-wav-nnet3-latgen-faster [options] <nnet3-in> <fst-in> "
-      "<spk2utt-rspecifier> <wav-rspecifier> <lattice-wspecifier>\n"
-      "The spk2utt-rspecifier can just be <utterance-id> <utterance-id> if\n"
-      "you want to decode utterance by utterance.\n";
+      "<wav-rspecifier> <lattice-wspecifier>\n";
 
     std::string word_syms_rxfilename;
 
@@ -542,7 +538,7 @@ int main(int argc, char *argv[]) {
 
     po.Read(argc, argv);
 
-    if (po.NumArgs() != 5) {
+    if (po.NumArgs() != 4) {
       po.PrintUsage();
       return 1;
     }
@@ -554,9 +550,8 @@ int main(int argc, char *argv[]) {
 
     std::string nnet3_rxfilename = po.GetArg(1),
       fst_rxfilename = po.GetArg(2),
-      spk2utt_rspecifier = po.GetArg(3),
-      wav_rspecifier = po.GetArg(4),
-      clat_wspecifier = po.GetArg(5);
+      wav_rspecifier = po.GetArg(3),
+      clat_wspecifier = po.GetArg(4);
 
     CompactLatticeWriter clat_writer(clat_wspecifier);
     
@@ -582,28 +577,15 @@ int main(int argc, char *argv[]) {
 
     std::queue<std::string> processed;
     for (int iter=0;iter<iterations;iter++) {
-      SequentialTokenVectorReader spk2utt_reader(spk2utt_rspecifier);
-      RandomAccessTableReader<WaveHolder> wav_reader(wav_rspecifier);
+      SequentialTableReader<WaveHolder> wav_reader(wav_rspecifier);
 
-      for (; !spk2utt_reader.Done(); spk2utt_reader.Next()) {
-        nvtxRangePushA("Speaker Iteration");
-        std::string spk = spk2utt_reader.Key();
-        printf("Speaker: %s\n",spk.c_str());
-
-        const std::vector<std::string> &uttlist = spk2utt_reader.Value();
-
-        for (size_t i = 0; i < uttlist.size(); i++) {
+        for (; !wav_reader.Done(); wav_reader.Next()) {
           nvtxRangePushA("Utterance Iteration");
 
-          std::string utt = uttlist[i];
+          std::string utt = wav_reader.Key();
           printf("Utterance: %s\n", utt.c_str());
-          if (!wav_reader.HasKey(utt)) {
-            KALDI_WARN << "Did not find audio for utterance " << utt;
-            num_err++;
-            continue;
-          }
 
-          const WaveData &wave_data = wav_reader.Value(utt);
+          const WaveData &wave_data = wav_reader.Value();
           total_audio+=wave_data.Duration();
 
           CudaDecoder.OpenDecodeHandle(utt,wave_data);
@@ -649,9 +631,6 @@ int main(int argc, char *argv[]) {
           nvtxRangePop();
           if (num_todo!=-1 && num_done>=num_todo) break;
         } //end utterance loop
-        nvtxRangePop();
-        if (num_todo!=-1 && num_done>=num_todo) break;
-      } //end speaker loop
 
       nvtxRangePushA("Lattice Write");
       while (processed.size()>0) {
